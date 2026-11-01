@@ -186,8 +186,16 @@ assets = [
 maintainer-scripts = "packaging/debian/"
 
 [profile.dev]
-debug = 0
-strip = "symbols"
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 2
+lto = "off"
 
 [profile.release]
 debug = 0

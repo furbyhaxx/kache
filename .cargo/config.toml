@@ -4,5 +4,8 @@
 # environment. The self-hosted CI Macs that run kache's own tests carry a real
 # /etc/kache/config.toml; a test must see only the config it writes. A test
 # that wants a host file sets KACHE_HOST_CONFIG on its own command.
+[build]
+jobs = 8
+
 [env]
 KACHE_HOST_CONFIG = ""

@@ -753,7 +753,6 @@ fn discover_within_using(
             external_roots,
             deadline,
             homes,
-            turn,
             sources,
             links,
             is_local,
@@ -769,7 +768,6 @@ fn inventory_external<'a>(
     external_roots: &[PathBuf],
     deadline: Instant,
     homes: &[PathBuf],
-    turn: u64,
     source_paths: impl IntoIterator<Item = &'a PathBuf>,
     links: impl IntoIterator<Item = &'a PathBuf>,
     is_local: impl Fn(&Path) -> bool,
@@ -783,6 +781,22 @@ fn inventory_external<'a>(
     ) -> Result<bool>,
     now: impl Fn() -> Instant,
 ) {
+    let links: Vec<_> = links
+        .into_iter()
+        .filter(|workspace| !shielded(workspace, homes))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if links.is_empty() || now() >= deadline {
+        return;
+    }
+    let turn = match store.next_external_inventory_turn() {
+        Ok(turn) => turn,
+        Err(error) => {
+            tracing::warn!("cannot read external target inventory pass cursor: {error:#}");
+            return;
+        }
+    };
     // Leave half the remaining time for candidates, subject to slow filesystem calls.
     let start = now();
     let source_deadline = start + deadline.saturating_duration_since(start) / 2;
@@ -817,19 +831,22 @@ fn inventory_external<'a>(
             sources.push(path.clone());
         }
     }
-    let links: Vec<_> = links
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    if now() >= deadline {
+        return;
+    }
+    let turn = match store.reserve_external_inventory_turn(deadline) {
+        Ok(Some(turn)) => turn,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!("cannot reserve external target inventory pass: {error:#}");
+            return;
+        }
+    };
     let turn = external_candidate_turn(turn, links.len());
     let mut candidates = 0;
     'external: for workspace in rotated(links, turn) {
         if now() >= deadline || candidates == MAX_EXTERNAL_RECORDS {
             break;
-        }
-        if shielded(workspace, homes) {
-            continue;
         }
         let Ok(resolved) = workspace.canonicalize() else {
             continue;
@@ -1235,9 +1252,11 @@ mod tests {
                 }
             })
             .collect();
-        let store = Store::open(&crate::test_support::test_config(base.join("cache"))).unwrap();
         let mut original_passes = Vec::new();
         for duplicate in [false, true] {
+            let config = crate::test_support::test_config(base.join(format!("cache-{duplicate}")));
+            private_inventory_cache(&config.cache_dir);
+            let store = Store::open(&config).unwrap();
             let visited = RefCell::new(HashSet::new());
             let mut passes = Vec::new();
             for turn in 0..2 {
@@ -1252,7 +1271,6 @@ mod tests {
                     std::slice::from_ref(&storage),
                     Instant::now() + DISCOVERY_TIME,
                     &[],
-                    turn,
                     links.iter().copied(),
                     links.iter().copied(),
                     |_| true,
@@ -1274,6 +1292,111 @@ mod tests {
                 original_passes = passes;
             }
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn external_pass_reserves_only_after_candidates_and_source_preparation() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let storage = base.join("storage");
+        let backing = storage.join("backing");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&backing).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        symlink(&backing, workspace.join("target")).unwrap();
+        let config = crate::test_support::test_config(base.join("cache"));
+        private_inventory_cache(&config.cache_dir);
+        let store = Store::open(&config).unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let clock = Cell::new(start);
+        let empty: Vec<PathBuf> = Vec::new();
+        inventory_external(
+            &store,
+            std::slice::from_ref(&storage),
+            deadline,
+            &[],
+            &empty,
+            &empty,
+            |_| panic!("no candidates"),
+            |_, _, _, _, _, _| panic!("no candidates"),
+            || clock.get(),
+        );
+        assert!(
+            !config
+                .cache_dir
+                .join("external-target-inventory.db")
+                .exists()
+        );
+        inventory_external(
+            &store,
+            std::slice::from_ref(&storage),
+            deadline,
+            &[],
+            std::slice::from_ref(&workspace),
+            std::slice::from_ref(&workspace),
+            |_| {
+                clock.set(deadline);
+                true
+            },
+            |_, _, _, _, _, _| panic!("deadline expired in source preparation"),
+            || clock.get(),
+        );
+        assert!(
+            !config
+                .cache_dir
+                .join("external-target-inventory.db")
+                .exists()
+        );
+        assert_eq!(store.next_external_inventory_turn().unwrap(), 0);
+
+        clock.set(start);
+        inventory_external(
+            &store,
+            std::slice::from_ref(&storage),
+            deadline,
+            &[],
+            &empty,
+            std::slice::from_ref(&workspace),
+            |path| {
+                if path == workspace.join("target") {
+                    assert_eq!(store.next_external_inventory_turn().unwrap(), 1);
+                }
+                true
+            },
+            observe_external_before_deadline,
+            || clock.get(),
+        );
+        assert_eq!(store.external_target_observations().unwrap().len(), 1);
+        assert_eq!(store.next_external_inventory_turn().unwrap(), 1);
+        inventory_external(
+            &store,
+            std::slice::from_ref(&storage),
+            deadline,
+            &[],
+            &empty,
+            &empty,
+            |_| panic!("no candidates"),
+            |_, _, _, _, _, _| panic!("no candidates"),
+            || clock.get(),
+        );
+        clock.set(deadline);
+        inventory_external(
+            &store,
+            std::slice::from_ref(&storage),
+            deadline,
+            &[],
+            &empty,
+            std::slice::from_ref(&workspace),
+            |_| panic!("expired"),
+            |_, _, _, _, _, _| panic!("expired"),
+            || clock.get(),
+        );
+        assert_eq!(store.next_external_inventory_turn().unwrap(), 1);
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1303,7 +1426,9 @@ mod tests {
         let mut paths = vec![sources[0].clone(); 40];
         paths.extend(sources.iter().cloned());
         paths.push(missing.clone());
-        let store = Store::open(&crate::test_support::test_config(base.join("cache"))).unwrap();
+        let config = crate::test_support::test_config(base.join("cache"));
+        private_inventory_cache(&config.cache_dir);
+        let store = Store::open(&config).unwrap();
         for timed in [true, false] {
             let mut first_probes = Vec::new();
             let mut all_probes = HashSet::new();
@@ -1317,7 +1442,6 @@ mod tests {
                     std::slice::from_ref(&storage),
                     start + Duration::from_secs(12),
                     &[],
-                    turn,
                     &paths,
                     std::slice::from_ref(&workspace),
                     |path| {
@@ -1620,6 +1744,12 @@ mod tests {
         assert_eq!(tracked.len(), 1);
 
         assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 0);
+        assert!(
+            !config
+                .cache_dir
+                .join("external-target-inventory.db")
+                .exists()
+        );
         assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
         assert!(store.external_target_observations().unwrap().is_empty());
         assert_eq!(
@@ -1780,6 +1910,14 @@ mod tests {
             store
                 .remember_target_root(&built, &repo.join("built"))
                 .unwrap();
+            if turn == 1 {
+                assert_eq!(
+                    store
+                        .reserve_external_inventory_turn(Instant::now() + DISCOVERY_TIME)
+                        .unwrap(),
+                    Some(0)
+                );
+            }
             let before_snapshot = RefCell::new(Vec::new());
             let calls = RefCell::new(Vec::new());
             let output = Arc::new(Mutex::new(Vec::new()));
@@ -1877,6 +2015,321 @@ mod tests {
             );
         }
         assert_eq!(first_observations, HashSet::from([workspace, later]));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn busy_inventory_keeps_ordinary_discovery_and_does_not_consume_a_turn() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_discovery::tests::busy_inventory_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[ignore = "subprocess fixture for inventory contention"]
+    fn busy_inventory_child() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("source/repo");
+        let sibling = base.join("source/sibling");
+        let storage = base.join("storage");
+        let backing = storage.join("backing");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        std::fs::write(sibling.join(".gitignore"), "target\n").unwrap();
+        let built = cargo_target(&repo.join("built"));
+        let normal = cargo_target(&sibling.join("normal"));
+        let workspace = sibling.join("external");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        symlink(&backing, workspace.join("target")).unwrap();
+        let config = crate::test_support::test_config(base.join("cache"));
+        private_inventory_cache(&config.cache_dir);
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &repo.join("built"))
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_external_inventory_turn(Instant::now() + DISCOVERY_TIME)
+                .unwrap(),
+            Some(0)
+        );
+        let lock =
+            std::fs::File::open(config.cache_dir.join("external-target-inventory.lock")).unwrap();
+        lock.lock().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(Arc::clone(&writer)))
+            .finish();
+        let observed = Cell::new(false);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            discover_within_using(
+                &store,
+                std::slice::from_ref(&storage),
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                0,
+                |_| true,
+                |_, _, _, _, _, _| {
+                    observed.set(true);
+                    Ok(true)
+                },
+            )
+        });
+        lock.unlock().unwrap();
+        assert_eq!(result.unwrap(), 1);
+        assert!(!observed.get());
+        assert!(
+            store
+                .tracked_target_roots(0)
+                .unwrap()
+                .iter()
+                .any(|row| row.path == normal && row.discovered)
+        );
+        assert_eq!(store.next_external_inventory_turn().unwrap(), 1);
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("cannot read external target inventory pass cursor"),
+            "{log}"
+        );
+        assert!(log.contains("busy"), "{log}");
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(Arc::clone(&writer)))
+            .finish();
+        let locked = Cell::new(false);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            discover_within_using(
+                &store,
+                std::slice::from_ref(&storage),
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                0,
+                |_| {
+                    if !locked.replace(true) {
+                        lock.lock().unwrap();
+                    }
+                    true
+                },
+                |_, _, _, _, _, _| {
+                    observed.set(true);
+                    Ok(true)
+                },
+            )
+        });
+        if locked.get() {
+            lock.unlock().unwrap();
+        }
+        assert!(locked.get());
+        assert_eq!(result.unwrap(), 0);
+        assert!(!observed.get());
+        assert_eq!(store.next_external_inventory_turn().unwrap(), 1);
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("cannot reserve external target inventory pass"),
+            "{log}"
+        );
+        assert!(log.contains("busy"), "{log}");
+        assert_eq!(
+            store
+                .reserve_external_inventory_turn(Instant::now() + DISCOVERY_TIME)
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn paused_inventory_cursor_transaction_does_not_block_cargo_leases() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        private_inventory_cache(&config.cache_dir);
+        let store = Store::open(&config).unwrap();
+        assert_eq!(
+            store
+                .reserve_external_inventory_turn(Instant::now() + DISCOVERY_TIME)
+                .unwrap(),
+            Some(0)
+        );
+        let writer = Store::open(&config).unwrap();
+        let _first =
+            crate::target_use::shared(&config.cache_dir, "cargo build", &mut Vec::new()).unwrap();
+        let path = config.cache_dir.join("external-target-inventory.db");
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        let probe = rusqlite::Connection::open(&path).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let current: i64 = reader
+            .query_row(
+                "SELECT next_turn FROM external_target_inventory_cursor WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, 1);
+        probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (lease_tx, lease_rx) = mpsc::channel();
+        let cache = config.cache_dir.clone();
+        let (transaction_active, acquired, still_paused, result) = std::thread::scope(|scope| {
+            let reserve = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result =
+                    writer.reserve_external_inventory_turn(Instant::now() + DISCOVERY_TIME);
+                done_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let limit = Instant::now() + Duration::from_secs(2);
+            let active = loop {
+                match probe.execute_batch("BEGIN IMMEDIATE") {
+                    Ok(()) => probe.execute_batch("ROLLBACK").unwrap(),
+                    Err(error)
+                        if matches!(
+                            error.sqlite_error_code(),
+                            Some(
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                        ) =>
+                    {
+                        break true;
+                    }
+                    Err(error) => panic!("cursor lock probe failed: {error}"),
+                }
+                if Instant::now() >= limit || done_rx.try_recv().is_ok() {
+                    break false;
+                }
+                std::thread::yield_now();
+            };
+            let second = scope.spawn(move || {
+                let mut notice = Vec::new();
+                let lease = crate::target_use::shared(&cache, "cargo test", &mut notice).unwrap();
+                lease_tx.send((lease, notice)).unwrap();
+            });
+            let acquired = lease_rx.recv_timeout(Duration::from_millis(150));
+            let still_paused = matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+            reader.execute_batch("COMMIT").unwrap();
+            second.join().unwrap();
+            (active, acquired, still_paused, reserve.join().unwrap())
+        });
+        assert!(
+            transaction_active,
+            "cursor transaction never acquired its SQLite write lock"
+        );
+        let (_second, notice) =
+            acquired.expect("second Cargo lease waited for the cursor transaction");
+        assert!(notice.is_empty());
+        assert!(
+            still_paused,
+            "cursor transaction completed before the second lease"
+        );
+        assert_eq!(result.unwrap(), Some(1));
+        assert_eq!(store.next_external_inventory_turn().unwrap(), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn daily_external_passes_reach_all_candidates_after_store_reopens() {
+        use std::os::unix::fs::symlink;
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("source/repo");
+        let sibling = base.join("source/sibling");
+        let storage = base.join("storage");
+        let backing = storage.join("backing");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        std::fs::write(sibling.join(".gitignore"), "target\n").unwrap();
+        let built = cargo_target(&repo.join("built"));
+        let workspaces: HashSet<_> = (0..12)
+            .map(|index| {
+                let workspace = sibling.join(format!("app-{index:02}"));
+                std::fs::create_dir(&workspace).unwrap();
+                std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+                symlink(&backing, workspace.join("target")).unwrap();
+                workspace
+            })
+            .collect();
+        let config = crate::test_support::test_config(base.join("cache"));
+        private_inventory_cache(&config.cache_dir);
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &repo.join("built"))
+            .unwrap();
+        drop(store);
+        for day in 0..2 {
+            let store = Store::open(&config).unwrap();
+            assert_eq!(
+                discover(
+                    &store,
+                    std::slice::from_ref(&storage),
+                    DISCOVERY_TIME,
+                    day * 24 * 3600
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                store.external_target_observations().unwrap().len(),
+                if day == 0 { 8 } else { 12 }
+            );
+        }
+        let store = Store::open(&config).unwrap();
+        let visited: HashSet<_> = store
+            .external_target_observations()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.workspace_path)
+            .collect();
+        assert_eq!(visited, workspaces);
     }
 
     #[cfg(target_os = "linux")]

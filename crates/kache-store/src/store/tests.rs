@@ -4703,6 +4703,309 @@ mod external_target_inventory {
     }
 
     #[test]
+    fn inventory_cursor_migrates_legacy_observations_without_read_side_effects() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        let before = ro_tree_snapshot(&f.store.config.cache_dir);
+        assert_eq!(f.store.next_external_inventory_turn().unwrap(), 0);
+        assert_eq!(readonly.next_external_inventory_turn().unwrap(), 0);
+        assert!(
+            readonly
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        assert_eq!(ro_tree_snapshot(&f.store.config.cache_dir), before);
+
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let observations = f.store.external_target_observations().unwrap();
+        f.inventory_db()
+            .execute_batch("DROP TABLE external_target_inventory_cursor; PRAGMA user_version = 1;")
+            .unwrap();
+        let before = ro_tree_snapshot(&f.store.config.cache_dir);
+        assert_eq!(
+            readonly.external_target_observations().unwrap(),
+            observations
+        );
+        assert_eq!(readonly.next_external_inventory_turn().unwrap(), 0);
+        assert_eq!(ro_tree_snapshot(&f.store.config.cache_dir), before);
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(readonly.next_external_inventory_turn().unwrap(), 1);
+        assert_eq!(
+            readonly.external_target_observations().unwrap(),
+            observations
+        );
+        let db = f.inventory_db();
+        let version: i64 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn inventory_cursor_failed_migration_preserves_legacy_data() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let observations = f.store.external_target_observations().unwrap();
+        f.inventory_db()
+            .execute_batch(
+                "DROP TABLE external_target_inventory_cursor;
+             CREATE TABLE external_target_inventory_cursor (other TEXT);
+             INSERT INTO external_target_inventory_cursor VALUES ('keep');
+             PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        assert!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        assert_eq!(
+            f.store.external_target_observations().unwrap(),
+            observations
+        );
+        let db = Connection::open(f.inventory_path()).unwrap();
+        let version: i64 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let value: String = db
+            .query_row(
+                "SELECT other FROM external_target_inventory_cursor",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(value, "keep");
+    }
+
+    #[test]
+    fn inventory_cursor_is_unique_across_concurrent_reopened_stores() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let stores: Vec<_> = (0..8)
+            .map(|_| Store::open(test_config(&f.store.config.cache_dir)).unwrap())
+            .collect();
+        let barrier = std::sync::Barrier::new(stores.len());
+        let mut turns = std::thread::scope(|scope| {
+            let handles: Vec<_> = stores
+                .into_iter()
+                .map(|store| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store
+                            .reserve_external_inventory_turn(
+                                std::time::Instant::now() + Duration::from_secs(5),
+                            )
+                            .unwrap()
+                            .unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        turns.sort_unstable();
+        assert_eq!(turns, (0..8).collect::<Vec<_>>());
+        let reopened = Store::open(test_config(&f.store.config.cache_dir)).unwrap();
+        assert_eq!(reopened.next_external_inventory_turn().unwrap(), 8);
+        let tables: i64 = reopened
+            .db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='external_target_inventory_cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+    }
+
+    #[test]
+    fn inventory_cursor_is_unique_across_concurrent_processes() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(0)
+        );
+        let mut children: Vec<_> = (0..4).map(|_| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "store::tests::external_target_inventory::inventory_cursor_reservation_child", "--ignored", "--nocapture"])
+                .env("KACHE_TEST_INVENTORY_DIR", &f.store.config.cache_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn().unwrap()
+        }).collect();
+        for child in &mut children {
+            let mut stderr = BufReader::new(child.stderr.as_mut().unwrap());
+            let mut line = String::new();
+            stderr.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "INVENTORY_READY");
+        }
+        for child in &mut children {
+            child.stdin.take().unwrap().write_all(b"x").unwrap();
+        }
+        let mut turns = Vec::new();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let turn: u64 = stdout
+                .split("INVENTORY_TURN=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            turns.push(turn);
+        }
+        turns.sort_unstable();
+        assert_eq!(turns, vec![1, 2, 3, 4]);
+        assert_eq!(f.store.next_external_inventory_turn().unwrap(), 5);
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for concurrent cursor reservations"]
+    fn inventory_cursor_reservation_child() {
+        use std::io::Read;
+
+        let cache = PathBuf::from(std::env::var_os("KACHE_TEST_INVENTORY_DIR").unwrap());
+        let store = Store::open(test_config(&cache)).unwrap();
+        eprintln!("INVENTORY_READY");
+        std::io::stdin().read_exact(&mut [0_u8]).unwrap();
+        let turn = store
+            .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        println!("INVENTORY_TURN={turn}");
+    }
+
+    #[test]
+    fn inventory_cursor_does_not_advance_when_expired_or_busy() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now())
+                .unwrap(),
+            None
+        );
+        assert!(!f.inventory_path().exists());
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(0)
+        );
+        let guard = f.inventory_db();
+        assert!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
+        drop(guard);
+        assert_eq!(f.store.next_external_inventory_turn().unwrap(), 1);
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let called = std::cell::Cell::new(false);
+        let result = f
+            .store
+            .reserve_external_inventory_turn_with(deadline, || {
+                called.set(true);
+                std::thread::sleep(
+                    deadline.saturating_duration_since(std::time::Instant::now())
+                        + Duration::from_millis(1),
+                );
+            })
+            .unwrap();
+        assert!(called.get());
+        assert_eq!(result, None);
+        assert_eq!(f.store.next_external_inventory_turn().unwrap(), 1);
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn inventory_cursor_rolls_back_if_the_database_is_replaced() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(0)
+        );
+        let path = f.inventory_path();
+        let replacement = f.temp.path().join("replacement.db");
+        fs::copy(&path, &replacement).unwrap();
+        let result = f.store.reserve_external_inventory_turn_with(
+            std::time::Instant::now() + Duration::from_secs(5),
+            || {
+                fs::rename(&path, f.temp.path().join("old-db")).unwrap();
+                fs::rename(&replacement, &path).unwrap();
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(f.store.next_external_inventory_turn().unwrap(), 1);
+    }
+
+    #[test]
+    fn inventory_cursor_wraps_without_changing_observations() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let before = f.store.external_target_observations().unwrap();
+        f.inventory_db()
+            .execute(
+                "UPDATE external_target_inventory_cursor SET next_turn = ?1",
+                [i64::MAX],
+            )
+            .unwrap();
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(i64::MAX as u64)
+        );
+        assert_eq!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(f.store.external_target_observations().unwrap(), before);
+    }
+
+    #[test]
     fn external_target_inventory_preserves_shared_links_and_first_observation() {
         let _serial = serialize_inventory_tests();
         let f = Fixture::new();
@@ -5631,6 +5934,12 @@ mod external_target_inventory {
             .pragma_update(None, "user_version", 99)
             .unwrap();
         assert!(f.store.external_target_observations().is_err());
+        assert!(f.store.next_external_inventory_turn().is_err());
+        assert!(
+            f.store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .is_err()
+        );
         assert!(
             f.store
                 .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)

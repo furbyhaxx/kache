@@ -1820,7 +1820,7 @@ const INDEX_SCHEMA_GENERATION: i64 = 9;
 
 const EXTERNAL_TARGET_INVENTORY_DB: &str = "external-target-inventory.db";
 const EXTERNAL_TARGET_INVENTORY_LOCK: &str = "external-target-inventory.lock";
-const EXTERNAL_TARGET_INVENTORY_SCHEMA: i64 = 1;
+const EXTERNAL_TARGET_INVENTORY_SCHEMA: i64 = 2;
 const EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 // A close on any fd for the DB can release another SQLite connection's POSIX locks.
@@ -2068,7 +2068,7 @@ fn open_external_target_inventory_with(
     db.revalidate()?;
     db.busy_timeout(EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT)?;
     let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if write && generation == 0 {
+    if write && (generation == 0 || generation == 1) {
         let transaction =
             rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         let generation: i64 =
@@ -2085,8 +2085,17 @@ fn open_external_target_inventory_with(
                     backing_inode        TEXT NOT NULL,
                     first_observed       INTEGER NOT NULL,
                     last_observed        INTEGER NOT NULL
+                );",
+            )?;
+        }
+        if generation == 0 || generation == 1 {
+            transaction.execute_batch(
+                "CREATE TABLE external_target_inventory_cursor (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    next_turn INTEGER NOT NULL CHECK (typeof(next_turn) = 'integer' AND next_turn >= 0)
                 );
-                PRAGMA user_version = 1;",
+                INSERT INTO external_target_inventory_cursor VALUES (1, 0);
+                PRAGMA user_version = 2;",
             )?;
         } else if generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
             anyhow::bail!(
@@ -2096,7 +2105,7 @@ fn open_external_target_inventory_with(
         }
         db.revalidate()?;
         transaction.commit()?;
-    } else if generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
+    } else if generation != 1 && generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
         anyhow::bail!(
             "unsupported inventory schema {generation}: {}",
             path.display()
@@ -4756,6 +4765,82 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             params![path],
         )?;
         Ok(())
+    }
+
+    /// Peek at the next external inventory pass without creating or migrating its database.
+    ///
+    /// A missing database or version 1 inventory has not reserved a pass yet.
+    pub fn next_external_inventory_turn(&self) -> Result<u64> {
+        let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
+            return Ok(0);
+        };
+        let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let turn = if generation == 1 {
+            0
+        } else {
+            db.query_row(
+                "SELECT next_turn FROM external_target_inventory_cursor WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        let turn = u64::try_from(turn).context("invalid external inventory pass cursor")?;
+        db.revalidate()?;
+        Ok(turn)
+    }
+
+    /// Atomically reserve the next external inventory pass before `deadline`.
+    ///
+    /// Returns `None` without advancing when the deadline has already expired.
+    /// The inventory transaction and its locks are released before this returns.
+    pub fn reserve_external_inventory_turn(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<Option<u64>> {
+        self.reserve_external_inventory_turn_with(deadline, || {})
+    }
+
+    fn reserve_external_inventory_turn_with(
+        &self,
+        deadline: std::time::Instant,
+        after_write: impl FnOnce(),
+    ) -> Result<Option<u64>> {
+        self.refuse_write("reserve an external inventory pass")?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let db = open_external_target_inventory(&self.config.cache_dir, true)?
+            .context("inventory database was not created")?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&db.db, rusqlite::TransactionBehavior::Immediate)?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let turn: i64 = transaction.query_row(
+            "SELECT next_turn FROM external_target_inventory_cursor WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let turn = u64::try_from(turn).context("invalid external inventory pass cursor")?;
+        transaction.execute(
+            "UPDATE external_target_inventory_cursor
+             SET next_turn = CASE WHEN next_turn = 9223372036854775807 THEN 0 ELSE next_turn + 1 END
+             WHERE singleton = 1",
+            [],
+        )?;
+        after_write();
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        db.revalidate()?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        transaction.commit()?;
+        Ok(Some(turn))
     }
 
     /// Record one workspace link after re-inspecting it against the supplied roots.

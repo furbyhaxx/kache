@@ -3,8 +3,8 @@
 //! Builds through kache record the target directories they use. On a quiet
 //! machine, at most once an hour, the daemon removes the ones whose
 //! workspace has been deleted (`[cache] auto_clean_orphaned_targets`, on by
-//! default) and, when `[cache] auto_clean_idle_targets_days` is set, the ones
-//! no build has used for that many days. A directory goes only after the
+//! default) and, when an idle-target age in days or hours is set, the ones
+//! no build has used for that long. A directory goes only after the
 //! checks `kache clean --tracked --yes` makes: it is still the derived target
 //! directory that was recorded, and no running build holds its lock. It is
 //! first renamed aside and checked again, so a build that starts meanwhile
@@ -82,7 +82,7 @@ fn last_unrecorded(cache_dir: &Path) -> u64 {
 pub(crate) enum Reason {
     /// Its workspace has been deleted.
     Orphaned,
-    /// No build has used it for the configured number of days.
+    /// No build has used it for the configured idle window.
     Idle,
     /// The volume fell below its configured free-space floor.
     Pressure,
@@ -92,10 +92,20 @@ impl Reason {
     pub(crate) fn describe(self) -> &'static str {
         match self {
             Reason::Orphaned => "its workspace was deleted",
-            Reason::Idle => "no build used it within auto_clean_idle_targets_days",
+            Reason::Idle => {
+                "no build used it within auto_clean_idle_targets_days or auto_clean_idle_targets_hours"
+            }
             Reason::Pressure => "its volume fell below auto_recover_min_free_bytes",
         }
     }
+}
+
+fn idle_window(config: &Config) -> Option<u64> {
+    let (value, seconds) = match config.auto_clean_idle_targets_hours {
+        Some(hours) => (hours, 3_600),
+        None => (config.auto_clean_idle_targets_days, DAY_SECS),
+    };
+    (value > 0).then(|| value.saturating_mul(seconds))
 }
 
 /// Why `config` removes a target, if it does: `orphaned` when its workspace
@@ -105,8 +115,9 @@ pub(crate) fn reason(config: &Config, orphaned: bool, idle_secs: i64) -> Option<
     if orphaned && config.auto_clean_orphaned_targets && idle >= ORPHAN_GRACE_SECS {
         return Some(Reason::Orphaned);
     }
-    let days = config.auto_clean_idle_targets_days;
-    (days > 0 && idle >= days.saturating_mul(DAY_SECS)).then_some(Reason::Idle)
+    idle_window(config)
+        .filter(|window| idle >= *window)
+        .map(|_| Reason::Idle)
 }
 
 /// Seconds since a build last used `tracked` at `now`: since the build that
@@ -140,7 +151,7 @@ pub(crate) fn due(
     now: u64,
 ) -> bool {
     let enabled = config.auto_clean_orphaned_targets
-        || config.auto_clean_idle_targets_days > 0
+        || idle_window(config).is_some()
         || config.auto_clean_unused_units_days > 0
         || recovers_free_space(config);
     enabled
@@ -584,7 +595,7 @@ fn watch_counts(is_local: Option<bool>) -> bool {
 /// Whether discovered targets are watched at all: only the idle rule and
 /// target recovery read the watch, and both are off by default.
 fn watches_discovered(config: &Config) -> bool {
-    config.auto_clean_idle_targets_days > 0 || recovers_free_space(config)
+    idle_window(config).is_some() || recovers_free_space(config)
 }
 
 /// Whether free-space recovery may remove targets: a floor is set and
@@ -1294,6 +1305,36 @@ mod tests {
     }
 
     #[test]
+    fn idle_hours_control_schedule_watches_and_cleanup_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut policy = config(cache.path(), false, 30);
+        policy.auto_clean_idle_targets_hours = Some(12);
+        let quiet = RequestClock::idle();
+        assert!(due(&policy, Trigger::Periodic(&quiet), Some(0), 0, 10_000));
+        assert!(watches_discovered(&policy));
+
+        let store = Store::open(&policy).unwrap();
+        let (_, target) = tracked_target(&store, root.path(), "idle");
+        let seen = u64::try_from(root_of(&store, &target).last_seen).unwrap();
+        let boundary = seen + 12 * 3_600;
+        assert!(sweep(&policy, boundary - 1).unwrap().removed.is_empty());
+        assert!(target.exists());
+        assert_eq!(
+            sweep(&policy, boundary).unwrap().removed,
+            vec![(target.clone(), Reason::Idle)]
+        );
+        assert!(!target.exists());
+
+        policy.auto_clean_idle_targets_hours = Some(0);
+        assert!(!due(&policy, Trigger::Periodic(&quiet), Some(0), 0, 10_000));
+        assert!(!watches_discovered(&policy));
+        assert_eq!(reason(&policy, false, i64::MAX), None);
+        policy.auto_clean_idle_targets_hours = Some(u64::MAX);
+        assert_eq!(reason(&policy, false, i64::MAX), None);
+    }
+
+    #[test]
     fn a_deleted_target_is_forgotten_while_its_worktree_stays() {
         let root = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1607,6 +1648,38 @@ mod tests {
         assert!(!unused.exists());
         assert!(used.join("debug").exists());
         assert_eq!(tracked(&store), vec![used.clone()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hours_policy_watches_discovered_targets() {
+        let root = tempfile::tempdir().unwrap();
+        if !reads_show(root.path()) {
+            eprintln!("discovered-target watch requires visible file reads");
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let mut policy = config(cache.path(), false, 0);
+        policy.auto_clean_idle_targets_hours = Some(12);
+        let store = Store::open(&policy).unwrap();
+        let target = discovered_with_unit(&store, root.path(), "discovered");
+        let now = unix_now_secs();
+        assert!(sweep(&policy, now).unwrap().removed.is_empty());
+        assert_eq!(
+            idle_secs(&policy, &root_of(&store, &target), now as i64),
+            Some(0)
+        );
+        assert!(
+            sweep(&policy, now + 12 * 3_600 - 1)
+                .unwrap()
+                .removed
+                .is_empty()
+        );
+        assert_eq!(
+            sweep(&policy, now + 12 * 3_600).unwrap().removed,
+            vec![(target.clone(), Reason::Idle)]
+        );
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]

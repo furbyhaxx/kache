@@ -522,8 +522,12 @@ pub struct Config {
     /// Let the daemon also remove tracked target directories no build has
     /// used for this many days (default `0`, disabled). Set via
     /// `KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS` or `[cache]
-    /// auto_clean_idle_targets_days`.
+    /// auto_clean_idle_targets_days`. An explicit hours setting takes precedence.
     pub auto_clean_idle_targets_days: u64,
+    /// Idle-target cleanup age in hours. When set, this overrides days;
+    /// `0` disables the idle rule. Set via `KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS`
+    /// or `[cache] auto_clean_idle_targets_hours`.
+    pub auto_clean_idle_targets_hours: Option<u64>,
     /// Minimum free bytes on the store's volume. Below it, builds have
     /// auto-GC evict eligible store entries. With
     /// [`Config::auto_recover_targets`] on, quiet target cleanup also removes
@@ -916,6 +920,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_share_target_files: Option<bool>,
     /// See [`Config::auto_clean_idle_targets_days`].
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
+    /// See [`Config::auto_clean_idle_targets_hours`].
+    pub(crate) auto_clean_idle_targets_hours: Option<u64>,
     /// See [`Config::auto_recover_min_free_bytes`].
     pub(crate) auto_recover_min_free_bytes: Option<u64>,
     /// See [`Config::auto_recover_targets`].
@@ -1346,6 +1352,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_CLEAN_ORPHANED_TARGETS",
     "KACHE_AUTO_SHARE_TARGET_FILES",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
+    "KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS",
     "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
@@ -1457,6 +1464,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
         "cache.auto_clean_idle_targets_days",
+    ),
+    (
+        "KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS",
+        "cache.auto_clean_idle_targets_hours",
     ),
     (
         "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
@@ -2049,6 +2060,7 @@ impl Config {
         let auto_clean_orphaned_targets = Self::auto_clean_orphaned_targets_enabled(&file_config);
         let auto_share_target_files = Self::auto_share_target_files_enabled(&file_config);
         let auto_clean_idle_targets_days = Self::auto_clean_idle_targets_days(&file_config);
+        let auto_clean_idle_targets_hours = Self::auto_clean_idle_targets_hours(&file_config);
         let auto_recover_min_free_bytes = Self::auto_recover_min_free_bytes(&file_config);
         let auto_recover_targets = Self::auto_recover_targets_enabled(&file_config);
         let scheduler_memory_pressure = Self::scheduler_memory_pressure_enabled(&file_config);
@@ -2158,6 +2170,7 @@ impl Config {
             auto_clean_orphaned_targets,
             auto_share_target_files,
             auto_clean_idle_targets_days,
+            auto_clean_idle_targets_hours,
             auto_recover_min_free_bytes,
             auto_recover_targets,
             scheduler_memory_pressure,
@@ -2925,6 +2938,21 @@ impl Config {
                     .and_then(|c| c.auto_clean_idle_targets_days)
             })
             .unwrap_or(0)
+    }
+
+    /// Idle-target cleanup age in hours, absent by default.
+    fn auto_clean_idle_targets_hours(file_config: &Result<FileConfig>) -> Option<u64> {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored("KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.auto_clean_idle_targets_hours)
+            })
     }
 
     /// Free-space threshold for store and target recovery, `0` (off) by

@@ -3851,6 +3851,7 @@ fn save_manifest_config(
         auto_clean_orphaned_targets: false,
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
+        auto_clean_idle_targets_hours: None,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -7979,7 +7980,7 @@ fn a_target_says_what_the_next_pass_does_to_it() {
     };
     assert_eq!(
         next_pass_note(&idle),
-        "  (next pass removes it: no build used it within auto_clean_idle_targets_days)"
+        "  (next pass removes it: no build used it within auto_clean_idle_targets_days or auto_clean_idle_targets_hours)"
     );
     assert_eq!(next_pass_note(&Plan::default()), "");
     let mut planned = row("/wt/a", TargetState::Live, 1024);

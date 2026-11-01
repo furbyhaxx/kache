@@ -2172,6 +2172,7 @@ mod tests {
                 auto_clean_orphaned_targets: None,
                 auto_share_target_files: None,
                 auto_clean_idle_targets_days: None,
+                auto_clean_idle_targets_hours: None,
                 auto_recover_min_free_bytes: None,
                 auto_recover_targets: None,
                 scheduler_memory_pressure: None,

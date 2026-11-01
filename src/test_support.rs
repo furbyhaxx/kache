@@ -188,6 +188,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         auto_clean_orphaned_targets: false,
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
+        auto_clean_idle_targets_hours: None,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,

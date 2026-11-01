@@ -410,8 +410,12 @@ fn target_cleanup_defaults_and_env_precedence() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let _config = set_kache_config_for_test(&config_path);
+    let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(dir.path().as_os_str()));
+    let _runtime = set_env_for_test("KACHE_RUNTIME_DIR", Some(dir.path().as_os_str()));
+    let _trust = set_env_for_test("KACHE_TRUST_DOMAIN", None);
     let _orphans = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ORPHANED_TARGETS");
     let _idle = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS");
+    let _idle_hours = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS");
     let _floor = NamedEnvGuard::remove("KACHE_AUTO_RECOVER_MIN_FREE_BYTES");
     let _recover_targets = NamedEnvGuard::remove("KACHE_AUTO_RECOVER_TARGETS");
     let _units = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS");
@@ -423,6 +427,7 @@ fn target_cleanup_defaults_and_env_precedence() {
     let config = Config::load().unwrap();
     assert!(config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 0);
+    assert_eq!(config.auto_clean_idle_targets_hours, None);
     assert_eq!(
         config.auto_recover_min_free_bytes, DEFAULT_RECOVERY_FLOOR,
         "builds evict cache entries below 10 GiB free"
@@ -491,9 +496,12 @@ fn target_cleanup_defaults_and_env_precedence() {
     assert_eq!(Config::load().unwrap().auto_clean_idle_targets_days, 0);
     drop(_garbage);
 
+    let cache_path = toml::Value::String(dir.path().to_string_lossy().into_owned());
     std::fs::write(
         &config_path,
-        "[cache]\nignore_env = true\nauto_clean_idle_targets_days = 3\nauto_recover_min_free_bytes = 1048576\n",
+        format!(
+            "[cache]\nignore_env = true\nlocal_store = {cache_path}\nauto_clean_idle_targets_days = 3\nauto_recover_min_free_bytes = 1048576\n"
+        ),
     )
     .unwrap();
     let _ignored = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ORPHANED_TARGETS", "0");
@@ -503,6 +511,77 @@ fn target_cleanup_defaults_and_env_precedence() {
     assert!(config.auto_clean_orphaned_targets);
     assert_eq!(config.auto_clean_idle_targets_days, 3);
     assert_eq!(config.auto_recover_min_free_bytes, 1 << 20);
+}
+
+#[test]
+fn target_cleanup_hours_config_precedence() {
+    use crate::target_cleanup::{Reason, reason};
+
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(dir.path().as_os_str()));
+    let _runtime = set_env_for_test("KACHE_RUNTIME_DIR", Some(dir.path().as_os_str()));
+    let _trust = set_env_for_test("KACHE_TRUST_DOMAIN", None);
+    let _days = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS");
+    let _hours = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS");
+    let cache_path = toml::Value::String(dir.path().to_string_lossy().into_owned());
+    let load = |contents: &str| {
+        let contents = contents.replacen(
+            "[cache]\n",
+            &format!("[cache]\nlocal_store = {cache_path}\nruntime_dir = {cache_path}\n"),
+            1,
+        );
+        std::fs::write(&config_path, contents).unwrap();
+        let config = Config::load().unwrap();
+        assert!(config.cache_dir.starts_with(dir.path()));
+        assert!(config.runtime_dir.starts_with(dir.path()));
+        config
+    };
+    let check_window = |config: &Config, seconds| {
+        assert_eq!(reason(config, false, seconds - 1), None);
+        assert_eq!(reason(config, false, seconds), Some(Reason::Idle));
+    };
+
+    let config = load("[cache]\n");
+    assert_eq!(reason(&config, false, 1_000_000), None);
+    let config = load("[cache]\nauto_clean_idle_targets_days = 2\n");
+    check_window(&config, 2 * 86_400);
+
+    let _days_override = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS", "3");
+    let config = load("[cache]\nauto_clean_idle_targets_days = 2\n");
+    check_window(&config, 3 * 86_400);
+    let config = load("[cache]\nauto_clean_idle_targets_hours = 12\n");
+    check_window(&config, 12 * 3_600);
+    let config = load("[cache]\nauto_clean_idle_targets_hours = 0\n");
+    assert_eq!(reason(&config, false, 1_000_000), None);
+
+    {
+        let _override = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS", "0");
+        let config = load("[cache]\nauto_clean_idle_targets_hours = 12\n");
+        assert_eq!(reason(&config, false, 1_000_000), None);
+    }
+    {
+        let _override = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS", "24");
+        let config = load("[cache]\nauto_clean_idle_targets_hours = 12\n");
+        check_window(&config, 24 * 3_600);
+        let config = load("[cache]\nauto_clean_idle_targets_days = 2\n");
+        check_window(&config, 24 * 3_600);
+        let config = load(
+            "[cache]\nignore_env = true\nauto_clean_idle_targets_hours = 0\nauto_clean_idle_targets_days = 2\n",
+        );
+        assert_eq!(reason(&config, false, 1_000_000), None);
+        let config = load("[cache]\nignore_env = true\nauto_clean_idle_targets_days = 2\n");
+        check_window(&config, 2 * 86_400);
+    }
+    {
+        let _invalid = NamedEnvGuard::set("KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS", "soon");
+        let config = load("[cache]\nauto_clean_idle_targets_hours = 12\n");
+        check_window(&config, 12 * 3_600);
+        let config = load("[cache]\nauto_clean_idle_targets_days = 2\n");
+        check_window(&config, 3 * 86_400);
+    }
 }
 
 #[test]
@@ -2449,6 +2528,7 @@ fn test_file_config_roundtrip() {
             auto_clean_orphaned_targets: None,
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
+            auto_clean_idle_targets_hours: None,
             auto_recover_min_free_bytes: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
@@ -2995,6 +3075,7 @@ fn test_config_store_dir() {
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_idle_targets_hours: None,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3075,6 +3156,7 @@ fn test_config_index_db_path() {
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_idle_targets_hours: None,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3151,6 +3233,7 @@ fn test_config_event_log_path() {
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_idle_targets_hours: None,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3246,6 +3329,7 @@ fn test_config_socket_path() {
         auto_clean_orphaned_targets: true,
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
+        auto_clean_idle_targets_hours: None,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3977,6 +4061,7 @@ fn test_save_and_load_file_config() {
             auto_clean_orphaned_targets: None,
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
+            auto_clean_idle_targets_hours: None,
             auto_recover_min_free_bytes: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,

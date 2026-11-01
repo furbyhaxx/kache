@@ -26,6 +26,198 @@ pub fn directory_identity(path: &Path) -> Option<PathIdentity> {
         })
 }
 
+/// A point-in-time observation of a workspace's `target` symlink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetSymlinkSnapshot {
+    /// Canonical path of the backing directory at inspection time.
+    pub backing_path: PathBuf,
+    /// Identity of the `target` symlink itself.
+    pub symlink_identity: PathIdentity,
+    /// Identity of the directory reached through the symlink.
+    pub backing_identity: PathIdentity,
+}
+
+/// Inspect `workspace_root/target` under `allowed_storage_root`.
+///
+/// All additional source roots must be supplied in `source_roots`; the
+/// workspace root is protected automatically. Each root must exist and resolve
+/// to a directory. The backing directory must be strictly below the canonical
+/// storage root and must not be a workspace or source root or their ancestor.
+/// No Cargo marker is required, and several links may share one backing.
+///
+/// Linux and Android are supported; other platforms return `None`. The same
+/// refusal covers metadata failures and observed changes during inspection.
+/// The result is only a snapshot:
+/// paths can change immediately afterward, and inode identities can be reused
+/// after removal. It does not establish ownership, inactivity, or permission
+/// to delete anything. Transient changes reverted between checks may go unseen.
+pub fn snapshot_workspace_target(
+    workspace_root: &Path,
+    allowed_storage_root: &Path,
+    source_roots: &[PathBuf],
+) -> Option<TargetSymlinkSnapshot> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        snapshot_workspace_target_with(workspace_root, allowed_storage_root, source_roots, || {})
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (workspace_root, allowed_storage_root, source_roots);
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use target_inventory::snapshot_workspace_target_with;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod target_inventory {
+    use super::{Path, PathBuf, PathIdentity, TargetSymlinkSnapshot, directory_identity};
+    use std::fs::{self, File, Metadata, OpenOptions};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn identity(metadata: &Metadata) -> PathIdentity {
+        PathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn open_directory(path: &Path, follow: bool) -> Option<File> {
+        let mut flags = libc::O_PATH | libc::O_DIRECTORY;
+        if !follow {
+            flags |= libc::O_NOFOLLOW;
+        }
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .ok()
+    }
+
+    fn open_symlink(path: &Path) -> Option<File> {
+        let flags = libc::O_PATH | libc::O_NOFOLLOW;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .ok()?;
+        file.metadata()
+            .ok()?
+            .file_type()
+            .is_symlink()
+            .then_some(file)
+    }
+
+    struct Directory {
+        input: PathBuf,
+        path: PathBuf,
+        handle: File,
+        identity: PathIdentity,
+    }
+
+    impl Directory {
+        fn open(input: &Path) -> Option<Self> {
+            let input = std::path::absolute(input).ok()?;
+            let path = fs::canonicalize(&input).ok()?;
+            let handle = open_directory(&path, false)?;
+            let metadata = handle.metadata().ok()?;
+            if !metadata.is_dir() {
+                return None;
+            }
+            let directory = Self {
+                input,
+                path,
+                handle,
+                identity: identity(&metadata),
+            };
+            directory.unchanged().then_some(directory)
+        }
+
+        fn unchanged(&self) -> bool {
+            self.handle
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_dir() && identity(&metadata) == self.identity)
+                && fs::canonicalize(&self.input).is_ok_and(|path| path == self.path)
+                && directory_identity(&self.path) == Some(self.identity)
+        }
+    }
+
+    pub(super) fn snapshot_workspace_target_with(
+        workspace_root: &Path,
+        allowed_storage_root: &Path,
+        source_roots: &[PathBuf],
+        after_pinning: impl FnOnce(),
+    ) -> Option<TargetSymlinkSnapshot> {
+        let workspace = Directory::open(workspace_root)?;
+        let storage = Directory::open(allowed_storage_root)?;
+        let sources = source_roots
+            .iter()
+            .map(|source| Directory::open(source))
+            .collect::<Option<Vec<_>>>()?;
+        let link = workspace.path.join("target");
+        // Keep both objects open to prevent inode reuse during inspection.
+        let link_handle = open_symlink(&link)?;
+        let symlink_identity = identity(&link_handle.metadata().ok()?);
+        let link_metadata = fs::symlink_metadata(&link).ok()?;
+        if !link_metadata.file_type().is_symlink() || identity(&link_metadata) != symlink_identity {
+            return None;
+        }
+        let backing_handle = open_directory(&link, true)?;
+        let backing_metadata = backing_handle.metadata().ok()?;
+        if !backing_metadata.is_dir() {
+            return None;
+        }
+        let backing_identity = identity(&backing_metadata);
+        after_pinning();
+
+        let backing_path = fs::canonicalize(&link).ok()?;
+        if !backing_path.starts_with(&storage.path)
+            || backing_path == storage.path
+            || backing_identity == storage.identity
+        {
+            return None;
+        }
+        for source in std::iter::once(&workspace).chain(&sources) {
+            if source.path.starts_with(&backing_path) {
+                return None;
+            }
+            for ancestor in source.path.ancestors() {
+                if directory_identity(ancestor)? == backing_identity {
+                    return None;
+                }
+            }
+        }
+        if !storage.unchanged()
+            || !workspace.unchanged()
+            || !sources.iter().all(Directory::unchanged)
+        {
+            return None;
+        }
+        if directory_identity(&backing_path) != Some(backing_identity)
+            || fs::canonicalize(&link).ok()? != backing_path
+        {
+            return None;
+        }
+        let followed = fs::metadata(&link).ok()?;
+        let link_metadata = fs::symlink_metadata(&link).ok()?;
+        let pinned_backing = backing_handle.metadata().ok()?;
+        let pinned_link = link_handle.metadata().ok()?;
+        if !followed.is_dir()
+            || identity(&followed) != identity(&pinned_backing)
+            || !link_metadata.file_type().is_symlink()
+            || identity(&link_metadata) != identity(&pinned_link)
+        {
+            return None;
+        }
+        Some(TargetSymlinkSnapshot {
+            backing_path,
+            symlink_identity,
+            backing_identity,
+        })
+    }
+}
+
 /// What Cargo writes in `CACHEDIR.TAG` at the top of a target directory.
 const CARGO_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 /// How much of `CACHEDIR.TAG` is read: the signature is in its first line.
@@ -218,6 +410,273 @@ pub fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod inventory {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        struct Fixture {
+            temp: tempfile::TempDir,
+            workspace: PathBuf,
+            storage: PathBuf,
+            backing: PathBuf,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let workspace = temp.path().join("workspace");
+                let storage = temp.path().join("storage");
+                let backing = storage.join("build");
+                fs::create_dir_all(&workspace).unwrap();
+                fs::create_dir_all(&backing).unwrap();
+                Self {
+                    temp,
+                    workspace,
+                    storage,
+                    backing,
+                }
+            }
+
+            fn link(&self) -> PathBuf {
+                self.workspace.join("target")
+            }
+
+            fn snapshot(&self) -> Option<TargetSymlinkSnapshot> {
+                snapshot_workspace_target(&self.workspace, &self.storage, &[])
+            }
+        }
+
+        fn metadata_identity(metadata: &fs::Metadata) -> PathIdentity {
+            PathIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        #[test]
+        fn inventory_untagged_relative_link_records_both_identities() {
+            let f = Fixture::new();
+            symlink("../storage/build", f.link()).unwrap();
+            let snapshot = f.snapshot().unwrap();
+            assert_eq!(snapshot.backing_path, fs::canonicalize(&f.backing).unwrap());
+            assert_eq!(
+                snapshot.symlink_identity,
+                metadata_identity(&fs::symlink_metadata(f.link()).unwrap())
+            );
+            assert_eq!(
+                snapshot.backing_identity,
+                directory_identity(&f.backing).unwrap()
+            );
+            assert!(!f.backing.join("CACHEDIR.TAG").exists());
+            assert_eq!(fs::read_dir(&f.backing).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn inventory_shared_backing_has_distinct_link_identities() {
+            let f = Fixture::new();
+            let other_workspace = f.temp.path().join("other-workspace");
+            fs::create_dir(&other_workspace).unwrap();
+            symlink(&f.backing, f.link()).unwrap();
+            symlink(&f.backing, other_workspace.join("target")).unwrap();
+            let first = f.snapshot().unwrap();
+            let second = snapshot_workspace_target(&other_workspace, &f.storage, &[]).unwrap();
+            assert_eq!(first.backing_path, second.backing_path);
+            assert_eq!(first.backing_identity, second.backing_identity);
+            assert_ne!(first.symlink_identity, second.symlink_identity);
+        }
+
+        #[test]
+        fn inventory_rejects_invalid_links_escapes_and_metadata_failures() {
+            let f = Fixture::new();
+            assert!(f.snapshot().is_none(), "missing link");
+            fs::write(f.link(), b"not a link").unwrap();
+            assert!(f.snapshot().is_none(), "regular file");
+            fs::remove_file(f.link()).unwrap();
+            fs::create_dir(f.link()).unwrap();
+            assert!(f.snapshot().is_none(), "real directory");
+            fs::remove_dir(f.link()).unwrap();
+
+            let outside = f.temp.path().join("storage-other");
+            fs::create_dir(&outside).unwrap();
+            let file = f.storage.join("file");
+            fs::write(&file, b"not a directory").unwrap();
+            let redirect = f.storage.join("redirect");
+            symlink(&outside, &redirect).unwrap();
+            for rejected in [
+                f.storage.clone(),
+                outside,
+                redirect,
+                file.clone(),
+                f.storage.join("missing"),
+                f.link(),
+            ] {
+                symlink(&rejected, f.link()).unwrap();
+                assert!(f.snapshot().is_none(), "target {rejected:?}");
+                fs::remove_file(f.link()).unwrap();
+            }
+
+            symlink(&f.backing, f.link()).unwrap();
+            assert!(snapshot_workspace_target(&f.workspace, &file, &[]).is_none());
+            assert!(
+                snapshot_workspace_target(&f.workspace, &f.storage.join("missing"), &[]).is_none()
+            );
+            assert!(
+                snapshot_workspace_target(&f.workspace.join("missing"), &f.storage, &[]).is_none()
+            );
+            assert!(snapshot_workspace_target(&f.workspace, &f.storage, &[file]).is_none());
+            assert!(
+                snapshot_workspace_target(
+                    &f.workspace,
+                    &f.storage,
+                    &[f.temp.path().join("missing")]
+                )
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn inventory_rejects_workspace_and_all_source_roots_and_ancestors() {
+            let f = Fixture::new();
+            let allowed = f.temp.path();
+            let source = allowed.join("source/nested");
+            let second_source = allowed.join("second-source/nested");
+            let workspace_alias = allowed.join("workspace-alias");
+            let source_alias = allowed.join("source-alias");
+            let storage_alias = allowed.join("storage-alias");
+            fs::create_dir_all(&source).unwrap();
+            fs::create_dir_all(&second_source).unwrap();
+            symlink(&f.workspace, &workspace_alias).unwrap();
+            symlink(&source, &source_alias).unwrap();
+            symlink(&f.storage, &storage_alias).unwrap();
+            for rejected in [
+                &f.workspace,
+                &source,
+                &allowed.join("source"),
+                &second_source,
+                &allowed.join("second-source"),
+            ] {
+                symlink(rejected, f.link()).unwrap();
+                assert!(
+                    snapshot_workspace_target(
+                        &workspace_alias,
+                        allowed,
+                        &[source_alias.clone(), second_source.clone()]
+                    )
+                    .is_none(),
+                    "target {rejected:?}"
+                );
+                fs::remove_file(f.link()).unwrap();
+            }
+            let nested_workspace = allowed.join("parent/project");
+            fs::create_dir_all(&nested_workspace).unwrap();
+            symlink(allowed.join("parent"), nested_workspace.join("target")).unwrap();
+            assert!(snapshot_workspace_target(&nested_workspace, allowed, &[]).is_none());
+
+            symlink(&f.backing, f.link()).unwrap();
+            let snapshot = snapshot_workspace_target(
+                &workspace_alias,
+                &storage_alias,
+                &[source_alias, second_source],
+            )
+            .unwrap();
+            assert_eq!(snapshot.backing_path, fs::canonicalize(&f.backing).unwrap());
+        }
+
+        #[test]
+        fn inventory_rejects_retarget_or_replacement_during_inspection() {
+            let f = Fixture::new();
+            let other = f.storage.join("other");
+            fs::create_dir(&other).unwrap();
+            for replacement in [&other, &f.backing] {
+                symlink(&f.backing, f.link()).unwrap();
+                let snapshot =
+                    snapshot_workspace_target_with(&f.workspace, &f.storage, &[], || {
+                        fs::remove_file(f.link()).unwrap();
+                        symlink(replacement, f.link()).unwrap();
+                    });
+                assert!(snapshot.is_none(), "replacement {replacement:?}");
+                fs::remove_file(f.link()).unwrap();
+            }
+
+            symlink(&f.backing, f.link()).unwrap();
+            let original = directory_identity(&f.backing).unwrap();
+            let snapshot = snapshot_workspace_target_with(&f.workspace, &f.storage, &[], || {
+                fs::remove_dir(&f.backing).unwrap();
+                fs::create_dir(&f.backing).unwrap();
+                assert_ne!(directory_identity(&f.backing).unwrap(), original);
+            });
+            assert!(snapshot.is_none(), "backing replaced");
+        }
+
+        #[test]
+        fn inventory_rejects_intermediate_retarget_and_root_replacement() {
+            let f = Fixture::new();
+            let redirect = f.storage.join("redirect");
+            let other = f.storage.join("other");
+            fs::create_dir(&other).unwrap();
+            symlink(&f.backing, &redirect).unwrap();
+            symlink(&redirect, f.link()).unwrap();
+            let snapshot = snapshot_workspace_target_with(&f.workspace, &f.storage, &[], || {
+                fs::remove_file(&redirect).unwrap();
+                symlink(&other, &redirect).unwrap();
+            });
+            assert!(snapshot.is_none(), "intermediate link retargeted");
+            fs::remove_file(f.link()).unwrap();
+            symlink(&f.backing, f.link()).unwrap();
+            let backing_identity = directory_identity(&f.backing).unwrap();
+            let snapshot = snapshot_workspace_target_with(&f.workspace, &f.storage, &[], || {
+                let old_storage = f.temp.path().join("old-storage");
+                fs::rename(&f.storage, &old_storage).unwrap();
+                fs::create_dir(&f.storage).unwrap();
+                fs::rename(old_storage.join("build"), &f.backing).unwrap();
+                assert_eq!(directory_identity(&f.backing).unwrap(), backing_identity);
+            });
+            assert!(snapshot.is_none(), "allowed root replaced");
+        }
+
+        #[test]
+        fn inventory_rejects_workspace_and_source_replacement_with_same_target() {
+            let f = Fixture::new();
+            let source = f.temp.path().join("source");
+            fs::create_dir(&source).unwrap();
+            symlink(&f.backing, f.link()).unwrap();
+            let link_identity = metadata_identity(&fs::symlink_metadata(f.link()).unwrap());
+            let backing_identity = directory_identity(&f.backing).unwrap();
+
+            let snapshot = snapshot_workspace_target_with(
+                &f.workspace,
+                &f.storage,
+                std::slice::from_ref(&source),
+                || {
+                    fs::rename(&source, f.temp.path().join("old-source")).unwrap();
+                    fs::create_dir(&source).unwrap();
+                },
+            );
+            assert!(snapshot.is_none(), "source root replaced");
+
+            let snapshot = snapshot_workspace_target_with(&f.workspace, &f.storage, &[], || {
+                let old_workspace = f.temp.path().join("old-workspace");
+                fs::rename(&f.workspace, &old_workspace).unwrap();
+                fs::create_dir(&f.workspace).unwrap();
+                fs::rename(old_workspace.join("target"), f.link()).unwrap();
+                assert_eq!(
+                    metadata_identity(&fs::symlink_metadata(f.link()).unwrap()),
+                    link_identity
+                );
+                assert_eq!(directory_identity(&f.backing).unwrap(), backing_identity);
+            });
+            assert!(snapshot.is_none(), "workspace root replaced");
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn inventory_unsupported_platform_refuses() {
+        assert!(snapshot_workspace_target(Path::new("."), Path::new("."), &[]).is_none());
+    }
 
     #[test]
     fn only_a_new_device_with_the_same_inode_is_a_renumbered_volume() {

@@ -1,6 +1,7 @@
 [cache]
 local_store = "~/old-store"
 external_target_roots = ["/mnt/targets-a", "/mnt/targets-b"] # inventory roots
+external_repository_roots = ["/mnt/source/project", "/mnt/source/other"] # repository search scope
 runtime_dir = "~/runtime"
 local_max_size = "40GiB"
 local_only = false

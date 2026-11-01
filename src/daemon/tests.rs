@@ -1336,6 +1336,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         external_target_roots: Vec::new(),
+        external_repository_roots: Vec::new(),
         cache_dir: dir.to_path_buf(),
         runtime_dir: dir.to_path_buf(),
         socket_path_override: None,

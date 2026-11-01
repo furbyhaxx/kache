@@ -144,6 +144,7 @@ fn test_config() -> Config {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         external_target_roots: Vec::new(),
+        external_repository_roots: Vec::new(),
         cache_dir: std::env::temp_dir().join("kache-tui-test"),
         runtime_dir: std::env::temp_dir().join("kache-tui-test"),
         max_size: 1024 * 1024,

@@ -543,6 +543,7 @@ mod tests {
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             external_target_roots: Vec::new(),
+            external_repository_roots: Vec::new(),
             runtime_dir: cache_dir.clone(),
             cache_dir,
             max_size: 1024 * 1024,

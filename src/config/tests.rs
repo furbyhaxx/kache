@@ -1037,6 +1037,84 @@ fn config_load_integrates_paths_base_dirs() {
 }
 
 #[test]
+fn config_external_repository_roots_survive_typed_roundtrip() {
+    let source = "[cache]\nexternal_repository_roots = [\"/repos/project\", \"/repos\"]\n";
+    let config: FileConfig = toml::from_str(source).unwrap();
+    let roundtrip = toml::to_string(&config).unwrap();
+    let saved: toml::Value = toml::from_str(&roundtrip).unwrap();
+    assert_eq!(
+        saved["cache"]["external_repository_roots"],
+        toml::Value::Array(vec!["/repos/project".into(), "/repos".into()])
+    );
+}
+
+#[test]
+fn config_external_repository_roots_are_explicit_and_absolute() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config_guard = set_kache_config_for_test(&config_path);
+    let _env_guard = set_env_for_test(
+        "KACHE_EXTERNAL_REPOSITORY_ROOTS",
+        Some("relative/root".as_ref()),
+    );
+
+    for source in ["", "[cache]\n", "[cache]\nexternal_repository_roots = []\n"] {
+        std::fs::write(&config_path, source).unwrap();
+        assert!(Config::load().unwrap().external_repository_roots.is_empty());
+    }
+
+    let roots = vec![dir.path().join("offline/repo"), dir.path().join("offline")];
+    assert!(roots.iter().all(|path| !path.exists()));
+    let source = format!(
+        "[cache]\nexternal_repository_roots = [{:?}, {:?}]\n",
+        roots[0].to_str().unwrap(),
+        roots[1].to_str().unwrap(),
+    );
+    std::fs::write(&config_path, &source).unwrap();
+    assert_eq!(Config::load().unwrap().external_repository_roots, roots);
+
+    for invalid in ["relative/root", "", "../repo", "~/repo"] {
+        std::fs::write(
+            &config_path,
+            format!(
+                "[cache]\nexternal_repository_roots = [{:?}, {:?}]\n",
+                roots[0].to_str().unwrap(),
+                invalid,
+            ),
+        )
+        .unwrap();
+        let error = Config::load().unwrap_err().to_string();
+        assert!(
+            error.contains("[cache].external_repository_roots[1]"),
+            "{error}"
+        );
+        assert!(error.contains("absolute"), "{error}");
+        assert!(error.contains(&format!("{invalid:?}")), "{error}");
+    }
+
+    let mut nul_path = roots[1].clone().into_os_string();
+    nul_path.push("\0bad");
+    let invalid_file = FileConfig {
+        cache: Some(CacheFileConfig {
+            external_repository_roots: Some(vec![roots[0].clone(), PathBuf::from(nul_path)]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    std::fs::write(&config_path, toml::to_string(&invalid_file).unwrap()).unwrap();
+    let error = Config::load().unwrap_err().to_string();
+    assert!(
+        error.contains("[cache].external_repository_roots[1]"),
+        "{error}"
+    );
+    assert!(error.contains("NUL"), "{error}");
+
+    std::fs::write(&config_path, format!("{source}cache_executables = 42\n")).unwrap();
+    assert!(Config::load().unwrap().external_repository_roots.is_empty());
+}
+
+#[test]
 fn config_external_target_roots_are_explicit_and_absolute() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -2609,6 +2687,7 @@ fn test_file_config_roundtrip() {
             incremental_crates: None,
             key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
             external_target_roots: Some(vec![PathBuf::from("/external/builds")]),
+            external_repository_roots: Some(vec![PathBuf::from("/sources/project")]),
             local_store: Some("~/my/cache".to_string()),
             runtime_dir: Some("~/my/runtime".to_string()),
             local_max_size: Some("50GiB".to_string()),
@@ -2659,6 +2738,14 @@ fn test_file_config_roundtrip() {
     assert_eq!(
         deserialized.cache.as_ref().unwrap().external_target_roots,
         Some(vec![PathBuf::from("/external/builds")])
+    );
+    assert_eq!(
+        deserialized
+            .cache
+            .as_ref()
+            .unwrap()
+            .external_repository_roots,
+        Some(vec![PathBuf::from("/sources/project")])
     );
     assert_eq!(
         deserialized.cache.as_ref().unwrap().local_store.as_deref(),
@@ -3161,6 +3248,7 @@ fn test_config_store_dir() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         external_target_roots: Vec::new(),
+        external_repository_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
@@ -3243,6 +3331,7 @@ fn test_config_index_db_path() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         external_target_roots: Vec::new(),
+        external_repository_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
@@ -3321,6 +3410,7 @@ fn test_config_event_log_path() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         external_target_roots: Vec::new(),
+        external_repository_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
@@ -3418,6 +3508,7 @@ fn test_config_socket_path() {
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
         external_target_roots: Vec::new(),
+        external_repository_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
@@ -4151,6 +4242,7 @@ fn test_save_and_load_file_config() {
             incremental_crates: None,
             key_env_vars: None,
             external_target_roots: None,
+            external_repository_roots: None,
             local_store: Some("/tmp/my-cache".to_string()),
             runtime_dir: Some("/tmp/my-runtime".to_string()),
             local_max_size: Some("10GiB".to_string()),

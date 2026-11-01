@@ -2056,6 +2056,7 @@ mod tests {
             "# Removed before 1.0 (#565).",
             "# Older S3 configs infer the backend",
             "external_target_roots = [\"/mnt/targets-a\", \"/mnt/targets-b\"] # inventory roots",
+            "external_repository_roots = [\"/mnt/source/project\", \"/mnt/source/other\"] # repository search scope",
         ] {
             assert!(written.contains(comment), "comment lost: {comment}");
         }
@@ -2192,6 +2193,7 @@ mod tests {
                 incremental_crates: Some(vec!["tap_lib".to_string()]),
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
                 external_target_roots: None,
+                external_repository_roots: Some(vec![std::path::PathBuf::from("/sources/project")]),
                 local_store: Some("~/cache".to_string()),
                 runtime_dir: Some("~/runtime".to_string()),
                 local_max_size: Some("50GiB".to_string()),
@@ -2257,6 +2259,10 @@ mod tests {
         );
         assert_eq!(cache.local_store.as_deref(), Some("~/cache"));
         assert_eq!(cache.runtime_dir.as_deref(), Some("~/runtime"));
+        assert_eq!(
+            cache.external_repository_roots,
+            Some(vec![std::path::PathBuf::from("/sources/project")])
+        );
         assert_eq!(cache.prefetch_enabled, Some(false));
         assert_eq!(cache.remote_key_cache_refresh_secs, Some(900));
         assert_eq!(cache.remote_restore_timeout_secs, Some(180));

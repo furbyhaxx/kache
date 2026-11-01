@@ -108,6 +108,7 @@ mod tests {
             key_env_vars: Vec::new(),
             base_dirs: Vec::new(),
             external_target_roots: Vec::new(),
+            external_repository_roots: Vec::new(),
             cache_dir: PathBuf::from("/tmp/kache-test"),
             runtime_dir: PathBuf::from("/tmp/kache-test"),
             max_size: 1024,

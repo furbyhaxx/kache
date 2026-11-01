@@ -1790,20 +1790,6 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     let _ = db
         .execute_batch("ALTER TABLE target_roots ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0");
 
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS external_target_observations (
-            workspace_path       TEXT PRIMARY KEY,
-            allowed_storage_root TEXT NOT NULL,
-            symlink_device       TEXT NOT NULL,
-            symlink_inode        TEXT NOT NULL,
-            backing_path         TEXT NOT NULL,
-            backing_device       TEXT NOT NULL,
-            backing_inode        TEXT NOT NULL,
-            first_observed       INTEGER NOT NULL,
-            last_observed        INTEGER NOT NULL
-        );",
-    )?;
-
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
     db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
 
@@ -1830,8 +1816,195 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    older release stamps back each time it opens the index; nothing such
 ///    a release records is served. An index can carry 9 and still lack a
 ///    column (`file_hash::has_rule_columns`), so the open checks them too.
-/// 10: `external_target_observations`, separate from cleanup provenance.
-const INDEX_SCHEMA_GENERATION: i64 = 10;
+const INDEX_SCHEMA_GENERATION: i64 = 9;
+
+const EXTERNAL_TARGET_INVENTORY_DB: &str = "external-target-inventory.db";
+const EXTERNAL_TARGET_INVENTORY_SCHEMA: i64 = 1;
+const EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
+// Closing a separate header-reading fd can release this process's SQLite locks.
+static EXTERNAL_TARGET_INVENTORY_GATES: [std::sync::Mutex<()>; 8192] =
+    [const { std::sync::Mutex::new(()) }; 8192];
+
+struct InventoryConnection {
+    db: Connection,
+    _gate: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for InventoryConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.db
+    }
+}
+
+fn open_external_target_inventory(
+    cache_dir: &Path,
+    write: bool,
+) -> Result<Option<InventoryConnection>> {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+
+    let path = cache_dir.join(EXTERNAL_TARGET_INVENTORY_DB);
+    if !write {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting inventory database {}", path.display()));
+            }
+            Ok(_) => {}
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    fs::canonicalize(cache_dir)?.hash(&mut hasher);
+    let gate = &EXTERNAL_TARGET_INVENTORY_GATES
+        [(hasher.finish() as usize) % EXTERNAL_TARGET_INVENTORY_GATES.len()];
+    let deadline = std::time::Instant::now() + EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT;
+    let gate = loop {
+        match gate.try_lock() {
+            Ok(gate) => break gate,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    anyhow::bail!("inventory database is busy: {}", path.display());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            anyhow::bail!(
+                "inventory database is not a regular file: {}",
+                path.display()
+            );
+        }
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    anyhow::bail!("inventory database has multiple links: {}", path.display());
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = metadata;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !write {
+                return Ok(None);
+            }
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            match options.open(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("creating inventory database {}", path.display())
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting inventory database {}", path.display()));
+        }
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("opening inventory database {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "inventory database is not a regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("inventory database is not private: {}", path.display());
+        }
+        if metadata.nlink() != 1 {
+            anyhow::bail!("inventory database has multiple links: {}", path.display());
+        }
+    }
+    if metadata.len() >= 20 {
+        let mut header = [0; 20];
+        file.read_exact(&mut header)?;
+        if header[18] == 2 || header[19] == 2 {
+            anyhow::bail!("inventory database is in WAL mode: {}", path.display());
+        }
+    } else if metadata.len() != 0 || !write {
+        anyhow::bail!(
+            "inventory database has an incomplete header: {}",
+            path.display()
+        );
+    }
+
+    let flags = if write {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+    } | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let db = Connection::open_with_flags(&path, flags)
+        .with_context(|| format!("opening inventory database {}", path.display()))?;
+    db.busy_timeout(EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT)?;
+    let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if write && generation == 0 {
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
+        let generation: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if generation == 0 {
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS external_target_observations (
+                    workspace_path       TEXT PRIMARY KEY,
+                    allowed_storage_root TEXT NOT NULL,
+                    symlink_device       TEXT NOT NULL,
+                    symlink_inode        TEXT NOT NULL,
+                    backing_path         TEXT NOT NULL,
+                    backing_device       TEXT NOT NULL,
+                    backing_inode        TEXT NOT NULL,
+                    first_observed       INTEGER NOT NULL,
+                    last_observed        INTEGER NOT NULL
+                );
+                PRAGMA user_version = 1;",
+            )?;
+        } else if generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
+            anyhow::bail!(
+                "unsupported inventory schema {generation}: {}",
+                path.display()
+            );
+        }
+        transaction.commit()?;
+    } else if generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
+        anyhow::bail!(
+            "unsupported inventory schema {generation}: {}",
+            path.display()
+        );
+    }
+    Ok(Some(InventoryConnection { db, _gate: gate }))
+}
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -4489,7 +4662,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// The caller must supply the authorized storage root and all additional
     /// source roots. Stale or unsafe snapshots and uninspectable paths return
-    /// `Ok(false)` without changing the index, as do non-UTF-8 workspace, storage,
+    /// `Ok(false)` without changing the inventory, as do non-UTF-8 workspace, storage,
     /// or backing paths. The first observation belongs to the workspace path,
     /// even when a later observation records different identities. Paths may
     /// change after reinspection; these times are not evidence of use, ownership,
@@ -4556,10 +4729,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .as_ref()
                     == Some(snapshot)
         };
-        let transaction = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = open_external_target_inventory(&self.config.cache_dir, true)?
+            .context("inventory database was not created")?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&db.db, rusqlite::TransactionBehavior::Immediate)?;
         if !unchanged() {
             return Ok(false);
         }
@@ -4598,7 +4771,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// These are historical snapshots, not proof that the paths remain valid.
     pub fn external_target_observations(&self) -> Result<Vec<ExternalTargetObservation>> {
-        let mut stmt = self.db.prepare(
+        let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = db.prepare(
             "SELECT workspace_path, allowed_storage_root, symlink_device, symlink_inode,
                     backing_path, backing_device, backing_inode, first_observed, last_observed
              FROM external_target_observations ORDER BY workspace_path",

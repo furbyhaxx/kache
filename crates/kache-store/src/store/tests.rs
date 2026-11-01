@@ -4657,6 +4657,19 @@ mod external_target_inventory {
                 .observe_external_target(workspace, &self.allowed, &[], snapshot)
                 .unwrap()
         }
+
+        fn inventory_path(&self) -> PathBuf {
+            self.store
+                .config
+                .cache_dir
+                .join(EXTERNAL_TARGET_INVENTORY_DB)
+        }
+
+        fn inventory_db(&self) -> InventoryConnection {
+            open_external_target_inventory(&self.store.config.cache_dir, true)
+                .unwrap()
+                .unwrap()
+        }
     }
 
     #[test]
@@ -4686,7 +4699,7 @@ mod external_target_inventory {
         assert_ne!(a.snapshot.symlink_identity, b.snapshot.symlink_identity);
         assert!(a.first_observed > 0 && a.last_observed >= a.first_observed);
 
-        f.store.db.execute("UPDATE external_target_observations SET first_observed = 100, last_observed = 101 WHERE workspace_path = ?1", [a.workspace_path.to_str().unwrap()]).unwrap();
+        f.inventory_db().execute("UPDATE external_target_observations SET first_observed = 100, last_observed = 101 WHERE workspace_path = ?1", [a.workspace_path.to_str().unwrap()]).unwrap();
         assert!(f.observe(&f.workspace, &first));
         let rows = f.store.external_target_observations().unwrap();
         let a = rows
@@ -4696,6 +4709,73 @@ mod external_target_inventory {
         assert_eq!(a.first_observed, 100);
         assert!(a.last_observed > 101);
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn inventory_revalidation_does_not_block_compiler_index_write() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        let observer = Store::open(test_config(&f.temp.path().join("cache"))).unwrap();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        f.store.db.busy_timeout(Duration::from_millis(250)).unwrap();
+        std::thread::scope(|scope| {
+            let workspace = &f.workspace;
+            let allowed = &f.allowed;
+            let observation = scope.spawn(move || {
+                observer.observe_external_target_with(workspace, allowed, &[], &snapshot, || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                })
+            });
+            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let write = f.store.remember_incremental_dir(&f.workspace);
+            resume_tx.send(()).unwrap();
+            assert!(observation.join().unwrap().unwrap());
+            write.expect("compiler index write blocked by inventory revalidation");
+        });
+        let count: i64 = f
+            .store
+            .db
+            .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn external_target_inventory_concurrent_initialization_preserves_both_rows() {
+        let f = Fixture::new();
+        let stores = [
+            Store::open(test_config(&f.store.config.cache_dir)).unwrap(),
+            Store::open(test_config(&f.store.config.cache_dir)).unwrap(),
+        ];
+        let workspaces = [f.workspace.clone(), f.second_workspace.clone()];
+        let snapshots = [f.snapshot(&workspaces[0]), f.snapshot(&workspaces[1])];
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = stores
+                .into_iter()
+                .zip(workspaces)
+                .zip(snapshots)
+                .map(|((store, workspace), snapshot)| {
+                    let barrier = &barrier;
+                    let allowed = &f.allowed;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.observe_external_target(&workspace, allowed, &[], &snapshot)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().unwrap().unwrap());
+            }
+        });
+        assert_eq!(f.store.external_target_observations().unwrap().len(), 2);
     }
 
     #[test]
@@ -4759,8 +4839,7 @@ mod external_target_inventory {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].snapshot, original);
 
-        f.store
-            .db
+        f.inventory_db()
             .execute(
                 "UPDATE external_target_observations SET last_observed = 101",
                 [],
@@ -4871,6 +4950,246 @@ mod external_target_inventory {
     }
 
     #[test]
+    fn external_target_inventory_missing_and_read_only_listing_creates_nothing() {
+        let f = Fixture::new();
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        let before = ro_tree_snapshot(&f.store.config.cache_dir);
+        assert!(f.store.external_target_observations().unwrap().is_empty());
+        assert!(readonly.external_target_observations().unwrap().is_empty());
+        assert_eq!(ro_tree_snapshot(&f.store.config.cache_dir), before);
+        assert!(!f.inventory_path().exists());
+
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let before = ro_tree_snapshot(&f.store.config.cache_dir);
+        let rows = readonly.external_target_observations().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].snapshot, snapshot);
+        assert_eq!(ro_tree_snapshot(&f.store.config.cache_dir), before);
+    }
+
+    #[test]
+    fn external_target_inventory_private_journal_and_read_only_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new();
+        let first = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &first));
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        let before = readonly.external_target_observations().unwrap();
+        let second = f.snapshot(&f.second_workspace);
+        let accepted = f
+            .store
+            .observe_external_target_with(&f.second_workspace, &f.allowed, &[], &second, || {
+                let db_path = f.inventory_path();
+                let journal = db_path.with_file_name("external-target-inventory.db-journal");
+                assert_eq!(
+                    fs::metadata(&db_path).unwrap().permissions().mode() & 0o077,
+                    0
+                );
+                assert_eq!(
+                    fs::metadata(journal).unwrap().permissions().mode() & 0o077,
+                    0
+                );
+                assert!(readonly.external_target_observations().is_err());
+            })
+            .unwrap();
+        assert!(accepted);
+        let after = readonly.external_target_observations().unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(after.contains(&before[0]));
+    }
+
+    #[test]
+    fn external_target_inventory_listing_keeps_writer_locked_across_processes() {
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        let snapshot = f.snapshot(&f.second_workspace);
+        assert!(f.store.observe_external_target_with(
+            &f.second_workspace,
+            &f.allowed,
+            &[],
+            &snapshot,
+            || {
+                let _ = readonly.external_target_observations();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "store::tests::external_target_inventory::external_target_inventory_lock_child", "--ignored", "--nocapture"])
+                    .env("KACHE_TEST_INVENTORY_DB", f.inventory_path())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            },
+        ).unwrap());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for external_target_inventory_listing_keeps_writer_locked_across_processes"]
+    fn external_target_inventory_lock_child() {
+        let path = std::env::var_os("KACHE_TEST_INVENTORY_DB").unwrap();
+        let db = Connection::open(path).unwrap();
+        db.busy_timeout(Duration::ZERO).unwrap();
+        let error = db.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert!(
+            matches!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_symlinks_and_nonregular_files() {
+        use std::os::unix::net::UnixListener;
+
+        for kind in ["symlink", "dangling", "hardlink", "directory", "socket"] {
+            let f = Fixture::new();
+            let path = f.inventory_path();
+            let target = f.temp.path().join("unrelated");
+            fs::write(&target, b"keep unchanged").unwrap();
+            let _listener = match kind {
+                "symlink" => {
+                    symlink(&target, &path).unwrap();
+                    None
+                }
+                "dangling" => {
+                    symlink(f.temp.path().join("missing"), &path).unwrap();
+                    None
+                }
+                "hardlink" => {
+                    fs::hard_link(&target, &path).unwrap();
+                    None
+                }
+                "directory" => {
+                    fs::create_dir(&path).unwrap();
+                    None
+                }
+                "socket" => Some(UnixListener::bind(&path).unwrap()),
+                _ => unreachable!(),
+            };
+            let snapshot = f.snapshot(&f.workspace);
+            let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+            assert!(f.store.external_target_observations().is_err(), "{kind}");
+            assert!(readonly.external_target_observations().is_err(), "{kind}");
+            assert!(
+                f.store
+                    .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                    .is_err(),
+                "{kind}"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"keep unchanged");
+        }
+    }
+
+    #[test]
+    fn external_target_inventory_surfaces_corruption_and_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new();
+        fs::write(f.inventory_path(), b"not a sqlite database").unwrap();
+        fs::set_permissions(f.inventory_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.store.external_target_observations().is_err());
+        assert!(
+            f.store
+                .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(f.inventory_path()).unwrap(),
+            b"not a sqlite database"
+        );
+
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        fs::set_permissions(f.inventory_path(), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(f.store.external_target_observations().is_err());
+        assert!(
+            f.store
+                .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_wal_without_creating_sidecars() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let f = Fixture::new();
+        let path = f.inventory_path();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        {
+            let db = Connection::open(&path).unwrap();
+            let mode: String = db
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            db.execute_batch("CREATE TABLE unrelated (value TEXT)")
+                .unwrap();
+        }
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        let before = ro_tree_snapshot(&f.store.config.cache_dir);
+        assert!(readonly.external_target_observations().is_err());
+        assert!(f.store.external_target_observations().is_err());
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(
+            f.store
+                .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                .is_err()
+        );
+        assert_eq!(ro_tree_snapshot(&f.store.config.cache_dir), before);
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_unknown_schema() {
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        f.inventory_db()
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        assert!(f.store.external_target_observations().is_err());
+        assert!(
+            f.store
+                .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                .is_err()
+        );
+        let db = Connection::open(f.inventory_path()).unwrap();
+        let version: i64 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 99);
+    }
+
+    #[test]
+    fn external_target_inventory_lock_wait_is_bounded() {
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let db = Connection::open(f.inventory_path()).unwrap();
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let start = std::time::Instant::now();
+        assert!(
+            f.store
+                .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(transaction);
+        assert!(f.observe(&f.workspace, &snapshot));
+    }
+
+    #[test]
     fn external_target_inventory_cannot_write_to_a_read_only_store() {
         let f = Fixture::new();
         let snapshot = f.snapshot(&f.workspace);
@@ -4885,19 +5204,24 @@ mod external_target_inventory {
     }
 
     #[test]
-    fn external_target_inventory_migrates_previous_schema() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index.db");
-        let db = open_index_db(&path).unwrap();
-        db.execute_batch("DROP TABLE external_target_observations; PRAGMA user_version = 9;")
+    fn external_target_inventory_has_a_separate_schema() {
+        let f = Fixture::new();
+        let tables: i64 = f.store.db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='external_target_observations'", [], |row| row.get(0)).unwrap();
+        assert_eq!(tables, 0);
+        let version: i64 = f
+            .store
+            .db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        drop(db);
-        let db = open_index_db(&path).unwrap();
+        assert_eq!(version, INDEX_SCHEMA_GENERATION);
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let db = f.inventory_db();
         let version: i64 = db
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         let tables: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='external_target_observations'", [], |row| row.get(0)).unwrap();
-        assert_eq!(version, INDEX_SCHEMA_GENERATION);
+        assert_eq!(version, EXTERNAL_TARGET_INVENTORY_SCHEMA);
         assert_eq!(tables, 1);
     }
 }

@@ -332,13 +332,16 @@ fn watch_with(
     }
 }
 
-/// An idle observation that keeps the kache reservation and existing Cargo
-/// profile locks held until the caller finishes its final deletion checks.
+/// An idle observation holding the backing directory, Cargo profile locks,
+/// and kache reservation until the caller finishes its final deletion checks.
 #[allow(dead_code)]
 pub(crate) struct VerifiedIdle {
     since: SystemTime,
     _reservation: crate::target_use::Reservation,
-    profiles: Vec<(PathBuf, Held)>,
+    #[cfg(target_os = "linux")]
+    target: VerifiedTarget,
+    #[cfg(target_os = "linux")]
+    profiles: Vec<VerifiedHeld>,
 }
 
 #[allow(dead_code)]
@@ -347,14 +350,14 @@ impl VerifiedIdle {
         self.since
     }
 
-    /// Recheck the held Cargo locks under the original or renamed target root.
+    /// Recheck pinned root, profile directories and locks under a possibly renamed root.
     /// The root must not be a symlink or contain `..`. This point-in-time check
     /// cannot detect a replacement restored between checks, prevent later
     /// replacement, or protect consumers that do not take Cargo locks.
     pub(crate) fn locks_match(&self, root: &Path) -> bool {
         #[cfg(target_os = "linux")]
         {
-            verified_locks_match(root, &self.profiles)
+            verified_locks_match(root, &self.target, &self.profiles, || true)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -365,7 +368,53 @@ impl VerifiedIdle {
 }
 
 #[cfg(target_os = "linux")]
-fn verified_locks_match(root: &Path, profiles: &[(PathBuf, Held)]) -> bool {
+struct VerifiedHeld {
+    relative: PathBuf,
+    dev: u64,
+    ino: u64,
+    locks: Held,
+}
+
+#[cfg(target_os = "linux")]
+struct VerifiedTarget(std::fs::File);
+
+#[cfg(target_os = "linux")]
+impl Drop for VerifiedTarget {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verified_target(target: &Path) -> Option<VerifiedTarget> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if target
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let target: PathBuf = target.components().collect();
+    if !std::fs::symlink_metadata(&target).ok()?.is_dir() {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(target)
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(VerifiedTarget(file))
+}
+
+#[cfg(target_os = "linux")]
+fn verified_locks_match(
+    root: &Path,
+    target: &VerifiedTarget,
+    profiles: &[VerifiedHeld],
+    mut tick: impl FnMut() -> bool,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     if root
@@ -375,15 +424,31 @@ fn verified_locks_match(root: &Path, profiles: &[(PathBuf, Held)]) -> bool {
         return false;
     }
     let root: PathBuf = root.components().collect();
-    if profiles.is_empty() || !std::fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
+    let Ok(path) = std::fs::symlink_metadata(&root) else {
+        return false;
+    };
+    let Ok(descriptor) = target.0.metadata() else {
+        return false;
+    };
+    if profiles.is_empty()
+        || !tick()
+        || !path.is_dir()
+        || !descriptor.is_dir()
+        || path.dev() != descriptor.dev()
+        || path.ino() != descriptor.ino()
+    {
         return false;
     }
-    profiles.iter().all(|(relative, held)| {
+    profiles.iter().all(|held| {
+        let relative = &held.relative;
         let mut profile = root.clone();
-        if relative.as_os_str().is_empty() || held.0.len() != LOCKS.len() {
+        if relative.as_os_str().is_empty() || held.locks.0.len() != LOCKS.len() {
             return false;
         }
         for component in relative.components() {
+            if !tick() {
+                return false;
+            }
             let std::path::Component::Normal(name) = component else {
                 return false;
             };
@@ -392,7 +457,17 @@ fn verified_locks_match(root: &Path, profiles: &[(PathBuf, Held)]) -> bool {
                 return false;
             }
         }
-        LOCKS.iter().zip(&held.0).all(|(name, file)| {
+        if !tick()
+            || !std::fs::symlink_metadata(&profile).is_ok_and(|metadata| {
+                metadata.is_dir() && metadata.dev() == held.dev && metadata.ino() == held.ino
+            })
+        {
+            return false;
+        }
+        LOCKS.iter().zip(&held.locks.0).all(|(name, file)| {
+            if !tick() {
+                return false;
+            }
             let Ok(path) = std::fs::symlink_metadata(profile.join(name)) else {
                 return false;
             };
@@ -407,6 +482,26 @@ fn verified_locks_match(root: &Path, profiles: &[(PathBuf, Held)]) -> bool {
     })
 }
 
+/// Work and elapsed-time limits for a verified watch stage.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct VerifiedWatchBudget {
+    /// Maximum work units, charged for paths, rechecks and metadata input chunks.
+    pub(crate) max_entries: usize,
+    /// Monotonic elapsed-time limit, checked throughout each stage.
+    pub(crate) max_duration: Duration,
+}
+
+/// Independent limits for observation and final revalidation.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct VerifiedWatchLimits {
+    /// Cumulative observation and arming work, including repeated scans.
+    pub(crate) observation: VerifiedWatchBudget,
+    /// Cumulative final revalidation work, while the global lease is held.
+    pub(crate) final_check: VerifiedWatchBudget,
+}
+
 /// Revalidate a boot-bound watch, returning a lock guard only after `window`.
 /// This observes Cargo activity; it establishes neither ownership nor permission
 /// to delete. Callers must separately approve the whole target and account for
@@ -415,7 +510,9 @@ fn verified_locks_match(root: &Path, profiles: &[(PathBuf, Held)]) -> bool {
 /// on daemon restart or any mount-change event, and synchronize changes with
 /// the returned guard. A probe cannot detect unobserved temporary remounts, so
 /// mount read-observation options must remain unchanged throughout the window.
-/// The guard cannot prevent Cargo from creating a new, previously absent profile.
+/// Uncooperative processes and split build-directory aliases are not protected;
+/// the caller must prevent concurrent mount events and new profiles. Both stages
+/// fail closed on budget exhaustion, but cannot interrupt a stuck filesystem syscall.
 #[allow(dead_code)]
 pub(crate) fn verified_watch(
     cache_dir: &Path,
@@ -424,11 +521,13 @@ pub(crate) fn verified_watch(
     not_before: SystemTime,
     window: Duration,
     epoch: &[u8],
+    limits: VerifiedWatchLimits,
 ) -> Option<VerifiedIdle> {
     #[cfg(target_os = "linux")]
     {
         let ops = VerifiedOps {
             epoch,
+            limits,
             boot: &linux_boot_id,
             uptime: &linux_boot_time,
             probe: &verified_shows_reads,
@@ -440,7 +539,9 @@ pub(crate) fn verified_watch(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (cache_dir, target_dir, now, not_before, window, epoch);
+        let _ = (
+            cache_dir, target_dir, now, not_before, window, epoch, limits,
+        );
         None
     }
 }
@@ -471,6 +572,7 @@ struct VerifiedIdentity {
 #[cfg(target_os = "linux")]
 struct VerifiedOps<'a> {
     epoch: &'a [u8],
+    limits: VerifiedWatchLimits,
     boot: &'a dyn Fn() -> Option<String>,
     uptime: &'a dyn Fn() -> Option<Duration>,
     probe: &'a dyn Fn(&Path) -> std::io::Result<bool>,
@@ -586,10 +688,18 @@ fn write_verified(path: &Path, record: &VerifiedRecord) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn verified_identity(target: &Path) -> Option<VerifiedIdentity> {
+fn verified_identity(target: &Path, pinned: &VerifiedTarget) -> Option<VerifiedIdentity> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(target).ok()?;
-    if !metadata.is_dir() {
+    let target: PathBuf = target.components().collect();
+    let metadata = std::fs::symlink_metadata(&target).ok()?;
+    let descriptor = pinned.0.metadata().ok()?;
+    if !metadata.is_dir()
+        || !descriptor.is_dir()
+        || metadata.dev() != descriptor.dev()
+        || metadata.ino() != descriptor.ino()
+        || metadata.ctime() != descriptor.ctime()
+        || metadata.ctime_nsec() != descriptor.ctime_nsec()
+    {
         return None;
     }
     Some(VerifiedIdentity {
@@ -616,33 +726,92 @@ fn verified_mount_id(path: &Path) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn verified_mount(target: &Path) -> Option<(u64, String)> {
+struct VerifiedBudget {
+    remaining: usize,
+    started: std::time::Instant,
+    duration: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedBudget {
+    fn new(limit: VerifiedWatchBudget) -> Self {
+        Self {
+            remaining: limit.max_entries,
+            started: std::time::Instant::now(),
+            duration: limit.max_duration,
+        }
+    }
+
+    fn check(&self) -> Option<()> {
+        (self.started.elapsed() < self.duration).then_some(())
+    }
+
+    fn step(&mut self) -> Option<()> {
+        self.check()?;
+        self.remaining = self.remaining.checked_sub(1)?;
+        Some(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verified_mount(target: &Path, budget: &mut VerifiedBudget) -> Option<(u64, String)> {
+    use std::io::BufRead;
+
+    budget.step()?;
     let id = verified_mount_id(target)?;
-    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-    let line = info.lines().find(|line| {
-        line.split_whitespace()
-            .next()
-            .and_then(|part| part.parse::<u64>().ok())
-            == Some(id)
-    })?;
-    Some((id, blake3::hash(line.as_bytes()).to_hex().to_string()))
+    let file = std::fs::File::open("/proc/self/mountinfo").ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        budget.step()?;
+        let available = reader.fill_buf().ok()?;
+        if available.is_empty() {
+            return None;
+        }
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let complete = available[count - 1] == b'\n';
+        line.extend_from_slice(&available[..count]);
+        reader.consume(count);
+        if !complete {
+            continue;
+        }
+        let text = std::str::from_utf8(&line).ok()?;
+        if text.split_whitespace().next()?.parse::<u64>().ok() == Some(id) {
+            budget.check()?;
+            return Some((
+                id,
+                blake3::hash(&line[..line.len() - 1]).to_hex().to_string(),
+            ));
+        }
+        line.clear();
+    }
 }
 
 #[cfg(target_os = "linux")]
 #[derive(PartialEq, Eq)]
 struct VerifiedProfile {
     path: PathBuf,
+    dev: u64,
+    ino: u64,
     fingerprints: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
-fn verified_entries(dir: &Path) -> Option<Vec<PathBuf>> {
-    let mut result = std::fs::read_dir(dir)
-        .ok()?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<Vec<_>>>()
-        .ok()?;
+fn verified_entries(dir: &Path, budget: &mut VerifiedBudget) -> Option<Vec<PathBuf>> {
+    budget.check()?;
+    let mut entries = std::fs::read_dir(dir).ok()?;
+    let mut result = Vec::new();
+    loop {
+        budget.check()?;
+        let Some(entry) = entries.next() else { break };
+        budget.step()?;
+        result.push(entry.ok()?.path());
+    }
     result.sort();
+    budget.check()?;
     Some(result)
 }
 
@@ -656,9 +825,14 @@ fn verified_directory(path: &Path) -> Option<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn verified_unrecognized_build_entry(path: &Path, mount: u64) -> Option<()> {
+fn verified_unrecognized_build_entry(
+    path: &Path,
+    mount: u64,
+    budget: &mut VerifiedBudget,
+) -> Option<()> {
     let mut pending = vec![path.to_path_buf()];
     while let Some(path) = pending.pop() {
+        budget.step()?;
         if matches!(
             path.file_name()?.to_str(),
             Some("fingerprint" | ".fingerprint")
@@ -670,14 +844,24 @@ fn verified_unrecognized_build_entry(path: &Path, mount: u64) -> Option<()> {
             return None;
         }
         if metadata.is_dir() {
-            pending.extend(verified_entries(&path)?);
+            pending.extend(verified_entries(&path, budget)?);
         }
     }
     Some(())
 }
 
 #[cfg(target_os = "linux")]
-fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
+fn verified_profile(
+    profile: &Path,
+    budget: &mut VerifiedBudget,
+) -> Option<Option<VerifiedProfile>> {
+    use std::os::unix::fs::MetadataExt;
+
+    budget.step()?;
+    let metadata = std::fs::symlink_metadata(profile).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
     let shared = profile.join(".fingerprint");
     let build = profile.join("build");
     let deps = profile.join("deps");
@@ -699,12 +883,15 @@ fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
         return Some(None);
     }
     let mut fingerprints = Vec::new();
+    let mut legacy = std::collections::HashSet::new();
     if has_shared {
-        for dir in verified_entries(&shared)? {
+        for dir in verified_entries(&shared, budget)? {
+            budget.check()?;
             if !std::fs::symlink_metadata(&dir).ok()?.is_dir() {
                 return None;
             }
             crate::cargo_layout::legacy_unit_package(dir.file_name()?.to_str()?)?;
+            legacy.insert(dir.file_name()?.to_os_string());
             fingerprints.push(dir);
         }
     }
@@ -713,10 +900,11 @@ fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
         if verified_mount_id(&build)? != mount {
             return None;
         }
-        for package in verified_entries(&build)? {
+        for package in verified_entries(&build, budget)? {
+            budget.check()?;
             let metadata = std::fs::symlink_metadata(&package).ok()?;
             if metadata.is_file() {
-                verified_unrecognized_build_entry(&package, mount)?;
+                verified_unrecognized_build_entry(&package, mount, budget)?;
                 continue;
             }
             if !metadata.is_dir() || verified_mount_id(&package)? != mount {
@@ -731,19 +919,20 @@ fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
                 .and_then(crate::cargo_layout::legacy_unit_package)
                 .is_some()
             {
-                if !fingerprints.contains(&shared.join(name)) {
+                if !legacy.contains(name) {
                     return None;
                 }
                 continue;
             }
-            for unit in verified_entries(&package)? {
+            for unit in verified_entries(&package, budget)? {
+                budget.check()?;
                 let metadata = std::fs::symlink_metadata(&unit).ok()?;
                 let hash = unit
                     .file_name()?
                     .to_str()
                     .is_some_and(crate::cargo_layout::is_unit_hash);
                 if !metadata.is_dir() || !hash {
-                    verified_unrecognized_build_entry(&unit, mount)?;
+                    verified_unrecognized_build_entry(&unit, mount, budget)?;
                     continue;
                 }
                 let fingerprint = unit.join("fingerprint");
@@ -756,7 +945,8 @@ fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
     }
     for (present, dir) in [(has_deps, deps), (has_examples, examples)] {
         if present {
-            for output in verified_entries(&dir)? {
+            for output in verified_entries(&dir, budget)? {
+                budget.check()?;
                 let metadata = std::fs::symlink_metadata(&output).ok()?;
                 if metadata.is_symlink() {
                     return None;
@@ -768,16 +958,20 @@ fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
         return None;
     }
     fingerprints.sort();
+    budget.check()?;
     Some(Some(VerifiedProfile {
         path: profile.to_path_buf(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
         fingerprints,
     }))
 }
 
 #[cfg(target_os = "linux")]
-fn verified_profiles(target: &Path) -> Option<Vec<VerifiedProfile>> {
+fn verified_profiles(target: &Path, budget: &mut VerifiedBudget) -> Option<Vec<VerifiedProfile>> {
     let mut profiles = Vec::new();
-    for dir in verified_entries(target)? {
+    for dir in verified_entries(target, budget)? {
+        budget.check()?;
         let metadata = std::fs::symlink_metadata(&dir).ok()?;
         if metadata.is_symlink() {
             return None;
@@ -785,17 +979,18 @@ fn verified_profiles(target: &Path) -> Option<Vec<VerifiedProfile>> {
         if !metadata.is_dir() {
             continue;
         }
-        if let Some(profile) = verified_profile(&dir)? {
+        if let Some(profile) = verified_profile(&dir, budget)? {
             profiles.push(profile);
             continue;
         }
-        for nested in verified_entries(&dir)? {
+        for nested in verified_entries(&dir, budget)? {
+            budget.check()?;
             let metadata = std::fs::symlink_metadata(&nested).ok()?;
             if metadata.is_symlink() {
                 return None;
             }
             if metadata.is_dir()
-                && let Some(profile) = verified_profile(&nested)?
+                && let Some(profile) = verified_profile(&nested, budget)?
             {
                 profiles.push(profile);
             }
@@ -836,14 +1031,19 @@ fn verified_fingerprint_marker(name: &std::ffi::OsStr) -> bool {
 fn verified_fingerprints(
     profiles: &[VerifiedProfile],
     mount: u64,
+    budget: &mut VerifiedBudget,
 ) -> Option<(Vec<PathBuf>, String)> {
     use std::os::unix::fs::MetadataExt;
     let mut files = Vec::new();
     let mut digest = blake3::Hasher::new();
     for profile in profiles {
         for fingerprint in &profile.fingerprints {
+            budget.step()?;
             let mut has_marker = false;
-            for path in std::iter::once(fingerprint.clone()).chain(verified_entries(fingerprint)?) {
+            for path in
+                std::iter::once(fingerprint.clone()).chain(verified_entries(fingerprint, budget)?)
+            {
+                budget.step()?;
                 let metadata = std::fs::symlink_metadata(&path).ok()?;
                 if path == *fingerprint {
                     if !metadata.is_dir() {
@@ -882,7 +1082,65 @@ fn verified_fingerprints(
             }
         }
     }
+    budget.check()?;
     Some((files, digest.finalize().to_hex().to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn verified_read_record(
+    mut file: std::fs::File,
+    budget: &mut VerifiedBudget,
+) -> Option<Option<VerifiedRecord>> {
+    use std::io::Read;
+
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        budget.step()?;
+        let count = file.read(&mut chunk).ok()?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    budget.check()?;
+    Some(serde_json::from_slice(&bytes).ok())
+}
+
+#[cfg(target_os = "linux")]
+struct VerifiedEvidence<'a> {
+    root: &'a Path,
+    target: &'a VerifiedTarget,
+    profiles: &'a [VerifiedProfile],
+    locks: &'a [VerifiedHeld],
+    mount_id: u64,
+    record: &'a VerifiedRecord,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedEvidence<'_> {
+    fn revalidate(&self, budget: &mut VerifiedBudget, ops: &VerifiedOps<'_>) -> Option<()> {
+        budget.check()?;
+        if (ops.boot)().as_ref() != Some(&self.record.boot)
+            || verified_identity(self.root, self.target)? != self.record.target
+            || verified_mount(self.root, budget)? != (self.mount_id, self.record.mount.clone())
+            || verified_profiles(self.root, budget)? != self.profiles
+            || verified_fingerprints(self.profiles, self.mount_id, budget)?.1
+                != self.record.fingerprints
+            || !verified_locks_match(self.root, self.target, self.locks, || {
+                budget.step().is_some()
+            })
+            || verified_identity(self.root, self.target)? != self.record.target
+            || verified_mount(self.root, budget)? != (self.mount_id, self.record.mount.clone())
+            || (ops.boot)().as_ref() != Some(&self.record.boot)
+        {
+            return None;
+        }
+        budget.check()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -894,19 +1152,25 @@ fn verified_watch_with(
     window: Duration,
     ops: &VerifiedOps<'_>,
 ) -> Option<VerifiedIdle> {
-    let reservation = crate::target_use::try_exclusive(cache_dir).ok()??;
+    let mut budget = VerifiedBudget::new(ops.limits.observation);
+    let target = verified_target(target_dir)?;
     let path = verified_record(cache_dir, target_dir);
     let parent = path.parent()?;
     std::fs::create_dir_all(parent).ok()?;
-    let old = std::fs::read(&path);
+    use std::os::unix::fs::OpenOptionsExt;
+    let old = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path);
     if !forget_armed(&path) || crate::atomic::fsync_dir(parent).is_err() {
         return None;
     }
     let old = match old {
-        Ok(bytes) => serde_json::from_slice::<VerifiedRecord>(&bytes).ok(),
+        Ok(file) => verified_read_record(file, &mut budget)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return None,
     };
+    budget.check()?;
     if window.is_zero() || ops.epoch.is_empty() {
         return None;
     }
@@ -916,26 +1180,35 @@ fn verified_watch_with(
     if now < not_before {
         return None;
     }
-    let target_before = verified_identity(target_dir)?;
-    let (mount_id, mount) = verified_mount(target_dir)?;
-    let profiles = verified_profiles(target_dir)?;
+    let target_before = verified_identity(target_dir, &target)?;
+    let (mount_id, mount) = verified_mount(target_dir, &mut budget)?;
+    let profiles = verified_profiles(target_dir, &mut budget)?;
     let mut locks = Vec::new();
     for profile in &profiles {
+        budget.step()?;
         let relative = profile.path.strip_prefix(target_dir).ok()?.to_path_buf();
-        locks.push((relative, hold_with(&profile.path, true)?));
+        locks.push(VerifiedHeld {
+            relative,
+            dev: profile.dev,
+            ino: profile.ino,
+            locks: hold_with(&profile.path, true)?,
+        });
     }
-    if !verified_locks_match(target_dir, &locks) || verified_profiles(target_dir)? != profiles {
+    if !verified_locks_match(target_dir, &target, &locks, || budget.step().is_some())
+        || verified_profiles(target_dir, &mut budget)? != profiles
+    {
         return None;
     }
-    let (files, fingerprints) = verified_fingerprints(&profiles, mount_id)?;
+    let (files, fingerprints) = verified_fingerprints(&profiles, mount_id, &mut budget)?;
     if !(ops.probe)(target_dir).ok()? {
         return None;
     }
-    let after_probe = verified_identity(target_dir)?;
+    budget.check()?;
+    let after_probe = verified_identity(target_dir, &target)?;
     if target_before.dev != after_probe.dev
         || target_before.ino != after_probe.ino
         || target_before.canonical != after_probe.canonical
-        || verified_mount(target_dir)? != (mount_id, mount.clone())
+        || verified_mount(target_dir, &mut budget)? != (mount_id, mount.clone())
         || (ops.boot)().as_ref() != Some(&boot)
     {
         return None;
@@ -964,6 +1237,7 @@ fn verified_watch_with(
         use std::os::unix::fs::MetadataExt;
         let mut armed_files = Vec::new();
         for file in &files {
+            budget.step()?;
             let metadata = std::fs::symlink_metadata(file).ok()?;
             if metadata.modified().ok()? > now.checked_sub(Duration::from_secs(2))? {
                 return None;
@@ -994,14 +1268,16 @@ fn verified_watch_with(
             }
             armed_files.push((file, armed));
         }
-        if verified_profiles(target_dir)? != profiles {
+        if verified_profiles(target_dir, &mut budget)? != profiles {
             return None;
         }
-        let (after_files, fingerprint_hash) = verified_fingerprints(&profiles, mount_id)?;
+        let (after_files, fingerprint_hash) =
+            verified_fingerprints(&profiles, mount_id, &mut budget)?;
         if after_files != files {
             return None;
         }
         for (file, armed) in armed_files {
+            budget.step()?;
             let metadata = std::fs::symlink_metadata(file).ok()?;
             if filetime::FileTime::from_last_access_time(&metadata) != armed {
                 return None;
@@ -1009,16 +1285,6 @@ fn verified_watch_with(
         }
         (now, (ops.uptime)()?, fingerprint_hash)
     };
-    if (ops.boot)().as_ref() != Some(&boot)
-        || verified_identity(target_dir)? != after_probe
-        || verified_mount(target_dir)? != (mount_id, mount.clone())
-        || verified_profiles(target_dir)? != profiles
-        || verified_fingerprints(&profiles, mount_id)?.1 != final_fingerprints
-        || !verified_locks_match(target_dir, &locks)
-    {
-        return None;
-    }
-    let elapsed = (ops.uptime)()?.checked_sub(started)?;
     let record = VerifiedRecord {
         version: 2,
         boot,
@@ -1029,15 +1295,44 @@ fn verified_watch_with(
         mount,
         fingerprints: final_fingerprints,
     };
-    (ops.write)(&path, &record).ok()?;
-    if !verified_locks_match(target_dir, &locks) {
+    let evidence = VerifiedEvidence {
+        root: target_dir,
+        target: &target,
+        profiles: &profiles,
+        locks: &locks,
+        mount_id,
+        record: &record,
+    };
+    evidence.revalidate(&mut budget, ops)?;
+    if (ops.write)(&path, &record).is_err() || evidence.revalidate(&mut budget, ops).is_none() {
         let _ = forget_armed(&path);
         let _ = crate::atomic::fsync_dir(parent);
         return None;
     }
-    (elapsed >= window).then_some(VerifiedIdle {
+    let elapsed = (ops.uptime)()?.checked_sub(started)?;
+    budget.check()?;
+    if elapsed < window {
+        return None;
+    }
+
+    let mut final_budget = VerifiedBudget::new(ops.limits.final_check);
+    final_budget.check()?;
+    let reservation = crate::target_use::try_exclusive(cache_dir).ok()??;
+    let final_valid = evidence.revalidate(&mut final_budget, ops).is_some()
+        && (ops.uptime)()
+            .and_then(|uptime| uptime.checked_sub(started))
+            .is_some_and(|elapsed| elapsed >= window)
+        && final_budget.check().is_some();
+    if !final_valid {
+        drop(reservation);
+        let _ = forget_armed(&path);
+        let _ = crate::atomic::fsync_dir(parent);
+        return None;
+    }
+    Some(VerifiedIdle {
         since,
         _reservation: reservation,
+        target,
         profiles: locks,
     })
 }
@@ -1450,14 +1745,38 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn test_limits() -> VerifiedWatchLimits {
+        let limit = VerifiedWatchBudget {
+            max_entries: 200_000,
+            max_duration: Duration::from_secs(120),
+        };
+        VerifiedWatchLimits {
+            observation: limit,
+            final_check: limit,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn verified_test_watch(
         cache: &Path,
         target: &Path,
         now: SystemTime,
         boot: Option<&str>,
     ) -> Option<VerifiedIdle> {
+        verified_test_watch_with_limits(cache, target, now, boot, test_limits())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verified_test_watch_with_limits(
+        cache: &Path,
+        target: &Path,
+        now: SystemTime,
+        boot: Option<&str>,
+        limits: VerifiedWatchLimits,
+    ) -> Option<VerifiedIdle> {
         let ops = VerifiedOps {
             epoch: b"epoch-a",
+            limits,
             boot: &|| boot.map(str::to_owned),
             uptime: &|| now.duration_since(SystemTime::UNIX_EPOCH).ok(),
             probe: &|_| Ok(true),
@@ -1499,7 +1818,13 @@ mod tests {
         let Some(path) = std::env::var_os("KACHE_TEST_LOCK_PATH") else {
             return;
         };
-        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        if Path::new(&path).is_dir() {
+            options.read(true);
+        } else {
+            options.write(true);
+        }
+        let file = options.open(path).unwrap();
         let available = std::env::var("KACHE_TEST_LOCK_AVAILABLE").unwrap() == "true";
         match file.try_lock() {
             Ok(()) => {
@@ -1511,6 +1836,400 @@ mod tests {
             }
             Err(error) => panic!("could not test lock: {error}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_does_not_block_an_unrelated_cargo_lease_during_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let now = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let alias_parent = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias_parent).unwrap();
+        let alias = alias_parent.join("target");
+        let other_cache = dir.path().join("other-cache");
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let target = &target;
+            scope.spawn(move || {
+                let first = std::cell::Cell::new(true);
+                let ops = VerifiedOps {
+                    epoch: b"epoch-a",
+                    limits: test_limits(),
+                    boot: &|| Some("boot-a".to_owned()),
+                    uptime: &|| {
+                        if first.replace(false) {
+                            paused_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                        now.duration_since(SystemTime::UNIX_EPOCH).ok()
+                    },
+                    probe: &|_| Ok(true),
+                    arm: &verified_arm_file,
+                    read: &|file, _| simulated_read(file),
+                    write: &write_verified,
+                };
+                verified_watch_with(
+                    cache,
+                    target,
+                    now,
+                    SystemTime::UNIX_EPOCH,
+                    Duration::from_secs(12 * 3600),
+                    &ops,
+                )
+            });
+            paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            scope.spawn(move || {
+                let _lease =
+                    crate::target_use::shared(cache, "unrelated Cargo", &mut std::io::sink())
+                        .unwrap();
+                acquired_tx.send(()).unwrap();
+            });
+            let acquired_while_paused = acquired_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            let competing_watcher = verified_test_watch(&other_cache, &alias, now, Some("boot-a"));
+            let competing_record = verified_record(&other_cache, &alias).exists();
+            resume_tx.send(()).unwrap();
+            assert!(
+                acquired_while_paused,
+                "observation blocked an unrelated Cargo lease"
+            );
+            assert!(competing_watcher.is_none());
+            assert!(!competing_record, "competing watcher reached record I/O");
+        });
+        assert!(verified_test_watch(&other_cache, &alias, now, Some("boot-a")).is_none());
+        assert!(verified_record(&other_cache, &alias).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_enumeration_stops_at_the_caller_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let unknown = dir.path().join("unknown/nested");
+        for index in 0..80 {
+            write(&unknown.join(format!("file-{index}")), "data");
+        }
+        let mut small = VerifiedBudget::new(VerifiedWatchBudget {
+            max_entries: 10,
+            max_duration: Duration::from_secs(10),
+        });
+        assert!(verified_entries(&unknown, &mut small).is_none());
+        let mount = verified_mount_id(dir.path()).unwrap();
+        let mut small = VerifiedBudget::new(VerifiedWatchBudget {
+            max_entries: 10,
+            max_duration: Duration::from_secs(10),
+        });
+        assert!(
+            verified_unrecognized_build_entry(&dir.path().join("unknown"), mount, &mut small)
+                .is_none()
+        );
+        let mut ample = VerifiedBudget::new(test_limits().observation);
+        assert!(
+            verified_unrecognized_build_entry(&dir.path().join("unknown"), mount, &mut ample)
+                .is_some()
+        );
+
+        let fingerprint = dir.path().join("fingerprint");
+        write(&fingerprint.join("lib-package"), "marker");
+        for index in 0..80 {
+            write(&fingerprint.join(format!("extra-{index}")), "data");
+        }
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(dir.path()).unwrap();
+        let profiles = [VerifiedProfile {
+            path: dir.path().to_path_buf(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            fingerprints: vec![fingerprint],
+        }];
+        let mut small = VerifiedBudget::new(VerifiedWatchBudget {
+            max_entries: 10,
+            max_duration: Duration::from_secs(10),
+        });
+        assert!(verified_fingerprints(&profiles, mount, &mut small).is_none());
+        let mut ample = VerifiedBudget::new(test_limits().observation);
+        assert_eq!(
+            verified_fingerprints(&profiles, mount, &mut ample)
+                .unwrap()
+                .0
+                .len(),
+            81
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_bounds_record_input_before_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        let record = verified_record(&cache, &target);
+        write(&record, &"x".repeat(32_768));
+        let boot_called = std::cell::Cell::new(false);
+        let mut limits = test_limits();
+        limits.observation.max_entries = 2;
+        let now = SystemTime::now();
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            limits,
+            boot: &|| {
+                boot_called.set(true);
+                Some("boot-a".to_owned())
+            },
+            uptime: &|| now.duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| Ok(true),
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                now,
+                SystemTime::UNIX_EPOCH,
+                Duration::from_secs(1),
+                &ops
+            )
+            .is_none()
+        );
+        assert!(!boot_called.get());
+        assert!(!record.exists());
+        assert_verified_locks_released(&cache, &target);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_verified_locks_released(cache: &Path, target: &Path) {
+        assert_lock_in_child(target, true);
+        let locks = hold_with(&target.join("debug"), true).unwrap();
+        let reservation = crate::target_use::try_exclusive(cache).unwrap().unwrap();
+        drop((locks, reservation));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_observes_while_busy_and_releases_locks_on_budget_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        let shared =
+            crate::target_use::shared(&cache, "unrelated Cargo", &mut std::io::sink()).unwrap();
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        assert!(verified_record(&cache, &target).exists());
+        assert!(verified_test_watch(&cache, &target, start + window, Some("boot-a")).is_none());
+        assert!(verified_record(&cache, &target).exists());
+        assert_lock_in_child(&target, true);
+        drop(shared);
+
+        let mut limits = test_limits();
+        limits.final_check.max_entries = 1;
+        assert!(
+            verified_test_watch_with_limits(
+                &cache,
+                &target,
+                start + window,
+                Some("boot-a"),
+                limits
+            )
+            .is_none()
+        );
+        assert!(!verified_record(&cache, &target).exists());
+        assert_verified_locks_released(&cache, &target);
+
+        assert!(verified_test_watch(&cache, &target, start + window, Some("boot-a")).is_none());
+        let mut limits = test_limits();
+        limits.observation.max_entries = 1;
+        assert!(
+            verified_test_watch_with_limits(
+                &cache,
+                &target,
+                start + 2 * window,
+                Some("boot-a"),
+                limits
+            )
+            .is_none()
+        );
+        assert!(!verified_record(&cache, &target).exists());
+        assert_verified_locks_released(&cache, &target);
+        assert!(verified_test_watch(&cache, &target, start + 2 * window, Some("boot-a")).is_none());
+        assert!(verified_test_watch(&cache, &target, start + 3 * window, Some("boot-a")).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_rechecks_changed_fingerprints_after_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        let fingerprint = unit_named(&target.join("debug"), NEW)
+            .fingerprint()
+            .join("lib-serde");
+        let changed = std::cell::Cell::new(false);
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            limits: test_limits(),
+            boot: &|| {
+                if crate::target_use::try_exclusive(&cache).unwrap().is_none()
+                    && !changed.replace(true)
+                {
+                    simulated_read(&fingerprint).unwrap();
+                }
+                Some("boot-a".to_owned())
+            },
+            uptime: &|| (start + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| Ok(true),
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+        assert!(changed.get(), "did not reach the final reservation");
+        assert!(!verified_record(&cache, &target).exists());
+        assert_verified_locks_released(&cache, &target);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_releases_reservation_when_final_time_budget_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        let observed = std::cell::Cell::new(false);
+        let mut limits = test_limits();
+        limits.final_check.max_duration = Duration::from_millis(20);
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            limits,
+            boot: &|| {
+                if crate::target_use::try_exclusive(&cache).unwrap().is_none() {
+                    observed.set(true);
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                Some("boot-a".to_owned())
+            },
+            uptime: &|| (start + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| Ok(true),
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+        assert!(observed.get(), "did not reach the final reservation");
+        assert!(!verified_record(&cache, &target).exists());
+        assert_verified_locks_released(&cache, &target);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "synthetic filesystem benchmark"]
+    fn verified_watch_benchmark_synthetic_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        for index in 0..1_000_u64 {
+            let name = format!("package-{index:016x}");
+            let fingerprint = profile.join(".fingerprint").join(&name);
+            for file in [
+                "lib-package",
+                "lib-package.json",
+                "dep-lib-package",
+                "invoked.timestamp",
+            ] {
+                write(&fingerprint.join(file), "fingerprint");
+            }
+            write(&profile.join("build").join(&name).join("output"), "output");
+            write(
+                &profile
+                    .join("deps")
+                    .join(format!("libpackage-{index:016x}.rlib")),
+                "output",
+            );
+            write(
+                &profile.join("deps").join(format!("package-{index:016x}.d")),
+                "output",
+            );
+        }
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        let timer = std::time::Instant::now();
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        let arming = timer.elapsed();
+        let final_started = std::cell::Cell::new(None);
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            limits: test_limits(),
+            boot: &|| {
+                if crate::target_use::try_exclusive(&cache).unwrap().is_none()
+                    && final_started.get().is_none()
+                {
+                    final_started.set(Some(std::time::Instant::now()));
+                }
+                Some("boot-a".to_owned())
+            },
+            uptime: &|| (start + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| Ok(true),
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        let timer = std::time::Instant::now();
+        let guard = verified_watch_with(
+            &cache,
+            &target,
+            start + window,
+            SystemTime::UNIX_EPOCH,
+            window,
+            &ops,
+        )
+        .unwrap();
+        let verification = timer.elapsed();
+        let final_revalidation = final_started.get().unwrap().elapsed();
+        eprintln!(
+            "synthetic: 1000 fingerprints, 4000 fingerprint files, 1000 build dirs, 2000 outputs; arming={arming:?}, verification={verification:?}, final-revalidation={final_revalidation:?}"
+        );
+        drop(guard);
     }
 
     #[cfg(target_os = "linux")]
@@ -1529,6 +2248,7 @@ mod tests {
         let ops = VerifiedOps {
             epoch: b"epoch-a",
             boot: &|| Some("boot-a".to_owned()),
+            limits: test_limits(),
             uptime: &|| (start + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
             probe: &|_| {
                 assert_lock_in_child(&lock, false);
@@ -1573,6 +2293,7 @@ mod tests {
         let guard = verified_test_watch(&cache, &target, start + window, Some("boot-a")).unwrap();
         assert!(guard.locks_match(&target));
         assert!(guard.locks_match(&target.join(".")));
+        assert_lock_in_child(&target, false);
 
         for profile in ["debug", "triple/release"] {
             for name in LOCKS {
@@ -1596,6 +2317,24 @@ mod tests {
                 assert!(guard.locks_match(&target), "restored {profile}/{name}");
             }
         }
+
+        let profile = target.join("triple/release");
+        let moved_profile = dir.path().join("old-profile");
+        std::fs::rename(&profile, &moved_profile).unwrap();
+        std::fs::create_dir(&profile).unwrap();
+        for name in LOCKS {
+            std::fs::hard_link(moved_profile.join(name), profile.join(name)).unwrap();
+        }
+        assert!(
+            !guard.locks_match(&target),
+            "replacement profile with original locks"
+        );
+        for name in LOCKS {
+            std::fs::remove_file(profile.join(name)).unwrap();
+        }
+        std::fs::remove_dir(&profile).unwrap();
+        std::fs::rename(&moved_profile, &profile).unwrap();
+        assert!(guard.locks_match(&target));
 
         let triple = target.join("triple");
         let moved_triple = dir.path().join("old-triple");
@@ -1625,9 +2364,21 @@ mod tests {
             per_unit_profile(&target.join(profile));
             drop(hold(&target.join(profile)).unwrap());
         }
-        assert!(!guard.locks_match(&target), "replacement target root");
+        for profile in ["debug", "triple/release"] {
+            for name in LOCKS {
+                let replacement = target.join(profile).join(name);
+                std::fs::remove_file(&replacement).unwrap();
+                std::fs::hard_link(renamed.join(profile).join(name), replacement).unwrap();
+            }
+        }
+        assert!(
+            !guard.locks_match(&target),
+            "replacement target root with original locks"
+        );
+        assert_lock_in_child(&renamed, false);
         assert_lock_in_child(&renamed.join("debug").join(LOCKS[0]), false);
         drop(guard);
+        assert_lock_in_child(&renamed, true);
         for profile in ["debug", "triple/release"] {
             for name in LOCKS {
                 assert_lock_in_child(&renamed.join(profile).join(name), true);
@@ -1681,6 +2432,7 @@ mod tests {
         let ops = VerifiedOps {
             epoch: b"epoch-a",
             boot: &|| Some("boot-a".to_owned()),
+            limits: test_limits(),
             uptime: &|| (start + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
             probe: &|_| Ok(true),
             arm: &verified_arm_file,
@@ -1756,6 +2508,7 @@ mod tests {
         let ops = VerifiedOps {
             epoch: b"epoch-a",
             boot: &|| Some("boot-a".to_owned()),
+            limits: test_limits(),
             uptime: &|| Some(uptime.get()),
             probe: &|_| Ok(true),
             arm: &verified_arm_file,
@@ -1805,6 +2558,7 @@ mod tests {
         let watch = |epoch: &[u8], now: SystemTime| {
             let ops = VerifiedOps {
                 epoch,
+                limits: test_limits(),
                 boot: &|| Some("boot-a".to_owned()),
                 uptime: &|| now.duration_since(SystemTime::UNIX_EPOCH).ok(),
                 probe: &|_| Ok(true),
@@ -1887,6 +2641,7 @@ mod tests {
             read_now(&unit_named(&target.join("debug"), NEW));
             let ops = VerifiedOps {
                 epoch: b"epoch-a",
+                limits: test_limits(),
                 boot: &boot,
                 uptime: &uptime,
                 probe,
@@ -2040,9 +2795,11 @@ mod tests {
             write(&fingerprint.join(name), "marker");
         }
         set_times(&target, ago(40));
-        let profiles = verified_profiles(&target).unwrap();
+        let mut budget = VerifiedBudget::new(test_limits().observation);
+        let profiles = verified_profiles(&target, &mut budget).unwrap();
         let (files, _) =
-            verified_fingerprints(&profiles, verified_mount_id(&target).unwrap()).unwrap();
+            verified_fingerprints(&profiles, verified_mount_id(&target).unwrap(), &mut budget)
+                .unwrap();
         assert!(
             markers
                 .iter()
@@ -2204,7 +2961,8 @@ mod tests {
                 SystemTime::now(),
                 SystemTime::UNIX_EPOCH,
                 window,
-                b"epoch-a"
+                b"epoch-a",
+                test_limits(),
             )
             .is_none()
         );
@@ -2212,6 +2970,7 @@ mod tests {
         let uptime = std::cell::Cell::new(Duration::from_secs(DAY));
         let ops = VerifiedOps {
             epoch: b"epoch-a",
+            limits: test_limits(),
             boot: &linux_boot_id,
             uptime: &|| Some(uptime.get()),
             probe: &verified_shows_reads,
@@ -2303,7 +3062,9 @@ mod tests {
             "initial cargo build failed: {}",
             String::from_utf8_lossy(&initial.stderr)
         );
-        let fingerprint_dirs = verified_entries(&target.join("debug/.fingerprint")).unwrap();
+        let mut budget = VerifiedBudget::new(test_limits().observation);
+        let fingerprint_dirs =
+            verified_entries(&target.join("debug/.fingerprint"), &mut budget).unwrap();
         let markers: Vec<_> = ["lib-renamed_library", "example-renamed-example"]
             .iter()
             .map(|name| {
@@ -2319,6 +3080,7 @@ mod tests {
         let uptime = std::cell::Cell::new(Duration::from_secs(DAY));
         let ops = VerifiedOps {
             epoch: b"epoch-a",
+            limits: test_limits(),
             boot: &linux_boot_id,
             uptime: &|| Some(uptime.get()),
             probe: &verified_shows_reads,
@@ -2409,7 +3171,8 @@ mod tests {
                     SystemTime::now(),
                     SystemTime::UNIX_EPOCH,
                     Duration::from_secs(12 * 3600),
-                    b"epoch-a"
+                    b"epoch-a",
+                    test_limits(),
                 )
                 .is_none()
             );
@@ -2453,6 +3216,7 @@ mod tests {
         let ops = VerifiedOps {
             epoch: b"epoch-a",
             boot: &|| Some("boot-a".to_owned()),
+            limits: test_limits(),
             uptime: &|| (now + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
             probe: &|_| {
                 simulated_read(&file)?;

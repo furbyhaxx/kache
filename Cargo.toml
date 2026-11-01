@@ -200,7 +200,6 @@ lto = "off"
 [profile.release]
 debug = 0
 lto = "fat"
-codegen-units = 1
 strip = "symbols"
 
 [lints.rust]

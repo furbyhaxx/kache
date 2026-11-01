@@ -1037,6 +1037,69 @@ fn config_load_integrates_paths_base_dirs() {
 }
 
 #[test]
+fn config_external_target_roots_are_explicit_and_absolute() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config_guard = set_kache_config_for_test(&config_path);
+    let _env_guard = set_env_for_test(
+        "KACHE_EXTERNAL_TARGET_ROOTS",
+        Some("relative/root".as_ref()),
+    );
+
+    for source in ["[cache]\n", "[cache]\nexternal_target_roots = []\n"] {
+        std::fs::write(&config_path, source).unwrap();
+        assert!(Config::load().unwrap().external_target_roots.is_empty());
+    }
+
+    let roots = vec![
+        dir.path().join("unmounted-a"),
+        dir.path().join("unmounted-b"),
+    ];
+    assert!(roots.iter().all(|path| !path.exists()));
+    let source = format!(
+        "[cache]\nexternal_target_roots = [{:?}, {:?}]\n",
+        roots[0].to_str().unwrap(),
+        roots[1].to_str().unwrap(),
+    );
+    std::fs::write(&config_path, &source).unwrap();
+    assert_eq!(Config::load().unwrap().external_target_roots, roots);
+
+    for invalid in ["relative/root", "", "../target", "~/target"] {
+        std::fs::write(
+            &config_path,
+            format!(
+                "[cache]\nexternal_target_roots = [{:?}, {:?}]\n",
+                roots[0].to_str().unwrap(),
+                invalid,
+            ),
+        )
+        .unwrap();
+        let error = Config::load().unwrap_err().to_string();
+        assert!(error.contains("external_target_roots[1]"), "{error}");
+        assert!(error.contains("absolute"), "{error}");
+        assert!(error.contains(&format!("{invalid:?}")), "{error}");
+    }
+
+    let mut nul_path = roots[0].clone().into_os_string();
+    nul_path.push("\0bad");
+    let invalid_file = FileConfig {
+        cache: Some(CacheFileConfig {
+            external_target_roots: Some(vec![PathBuf::from(nul_path)]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    std::fs::write(&config_path, toml::to_string(&invalid_file).unwrap()).unwrap();
+    let error = Config::load().unwrap_err().to_string();
+    assert!(error.contains("external_target_roots[0]"), "{error}");
+    assert!(error.contains("NUL"), "{error}");
+
+    std::fs::write(&config_path, format!("{source}cache_executables = 42\n")).unwrap();
+    assert!(Config::load().unwrap().external_target_roots.is_empty());
+}
+
+#[test]
 fn parse_size_checked_rejects_malformed_and_mirrors_parse_size() {
     // Values ByteSize can't parse: a typo'd unit and digit grouping. These
     // are exactly what used to silently degrade to the hardcoded default.
@@ -2545,6 +2608,7 @@ fn test_file_config_roundtrip() {
             path_only_env_vars: None,
             incremental_crates: None,
             key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
+            external_target_roots: Some(vec![PathBuf::from("/external/builds")]),
             local_store: Some("~/my/cache".to_string()),
             runtime_dir: Some("~/my/runtime".to_string()),
             local_max_size: Some("50GiB".to_string()),
@@ -2592,6 +2656,10 @@ fn test_file_config_roundtrip() {
     };
     let serialized = toml::to_string_pretty(&config).unwrap();
     let deserialized: FileConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(
+        deserialized.cache.as_ref().unwrap().external_target_roots,
+        Some(vec![PathBuf::from("/external/builds")])
+    );
     assert_eq!(
         deserialized.cache.as_ref().unwrap().local_store.as_deref(),
         Some("~/my/cache")
@@ -3092,6 +3160,7 @@ fn test_config_store_dir() {
         incremental_crates: Vec::new(),
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
+        external_target_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
@@ -3173,6 +3242,7 @@ fn test_config_index_db_path() {
         incremental_crates: Vec::new(),
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
+        external_target_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache"),
         socket_path_override: None,
@@ -3250,6 +3320,7 @@ fn test_config_event_log_path() {
         incremental_crates: Vec::new(),
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
+        external_target_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
@@ -3346,6 +3417,7 @@ fn test_config_socket_path() {
         incremental_crates: Vec::new(),
         key_env_vars: Vec::new(),
         base_dirs: Vec::new(),
+        external_target_roots: Vec::new(),
         cache_dir: PathBuf::from("/tmp/kache"),
         runtime_dir: PathBuf::from("/tmp/kache-runtime"),
         socket_path_override: None,
@@ -4078,6 +4150,7 @@ fn test_save_and_load_file_config() {
             path_only_env_vars: None,
             incremental_crates: None,
             key_env_vars: None,
+            external_target_roots: None,
             local_store: Some("/tmp/my-cache".to_string()),
             runtime_dir: Some("/tmp/my-runtime".to_string()),
             local_max_size: Some("10GiB".to_string()),

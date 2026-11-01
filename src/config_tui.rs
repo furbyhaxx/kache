@@ -2055,6 +2055,7 @@ mod tests {
         for comment in [
             "# Removed before 1.0 (#565).",
             "# Older S3 configs infer the backend",
+            "external_target_roots = [\"/mnt/targets-a\", \"/mnt/targets-b\"] # inventory roots",
         ] {
             assert!(written.contains(comment), "comment lost: {comment}");
         }
@@ -2190,6 +2191,7 @@ mod tests {
                 path_only_env_vars: Some(vec!["BUILDCONFIG_RS".to_string()]),
                 incremental_crates: Some(vec!["tap_lib".to_string()]),
                 key_env_vars: Some(vec!["BOLTFFI_*".to_string()]),
+                external_target_roots: None,
                 local_store: Some("~/cache".to_string()),
                 runtime_dir: Some("~/runtime".to_string()),
                 local_max_size: Some("50GiB".to_string()),

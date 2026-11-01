@@ -173,6 +173,8 @@ pub struct Config {
     /// file only, not libraries it loads at run time.
     /// `KACHE_TRUST_CODEGEN_BACKENDS` or `[cache] trust_codegen_backends`.
     pub trust_codegen_backends: bool,
+    /// Absolute external target roots allowlisted for inventory, not adoption or deletion.
+    pub external_target_roots: Vec<PathBuf>,
     /// Capture Cargo liveness receipts for exact-scope unit cleanup. Off by default.
     /// `KACHE_TARGET_LIVENESS` or `[cache] target_liveness`.
     pub target_liveness: bool,
@@ -878,6 +880,7 @@ pub(crate) struct CcFileConfig {
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub(crate) struct CacheFileConfig {
     pub(crate) local_store: Option<String>,
+    pub(crate) external_target_roots: Option<Vec<PathBuf>>,
     /// Job/process-lifetime state, separate from the persistent local store.
     pub(crate) runtime_dir: Option<String>,
     /// Another store read after the local one. See [`Config::readonly_store`].
@@ -2015,6 +2018,25 @@ impl Config {
             ),
         };
 
+        let external_target_roots = file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.external_target_roots.clone())
+            .unwrap_or_default();
+        for (index, root) in external_target_roots.iter().enumerate() {
+            if !root.is_absolute() {
+                anyhow::bail!(
+                    "[cache].external_target_roots[{index}] must be absolute, got {root:?}"
+                );
+            }
+            if root.as_os_str().as_encoded_bytes().contains(&0) {
+                anyhow::bail!(
+                    "[cache].external_target_roots[{index}] must not contain NUL, got {root:?}"
+                );
+            }
+        }
+
         let base_dirs = normalize_base_dirs(
             file_config
                 .as_ref()
@@ -2188,6 +2210,7 @@ impl Config {
             cache_cc_links,
             trust_codegen_backends,
             target_liveness,
+            external_target_roots,
             clean_incremental,
             preserve_incremental,
             adaptive_incremental,

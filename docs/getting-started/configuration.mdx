@@ -86,6 +86,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS` | `cache.auto_clean_idle_targets_hours` | unset | Set the idle-target age in hours, overriding days; `0` disables the idle rule |
 | `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` | `cache.auto_recover_min_free_bytes` | `10737418240` (10 GiB); `0` in CI | Below this many free bytes, builds evict eligible cache entries; `0` disables recovery. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
+| none | `cache.external_target_roots` | `[]` | Absolute external target storage roots allowlisted for inventory only. Paths need not exist when the config loads; listing them neither adopts nor deletes anything. |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
@@ -98,6 +99,15 @@ local_max_size = "200GiB"
 | `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. On GitHub Actions and GitLab CI, every job except a push to a protected branch is also forced read-only, and `=0` does not turn that off. A pull request job with `pull_request_prefix` set writes under that prefix instead, unless this setting is on or the remote is OCI. See [Who may write](/docs/remote-cache/ci#who-may-write). |
 | `KACHE_SCHEDULER` | `cache.scheduler` | `true` | Pace real compiler processes across concurrent builds after a miss. Hits and passthroughs never wait. `0` or `false` turns it off. With the [test runner](#test-runner), it paces test binaries too. |
 | `KACHE_SCHEDULER_MEMORY_PRESSURE` | `cache.scheduler_memory_pressure` | `true` | Under memory pressure, run compiles one after another. See [Limits](/docs/how-it-works/limits). |
+
+To allowlist external target storage roots for inventory, list them in the config file:
+
+```toml
+[cache]
+external_target_roots = ["/mnt/cache/targets"]
+```
+
+Each path must be absolute. Roots need not exist when the config loads; snapshot checks resolve and verify them when used. This setting alone does not discover, adopt, or delete targets.
 
 On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
 

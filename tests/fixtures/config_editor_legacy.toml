@@ -1,5 +1,6 @@
 [cache]
 local_store = "~/old-store"
+external_target_roots = ["/mnt/targets-a", "/mnt/targets-b"] # inventory roots
 runtime_dir = "~/runtime"
 local_max_size = "40GiB"
 local_only = false

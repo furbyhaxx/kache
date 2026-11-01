@@ -77,6 +77,22 @@ fn new_epoch_and_events_remain_invalid_until_reported_and_acknowledged() {
     assert_eq!(observer.check().unwrap(), MountChange::Unchanged);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_mount_namespace_is_reported_as_unsupported() {
+    let path = std::path::Path::new("/proc/self/ns/kache-observer-missing");
+    assert_eq!(
+        super::require_mount_namespace(path).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(
+        super::require_mount_namespace(std::path::Path::new("/"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EINVAL)
+    );
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn unsupported_platform_cannot_open_an_observer() {

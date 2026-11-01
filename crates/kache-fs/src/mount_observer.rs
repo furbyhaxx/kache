@@ -34,8 +34,9 @@ impl MountChangeObserver {
     ///
     /// # Errors
     ///
-    /// Returns an error if procfs is unavailable, initialization fails, or the
-    /// platform does not support mount-namespace observation.
+    /// Returns an error if procfs is unavailable or initialization fails.
+    /// Returns [`io::ErrorKind::Unsupported`] if the mount namespace link is
+    /// absent, the mount table is not on procfs, or the platform is unsupported.
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             observer: Observer::new(PlatformSource::open()?)?,
@@ -170,6 +171,7 @@ impl PlatformSource {
                 "/proc/self/mounts is not on procfs",
             ));
         }
+        require_mount_namespace(std::path::Path::new("/proc/self/ns/mnt"))?;
         Ok(Self { mounts })
     }
 
@@ -178,6 +180,18 @@ impl PlatformSource {
 
         self.mounts.seek(SeekFrom::Start(0))?;
         self.mounts.read_exact(&mut [0])
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn require_mount_namespace(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::read_link(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mount namespace is unavailable",
+        )),
+        Err(error) => Err(error),
     }
 }
 

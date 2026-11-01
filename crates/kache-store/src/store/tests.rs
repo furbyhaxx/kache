@@ -4831,7 +4831,12 @@ mod external_target_inventory {
         );
         assert!(
             !f.store
-                .observe_external_target(&f.workspace, &f.allowed, &[f.backing.clone()], &snapshot)
+                .observe_external_target(
+                    &f.workspace,
+                    &f.allowed,
+                    std::slice::from_ref(&f.backing),
+                    &snapshot,
+                )
                 .unwrap()
         );
         assert!(

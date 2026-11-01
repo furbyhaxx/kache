@@ -408,6 +408,9 @@ fn verified_locks_match(root: &Path, profiles: &[(PathBuf, Held)]) -> bool {
 }
 
 /// Revalidate a boot-bound watch, returning a lock guard only after `window`.
+/// This observes Cargo activity; it establishes neither ownership nor permission
+/// to delete. Callers must separately approve the whole target and account for
+/// every applicable Cargo build directory, which may differ from the target.
 /// The caller must keep a nonempty epoch stable throughout a watch, replacing it
 /// on daemon restart or any mount-change event, and synchronize changes with
 /// the returned guard. A probe cannot detect unobserved temporary remounts, so
@@ -601,7 +604,12 @@ fn verified_identity(target: &Path) -> Option<VerifiedIdentity> {
 #[cfg(target_os = "linux")]
 fn verified_mount_id(path: &Path) -> Option<u64> {
     use std::os::fd::AsRawFd;
-    let file = std::fs::File::open(path).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).ok()?;
     info.lines()
         .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
@@ -648,6 +656,27 @@ fn verified_directory(path: &Path) -> Option<bool> {
 }
 
 #[cfg(target_os = "linux")]
+fn verified_unrecognized_build_entry(path: &Path, mount: u64) -> Option<()> {
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        if matches!(
+            path.file_name()?.to_str(),
+            Some("fingerprint" | ".fingerprint")
+        ) {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if !(metadata.is_dir() || metadata.is_file()) || verified_mount_id(&path)? != mount {
+            return None;
+        }
+        if metadata.is_dir() {
+            pending.extend(verified_entries(&path)?);
+        }
+    }
+    Some(())
+}
+
+#[cfg(target_os = "linux")]
 fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
     let shared = profile.join(".fingerprint");
     let build = profile.join("build");
@@ -670,43 +699,52 @@ fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
         return Some(None);
     }
     let mut fingerprints = Vec::new();
-    let mut shared_units = Vec::new();
     if has_shared {
         for dir in verified_entries(&shared)? {
             if !std::fs::symlink_metadata(&dir).ok()?.is_dir() {
                 return None;
             }
-            let name = dir.file_name()?.to_str()?;
-            let package = crate::cargo_layout::legacy_unit_package(name)?;
-            shared_units.push((
-                package.replace('-', "_"),
-                name[package.len() + 1..].to_owned(),
-            ));
+            crate::cargo_layout::legacy_unit_package(dir.file_name()?.to_str()?)?;
             fingerprints.push(dir);
         }
     }
     if has_build {
+        let mount = verified_mount_id(profile)?;
+        if verified_mount_id(&build)? != mount {
+            return None;
+        }
         for package in verified_entries(&build)? {
-            if !std::fs::symlink_metadata(&package).ok()?.is_dir() {
+            let metadata = std::fs::symlink_metadata(&package).ok()?;
+            if metadata.is_file() {
+                verified_unrecognized_build_entry(&package, mount)?;
+                continue;
+            }
+            if !metadata.is_dir() || verified_mount_id(&package)? != mount {
                 return None;
             }
-            let name = package.file_name()?.to_str()?;
-            if crate::cargo_layout::legacy_unit_package(name).is_some() {
+            let name = package.file_name()?;
+            if matches!(name.to_str(), Some("fingerprint" | ".fingerprint")) {
+                return None;
+            }
+            if name
+                .to_str()
+                .and_then(crate::cargo_layout::legacy_unit_package)
+                .is_some()
+            {
                 if !fingerprints.contains(&shared.join(name)) {
                     return None;
                 }
                 continue;
             }
-            let units = verified_entries(&package)?;
-            if units.is_empty() {
-                return None;
-            }
-            for unit in units {
+            for unit in verified_entries(&package)? {
                 let metadata = std::fs::symlink_metadata(&unit).ok()?;
-                if !metadata.is_dir()
-                    || !crate::cargo_layout::is_unit_hash(unit.file_name()?.to_str()?)
-                {
-                    return None;
+                let hash = unit
+                    .file_name()?
+                    .to_str()
+                    .is_some_and(crate::cargo_layout::is_unit_hash);
+                if !metadata.is_dir() || !hash {
+                    verified_unrecognized_build_entry(&unit, mount)?;
+                    continue;
                 }
                 let fingerprint = unit.join("fingerprint");
                 if !verified_directory(&fingerprint)? {
@@ -721,15 +759,6 @@ fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
             for output in verified_entries(&dir)? {
                 let metadata = std::fs::symlink_metadata(&output).ok()?;
                 if metadata.is_symlink() {
-                    return None;
-                }
-                let name = output.file_name()?.to_str()?;
-                if let Some((stem, hash)) = hashed_name(name)
-                    && !shared_units.iter().any(|(package, known)| {
-                        (package == stem || package == stem.strip_prefix("lib").unwrap_or(stem))
-                            && known == hash
-                    })
-                {
                     return None;
                 }
             }
@@ -776,6 +805,34 @@ fn verified_profiles(target: &Path) -> Option<Vec<VerifiedProfile>> {
 }
 
 #[cfg(target_os = "linux")]
+fn verified_fingerprint_marker(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let name = name
+        .strip_prefix("test-")
+        .or_else(|| name.strip_prefix("doc-"))
+        .or_else(|| name.strip_prefix("run-"))
+        .unwrap_or(name);
+    [
+        "integration-test-",
+        "build-script-",
+        "example-",
+        "bench-",
+        "lib-",
+        "bin-",
+    ]
+    .into_iter()
+    .filter_map(|prefix| name.strip_prefix(prefix))
+    .any(|target| {
+        !target.is_empty()
+            && target
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-'))
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn verified_fingerprints(
     profiles: &[VerifiedProfile],
     mount: u64,
@@ -785,18 +842,20 @@ fn verified_fingerprints(
     let mut digest = blake3::Hasher::new();
     for profile in profiles {
         for fingerprint in &profile.fingerprints {
+            let mut has_marker = false;
             for path in std::iter::once(fingerprint.clone()).chain(verified_entries(fingerprint)?) {
                 let metadata = std::fs::symlink_metadata(&path).ok()?;
-                if verified_mount_id(&path)? != mount {
-                    return None;
-                }
                 if path == *fingerprint {
                     if !metadata.is_dir() {
                         return None;
                     }
                 } else if metadata.is_file() {
+                    has_marker |= verified_fingerprint_marker(path.file_name()?);
                     files.push(path.clone());
                 } else {
+                    return None;
+                }
+                if verified_mount_id(&path)? != mount {
                     return None;
                 }
                 let name = path.as_os_str().as_encoded_bytes();
@@ -817,10 +876,8 @@ fn verified_fingerprints(
                     digest.update(&metadata.atime_nsec().to_le_bytes());
                 }
             }
-            if !files
-                .iter()
-                .any(|file| file.parent() == Some(fingerprint.as_path()))
-            {
+            // Diagnostics and dependency files alone do not establish a Cargo freshness hash.
+            if !has_marker {
                 return None;
             }
         }
@@ -1658,10 +1715,6 @@ mod tests {
             let cache = dir.path().join("cache");
             let target = dir.path().join("target");
             layout(&target.join("debug"));
-            let unrelated = target.join(format!("debug/deps/libother-{OLD}.rlib"));
-            if unrelated.exists() {
-                std::fs::remove_file(unrelated).unwrap();
-            }
             set_times(&target, ago(40));
             let start = SystemTime::now() - Duration::from_secs(20 * 3600);
             let hours = |n: u64| Duration::from_secs(n * 3600);
@@ -1904,7 +1957,6 @@ mod tests {
                 per_unit_profile(&profile);
             } else {
                 shared_profile(&profile);
-                std::fs::remove_file(profile.join(format!("deps/libother-{OLD}.rlib"))).unwrap();
             }
             set_times(&target, ago(40));
             let now = SystemTime::now() - Duration::from_secs(2 * DAY);
@@ -1932,6 +1984,179 @@ mod tests {
             );
             assert!(
                 verified_test_watch(&cache, &target, now + 3 * window, Some("boot-a")).is_some()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_accepts_disposable_contents_without_matching_output_names() {
+        for layout in [shared_profile as fn(&Path), per_unit_profile] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = dir.path().join("target");
+            let profile = target.join("debug");
+            layout(&profile);
+            let arbitrary = [
+                target.join("notes.txt"),
+                target.join("unrelated/nested/notes.txt"),
+                profile.join("arbitrary-file"),
+                profile.join(format!("deps/unrelated-{NEW}.unrecognized")),
+                profile.join(format!("examples/renamed_example-{OLD}.d")),
+                profile.join("build/unrelated-file"),
+                profile.join("build/unrelated-dir/nested/file.txt"),
+            ];
+            for path in &arbitrary {
+                write(path, "disposable");
+            }
+            let dest = profile.join(format!("deps/librenamed-{NEW}.rlib"));
+            let staged =
+                crate::prestage::staged_path(&dest, "0123456789abcdef0123456789abcdef").unwrap();
+            write(&staged, "staged");
+            set_times(&target, ago(40));
+            let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+            let window = Duration::from_secs(12 * 3600);
+            assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+            let guard =
+                verified_test_watch(&cache, &target, start + window, Some("boot-a")).unwrap();
+            assert_eq!(guard.since(), start);
+            drop(guard);
+            assert!(arbitrary.iter().all(|path| path.exists()));
+            assert!(staged.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_monitors_every_file_in_multiple_doc_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        shared_profile(&profile);
+        let fingerprint = profile.join(format!(".fingerprint/docs-{OLD}"));
+        let markers = ["doc-lib-renamed", "doc-bin-different", "unrecognized-file"];
+        for name in markers {
+            write(&fingerprint.join(name), "marker");
+        }
+        set_times(&target, ago(40));
+        let profiles = verified_profiles(&target).unwrap();
+        let (files, _) =
+            verified_fingerprints(&profiles, verified_mount_id(&target).unwrap()).unwrap();
+        assert!(
+            markers
+                .iter()
+                .all(|name| files.contains(&fingerprint.join(name)))
+        );
+        let mut start = SystemTime::now() - Duration::from_secs(4 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        for name in markers {
+            assert!(verified_test_watch(&cache, &target, start + window, Some("boot-a")).is_some());
+            simulated_read(&fingerprint.join(name)).unwrap();
+            start += window;
+            assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        }
+        assert_eq!(
+            verified_test_watch(&cache, &target, start + window, Some("boot-a"))
+                .unwrap()
+                .since(),
+            start
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_rejects_output_only_incomplete_fingerprints() {
+        for per_unit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = dir.path().join("target");
+            let profile = target.join("debug");
+            if per_unit {
+                per_unit_profile(&profile);
+            } else {
+                shared_profile(&profile);
+            }
+            let fingerprint = unit_named(&profile, NEW).fingerprint();
+            std::fs::remove_file(fingerprint.join("lib-serde")).unwrap();
+            for name in [
+                "output-lib-serde",
+                "dep-lib-serde",
+                "lib-serde.json",
+                "invoked.timestamp",
+            ] {
+                write(&fingerprint.join(name), "incomplete");
+            }
+            set_times(&target, ago(40));
+            let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+            let window = Duration::from_secs(12 * 3600);
+            assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+            assert!(!verified_record(&cache, &target).exists());
+            assert!(verified_test_watch(&cache, &target, start + window, Some("boot-a")).is_none());
+            assert!(!verified_record(&cache, &target).exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_rejects_symlinks_and_unknown_fingerprint_structure() {
+        use std::os::unix::fs::symlink;
+
+        for change in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = dir.path().join("target");
+            let profile = target.join("debug");
+            shared_profile(&profile);
+            set_times(&target, ago(40));
+            let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+            let window = Duration::from_secs(12 * 3600);
+            assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+            drop(verified_test_watch(&cache, &target, start + window, Some("boot-a")).unwrap());
+            let fingerprint = unit_named(&profile, NEW).fingerprint();
+            match change {
+                0 => symlink(fingerprint.join("lib-serde"), fingerprint.join("link")).unwrap(),
+                1 => symlink(
+                    &fingerprint,
+                    profile.join(format!(".fingerprint/other-{OLD}")),
+                )
+                .unwrap(),
+                2 => symlink(fingerprint.join("lib-serde"), profile.join("deps/link")).unwrap(),
+                3 => write(&profile.join(".fingerprint/unknown/lib-unknown"), "unknown"),
+                4 => std::fs::create_dir(fingerprint.join("nested")).unwrap(),
+                5 => symlink(&fingerprint, profile.join("build/link")).unwrap(),
+                6 => write(
+                    &profile.join("build/unrelated/nested/deeper/fingerprint/file"),
+                    "unknown",
+                ),
+                7 => write(
+                    &profile.join(format!("build/unrelated/{OLD}/out/file")),
+                    "missing fingerprint",
+                ),
+                8 => {
+                    let nested = profile.join("build/unrelated/nested");
+                    std::fs::create_dir_all(&nested).unwrap();
+                    symlink(&fingerprint, nested.join("link")).unwrap();
+                }
+                _ => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let fifo = dir.path().join("fifo");
+                    let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: path is NUL-terminated and names a file in the test directory.
+                    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+                    let link = fingerprint.join("link-to-fifo");
+                    symlink(&fifo, &link).unwrap();
+                    assert!(verified_mount_id(&link).is_none());
+                }
+            }
+            assert!(
+                verified_test_watch(&cache, &target, start + 2 * window, Some("boot-a")).is_none(),
+                "change {change}"
+            );
+            assert!(
+                !verified_record(&cache, &target).exists(),
+                "change {change}"
             );
         }
     }
@@ -2022,6 +2247,149 @@ mod tests {
                 &ops
             )
             .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_observes_a_noop_cargo_build_with_renamed_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        if !verified_shows_reads(&target).unwrap() {
+            eprintln!("skipping Cargo read observation: filesystem does not expose reads");
+            return;
+        }
+        write(
+            &workspace.join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\n\
+             [package]\nname = \"package-name\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [lib]\nname = \"renamed_library\"\n\
+             [[example]]\nname = \"renamed-example\"\npath = \"examples/renamed.rs\"\n",
+        );
+        write(
+            &workspace.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        );
+        write(
+            &workspace.join("examples/renamed.rs"),
+            "fn main() { assert_eq!(renamed_library::answer(), 42); }\n",
+        );
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let build = || {
+            std::process::Command::new(&cargo)
+                .args(["build", "--offline", "--all-targets", "--verbose"])
+                .current_dir(&workspace)
+                .env("CARGO_HOME", dir.path().join("cargo-home"))
+                .env("CARGO_TARGET_DIR", &target)
+                .env("CARGO_BUILD_JOBS", "2")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .env_remove("RUSTC")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_TARGET")
+                .output()
+                .unwrap()
+        };
+        let initial = build();
+        assert!(
+            initial.status.success(),
+            "initial cargo build failed: {}",
+            String::from_utf8_lossy(&initial.stderr)
+        );
+        let fingerprint_dirs = verified_entries(&target.join("debug/.fingerprint")).unwrap();
+        let markers: Vec<_> = ["lib-renamed_library", "example-renamed-example"]
+            .iter()
+            .map(|name| {
+                fingerprint_dirs
+                    .iter()
+                    .map(|dir| dir.join(name))
+                    .find(|path| path.is_file())
+                    .unwrap_or_else(|| panic!("missing Cargo fingerprint {name}"))
+            })
+            .collect();
+        let start = SystemTime::now() + Duration::from_secs(3);
+        let window = Duration::from_secs(12 * 3600);
+        let uptime = std::cell::Cell::new(Duration::from_secs(DAY));
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            boot: &linux_boot_id,
+            uptime: &|| Some(uptime.get()),
+            probe: &verified_shows_reads,
+            arm: &verified_arm_file,
+            read: &verified_read_file,
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(&cache, &target, start, SystemTime::UNIX_EPOCH, window, &ops)
+                .is_none()
+        );
+        assert!(verified_record(&cache, &target).exists());
+        uptime.set(uptime.get() + window);
+        drop(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops,
+            )
+            .unwrap(),
+        );
+        let before: Vec<_> = markers
+            .iter()
+            .map(|path| {
+                filetime::FileTime::from_last_access_time(&std::fs::metadata(path).unwrap())
+            })
+            .collect();
+        let noop = build();
+        let stderr = String::from_utf8_lossy(&noop.stderr);
+        assert!(noop.status.success(), "no-op cargo build failed: {stderr}");
+        assert!(
+            stderr.contains("Fresh ") && !stderr.contains("Compiling "),
+            "{stderr}"
+        );
+        eprintln!("no-op Cargo output:\n{stderr}");
+        for (path, armed) in markers.iter().zip(before) {
+            let accessed =
+                filetime::FileTime::from_last_access_time(&std::fs::metadata(path).unwrap());
+            assert!(
+                moved_past(accessed, armed),
+                "Cargo did not read {}",
+                path.display()
+            );
+        }
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+        uptime.set(uptime.get() + window);
+        assert_eq!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + 2 * window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .unwrap()
+            .since(),
+            start + window
         );
     }
 

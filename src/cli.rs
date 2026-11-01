@@ -7668,7 +7668,7 @@ fn doctor_link_layout_check(
     let fix = if pass {
         None
     } else if !probe.cross_reflinks_determined() {
-        Some("check that the build and staging directories are accessible and retry the reflink probes".into())
+        Some("check free space, permissions, and filesystem health for the build and staging directories, then retry the reflink probes".into())
     } else if probe.error_kind.as_deref() == Some("CrossesDevices") {
         Some("put the cache and build tree on the SAME mount for zero-copy sharing; if this layout is intentional, expect copies (see `kache report` copy reasons)".into())
     } else if probe.error_kind.as_deref() == Some("PermissionDenied") {

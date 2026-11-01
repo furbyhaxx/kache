@@ -5,6 +5,17 @@
 use std::io::Write;
 use std::path::Path;
 
+/// Outcome of one reflink probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReflinkProbe {
+    /// The reflink succeeded.
+    Supported,
+    /// The filesystem or platform rejected this reflink as unsupported.
+    Unsupported,
+    /// The probe could not determine support, with an explanation.
+    Unknown(String),
+}
+
 /// Outcome of [`probe_link_layout`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkLayoutReport {
@@ -26,30 +37,31 @@ pub struct LinkLayoutReport {
     pub source_owner: Option<u32>,
     /// Owner uid of the staging dir, if determinable (unix).
     pub dest_owner: Option<u32>,
-    /// Whether a staging-local reflink succeeded; `None` means it was not attempted.
-    pub ficlone_supported: Option<bool>,
-    /// Whether a reflink from the build tree into staging succeeded.
-    pub reflink_build_to_staging: Option<bool>,
-    /// Whether a reflink from staging into the build tree succeeded.
-    pub reflink_staging_to_build: Option<bool>,
+    /// Outcome of a staging-local reflink.
+    pub ficlone_supported: ReflinkProbe,
+    /// Outcome of a reflink from the build tree into staging.
+    pub reflink_build_to_staging: ReflinkProbe,
+    /// Outcome of a reflink from staging into the build tree.
+    pub reflink_staging_to_build: ReflinkProbe,
 }
 
 impl LinkLayoutReport {
     pub(crate) fn sharing_supported(&self) -> bool {
         self.hardlink_supported
-            || (self.reflink_build_to_staging == Some(true)
-                && self.reflink_staging_to_build == Some(true))
+            || (self.reflink_build_to_staging == ReflinkProbe::Supported
+                && self.reflink_staging_to_build == ReflinkProbe::Supported)
     }
 
     pub(crate) fn cross_reflinks_determined(&self) -> bool {
-        self.reflink_build_to_staging.is_some() && self.reflink_staging_to_build.is_some()
+        !matches!(self.reflink_build_to_staging, ReflinkProbe::Unknown(_))
+            && !matches!(self.reflink_staging_to_build, ReflinkProbe::Unknown(_))
     }
 }
 
 /// Probe hardlinks and reflinks between `build_dir` and `staging_dir`.
 ///
 /// Probe files are created exclusively in temporary paths and removed on
-/// return. A reflink result is `None` when the probe could not be attempted.
+/// return. Inconclusive reflink probes retain their failure details.
 pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutReport {
     probe_link_layout_with(build_dir, staging_dir, reflink_supported_between)
 }
@@ -57,7 +69,7 @@ pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutRepo
 fn probe_link_layout_with(
     build_dir: &Path,
     staging_dir: &Path,
-    mut reflink_probe: impl FnMut(&Path, &Path) -> Option<bool>,
+    mut reflink_probe: impl FnMut(&Path, &Path) -> ReflinkProbe,
 ) -> LinkLayoutReport {
     let mut report = LinkLayoutReport {
         hardlink_supported: false,
@@ -69,9 +81,9 @@ fn probe_link_layout_with(
         uid: current_uid(),
         source_owner: None,
         dest_owner: None,
-        ficlone_supported: None,
-        reflink_build_to_staging: None,
-        reflink_staging_to_build: None,
+        ficlone_supported: ReflinkProbe::Unknown("not attempted".into()),
+        reflink_build_to_staging: ReflinkProbe::Unknown("not attempted".into()),
+        reflink_staging_to_build: ReflinkProbe::Unknown("not attempted".into()),
     };
 
     if let Err(e) = std::fs::create_dir_all(staging_dir) {
@@ -207,15 +219,15 @@ pub(crate) fn format_eperm_detail(
 pub(crate) fn format_probe_detail(report: &LinkLayoutReport) -> String {
     let cross_reflinks = format!(
         "cross-path reflinks: build → staging {}, staging → build {}",
-        reflink_probe_status(report.reflink_build_to_staging),
-        reflink_probe_status(report.reflink_staging_to_build),
+        reflink_probe_status(&report.reflink_build_to_staging),
+        reflink_probe_status(&report.reflink_staging_to_build),
     );
+    let ficlone = match &report.ficlone_supported {
+        ReflinkProbe::Supported => "staging reflinks supported".to_string(),
+        ReflinkProbe::Unsupported => "staging reflinks unsupported".to_string(),
+        ReflinkProbe::Unknown(reason) => format!("staging reflink support unknown ({reason})"),
+    };
     if report.hardlink_supported {
-        let ficlone = match report.ficlone_supported {
-            Some(true) => "staging reflinks supported",
-            Some(false) => "staging reflink probe failed",
-            None => "staging reflink support unknown",
-        };
         return format!(
             "hardlink build-tree → <store>/staging works ({ficlone}; {cross_reflinks})"
         );
@@ -223,7 +235,7 @@ pub(crate) fn format_probe_detail(report: &LinkLayoutReport) -> String {
     let kind = report.error_kind.as_deref().unwrap_or("Unknown");
     if report.sharing_supported() {
         return format!(
-            "{cross_reflinks}; hardlink fallback unavailable (build-tree → <store>/staging failed: {kind})"
+            "{ficlone}; {cross_reflinks}; hardlink fallback unavailable (build-tree → <store>/staging failed: {kind})"
         );
     }
     let hardlink_detail = if kind == "CrossesDevices" {
@@ -245,14 +257,14 @@ pub(crate) fn format_probe_detail(report: &LinkLayoutReport) -> String {
             report.error_message.as_deref().unwrap_or("unknown error")
         )
     };
-    format!("{hardlink_detail}; {cross_reflinks}")
+    format!("{hardlink_detail}; {ficlone}; {cross_reflinks}")
 }
 
-fn reflink_probe_status(result: Option<bool>) -> &'static str {
+fn reflink_probe_status(result: &ReflinkProbe) -> String {
     match result {
-        Some(true) => "works",
-        Some(false) => "failed",
-        None => "unknown",
+        ReflinkProbe::Supported => "works".to_string(),
+        ReflinkProbe::Unsupported => "unsupported".to_string(),
+        ReflinkProbe::Unknown(reason) => format!("unknown ({reason})"),
     }
 }
 
@@ -387,23 +399,88 @@ fn file_owner(path: &Path) -> Option<u32> {
     }
 }
 
-fn reflink_supported_between(source_dir: &Path, dest_dir: &Path) -> Option<bool> {
-    let mut source = tempfile::Builder::new()
-        .prefix(".kache-reflink-probe-")
-        .tempfile_in(source_dir)
-        .ok()?;
-    // ReFS block cloning requires at least one complete filesystem cluster.
-    source.write_all(&vec![b'k'; 128 * 1024]).ok()?;
-    let dest = tempfile::Builder::new()
-        .prefix(".kache-reflink-probe-")
-        .tempdir_in(dest_dir)
-        .ok()?;
-    Some(crate::link::try_reflink(source.path(), &dest.path().join("clone")).is_ok())
+fn reflink_supported_between(source_dir: &Path, dest_dir: &Path) -> ReflinkProbe {
+    reflink_supported_between_with(source_dir, dest_dir, kache_fs::try_reflink)
+}
+
+pub(crate) fn reflink_supported_between_with(
+    source_dir: &Path,
+    dest_dir: &Path,
+    try_reflink: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> ReflinkProbe {
+    let probe = || -> Result<ReflinkProbe, String> {
+        let mut source = tempfile::Builder::new()
+            .prefix(".kache-reflink-probe-")
+            .tempfile_in(source_dir)
+            .map_err(|e| {
+                format!(
+                    "creating a temporary source in {}: {e}",
+                    source_dir.display()
+                )
+            })?;
+        // ReFS block cloning requires at least one complete filesystem cluster.
+        source.write_all(&vec![b'k'; 128 * 1024]).map_err(|e| {
+            format!(
+                "writing a temporary source in {}: {e}",
+                source_dir.display()
+            )
+        })?;
+        let dest = tempfile::Builder::new()
+            .prefix(".kache-reflink-probe-")
+            .tempdir_in(dest_dir)
+            .map_err(|e| {
+                format!(
+                    "creating a temporary destination in {}: {e}",
+                    dest_dir.display()
+                )
+            })?;
+        Ok(
+            match try_reflink(source.path(), &dest.path().join("clone")) {
+                Ok(()) => ReflinkProbe::Supported,
+                Err(e) if clone_error_is_unsupported(&e) => ReflinkProbe::Unsupported,
+                Err(e) => ReflinkProbe::Unknown(format!(
+                    "cloning from {} to {}: {e}",
+                    source_dir.display(),
+                    dest_dir.display()
+                )),
+            },
+        )
+    };
+    probe().unwrap_or_else(ReflinkProbe::Unknown)
+}
+
+fn clone_error_is_unsupported(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if let Some(errno) = error.raw_os_error() {
+        // ENOTSUP and EOPNOTSUPP have distinct values on macOS.
+        return errno == libc::EXDEV
+            || errno == libc::EOPNOTSUPP
+            || errno == libc::ENOTSUP
+            || cfg!(target_os = "linux") && errno == libc::ENOTTY;
+    }
+    #[cfg(windows)]
+    if let Some(code) = error.raw_os_error() {
+        use windows_sys::Win32::Foundation::{ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED};
+        return code == ERROR_NOT_SAME_DEVICE as i32 || code == ERROR_NOT_SUPPORTED as i32;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        error.kind() == std::io::ErrorKind::Unsupported
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ReflinkProbe::{Supported, Unknown, Unsupported};
+
+    fn unknown() -> ReflinkProbe {
+        Unknown("not attempted".into())
+    }
 
     fn empty_report() -> LinkLayoutReport {
         LinkLayoutReport {
@@ -416,9 +493,9 @@ mod tests {
             uid: None,
             source_owner: None,
             dest_owner: None,
-            ficlone_supported: None,
-            reflink_build_to_staging: None,
-            reflink_staging_to_build: None,
+            ficlone_supported: unknown(),
+            reflink_build_to_staging: unknown(),
+            reflink_staging_to_build: unknown(),
         }
     }
 
@@ -632,7 +709,7 @@ mod tests {
     fn format_probe_detail_reports_success_with_ficlone() {
         let mut report = empty_report();
         report.hardlink_supported = true;
-        report.ficlone_supported = Some(true);
+        report.ficlone_supported = Supported;
         let got = format_probe_detail(&report);
         assert!(got.contains("works"));
         assert!(got.contains("reflinks supported"), "{got}");
@@ -643,9 +720,9 @@ mod tests {
     fn format_probe_detail_reports_success_without_ficlone() {
         let mut report = empty_report();
         report.hardlink_supported = true;
-        report.ficlone_supported = Some(false);
+        report.ficlone_supported = Unsupported;
         let got = format_probe_detail(&report);
-        assert!(got.contains("staging reflink probe failed"), "{got}");
+        assert!(got.contains("staging reflinks unsupported"), "{got}");
         assert!(!got.contains("ext4"), "{got}");
     }
 
@@ -653,8 +730,9 @@ mod tests {
     fn format_probe_detail_reports_success_with_unknown_ficlone() {
         let mut report = empty_report();
         report.hardlink_supported = true;
-        report.ficlone_supported = None;
+        report.ficlone_supported = Unknown("permission denied".into());
         let got = format_probe_detail(&report);
+        assert!(got.contains("permission denied"), "{got}");
         assert!(got.contains("reflink support unknown"), "{got}");
     }
 
@@ -692,16 +770,16 @@ mod tests {
     #[test]
     fn sharing_requires_a_hardlink_or_both_cross_path_reflinks() {
         for hardlink in [false, true] {
-            for forward in [None, Some(false), Some(true)] {
-                for reverse in [None, Some(false), Some(true)] {
+            for forward in [unknown(), Unsupported, Supported] {
+                for reverse in [unknown(), Unsupported, Supported] {
                     let mut report = empty_report();
                     report.hardlink_supported = hardlink;
-                    report.ficlone_supported = Some(true);
-                    report.reflink_build_to_staging = forward;
-                    report.reflink_staging_to_build = reverse;
+                    report.ficlone_supported = Supported;
+                    report.reflink_build_to_staging = forward.clone();
+                    report.reflink_staging_to_build = reverse.clone();
                     assert_eq!(
                         report.sharing_supported(),
-                        hardlink || (forward == Some(true) && reverse == Some(true)),
+                        hardlink || (forward == Supported && reverse == Supported),
                         "hardlink={hardlink}, forward={forward:?}, reverse={reverse:?}"
                     );
                 }
@@ -713,10 +791,11 @@ mod tests {
     fn reflinks_in_both_directions_report_unavailable_hardlink_fallback() {
         let mut report = empty_report();
         report.error_kind = Some("CrossesDevices".to_string());
-        report.ficlone_supported = Some(false);
-        report.reflink_build_to_staging = Some(true);
-        report.reflink_staging_to_build = Some(true);
+        report.ficlone_supported = Unknown("staging full".into());
+        report.reflink_build_to_staging = Supported;
+        report.reflink_staging_to_build = Supported;
         let detail = format_probe_detail(&report);
+        assert!(detail.contains("staging reflink support unknown (staging full)"));
         assert!(report.sharing_supported());
         assert!(detail.contains("build → staging works"), "{detail}");
         assert!(detail.contains("staging → build works"), "{detail}");
@@ -728,15 +807,15 @@ mod tests {
     #[test]
     fn unknown_cross_path_reflinks_do_not_claim_success_or_suggest_moving_mounts() {
         for (forward, reverse) in [
-            (None, None),
-            (None, Some(true)),
-            (Some(true), None),
-            (Some(false), None),
-            (None, Some(false)),
+            (unknown(), unknown()),
+            (unknown(), Supported),
+            (Supported, unknown()),
+            (Unsupported, unknown()),
+            (unknown(), Unsupported),
         ] {
             let mut report = empty_report();
             report.error_kind = Some("CrossesDevices".to_string());
-            report.ficlone_supported = Some(true);
+            report.ficlone_supported = Supported;
             report.reflink_build_to_staging = forward;
             report.reflink_staging_to_build = reverse;
             let detail = format_probe_detail(&report);
@@ -749,16 +828,20 @@ mod tests {
 
     #[test]
     fn failed_cross_path_reflink_keeps_exdev_diagnostic() {
-        for (forward, reverse) in [(true, false), (false, true), (false, false)] {
+        for (forward, reverse) in [
+            (Supported, Unsupported),
+            (Unsupported, Supported),
+            (Unsupported, Unsupported),
+        ] {
             let mut report = empty_report();
             report.error_kind = Some("CrossesDevices".to_string());
-            report.reflink_build_to_staging = Some(forward);
-            report.reflink_staging_to_build = Some(reverse);
+            report.reflink_build_to_staging = forward;
+            report.reflink_staging_to_build = reverse;
             let detail = format_probe_detail(&report);
             assert!(!report.sharing_supported());
             assert!(detail.contains("EXDEV"), "{detail}");
             assert!(detail.contains("SAME mount"), "{detail}");
-            assert!(detail.contains("failed"), "{detail}");
+            assert!(detail.contains("unsupported"), "{detail}");
         }
     }
 
@@ -768,24 +851,31 @@ mod tests {
         let build = dir.path().join("build");
         let staging = dir.path().join("staging");
         std::fs::create_dir(&build).unwrap();
-        for (forward, reverse) in [(Some(true), Some(false)), (None, Some(true))] {
+        for (forward, reverse) in [(Supported, Unsupported), (unknown(), Supported)] {
             let mut calls = Vec::new();
             let report = probe_link_layout_with(&build, &staging, |src, dst| {
                 calls.push((src.to_path_buf(), dst.to_path_buf()));
                 if src == staging && dst == staging {
-                    Some(true)
+                    Supported
                 } else if src == build && dst == staging {
-                    forward
+                    forward.clone()
                 } else if src == staging && dst == build {
-                    reverse
+                    reverse.clone()
                 } else {
                     panic!("unexpected reflink paths: {src:?} → {dst:?}");
                 }
             });
-            assert_eq!(report.ficlone_supported, Some(true));
+            assert_eq!(report.ficlone_supported, Supported);
             assert_eq!(report.reflink_build_to_staging, forward);
             assert_eq!(report.reflink_staging_to_build, reverse);
-            assert_eq!(calls.len(), 3);
+            assert_eq!(
+                calls,
+                vec![
+                    (staging.clone(), staging.clone()),
+                    (build.clone(), staging.clone()),
+                    (staging.clone(), build.clone()),
+                ]
+            );
         }
     }
 
@@ -803,24 +893,13 @@ mod tests {
 
         let report = probe_link_layout(&build, &staging);
         assert!(report.hardlink_supported, "{report:?}");
-        assert!(report.reflink_build_to_staging.is_some(), "{report:?}");
-        assert!(report.reflink_staging_to_build.is_some(), "{report:?}");
-        assert_eq!(
-            report.reflink_build_to_staging,
-            reflink_supported_between(&build, &staging)
-        );
-        assert_eq!(
-            report.reflink_staging_to_build,
-            reflink_supported_between(&staging, &build)
-        );
-        assert_eq!(
-            reflink_supported_between(&build, &dir.path().join("missing")),
-            None
-        );
+        let missing = dir.path().join("missing");
+        let result = reflink_supported_between(&build, &missing);
+        assert!(matches!(result, Unknown(reason) if reason.contains("temporary destination")));
         let failed = probe_link_layout(&existing_build, &staging);
         assert!(!failed.hardlink_supported);
-        assert_eq!(failed.reflink_build_to_staging, None);
-        assert_eq!(failed.reflink_staging_to_build, None);
+        assert!(matches!(failed.reflink_build_to_staging, Unknown(_)));
+        assert!(matches!(failed.reflink_staging_to_build, Unknown(_)));
 
         assert_eq!(std::fs::read(&existing_build).unwrap(), b"build sentinel");
         assert_eq!(
@@ -861,21 +940,99 @@ mod tests {
         assert!(report.error_kind.is_some());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn ficlone_probe_returns_determinate_for_existing_dir() {
+    fn reflink_clone_environmental_failures_are_unknown() {
         let dir = tempfile::tempdir().unwrap();
-        // CoW or not, an existing dir yields a determinate answer; a missing
-        // dir yields None. Do not assert true/false: that varies by
-        // filesystem (APFS vs ext4) and would flake.
-        assert!(reflink_supported_between(dir.path(), dir.path()).is_some());
+        for errno in [
+            libc::ENOSPC,
+            libc::EACCES,
+            libc::EPERM,
+            libc::EIO,
+            libc::EINVAL,
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            let result = reflink_supported_between_with(dir.path(), dir.path(), |_, dest| {
+                std::fs::write(dest, b"partial clone").unwrap();
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            assert!(
+                matches!(result, Unknown(ref reason) if reason.contains(&error.to_string())),
+                "errno {errno}: {result:?}"
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reflink_clone_cross_device_and_unsupported_are_determinate() {
+        let dir = tempfile::tempdir().unwrap();
+        for errno in [libc::EXDEV, libc::EOPNOTSUPP, libc::ENOTSUP] {
+            let result = reflink_supported_between_with(dir.path(), dir.path(), |_, _| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(result, Unsupported, "errno {errno}");
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            reflink_supported_between_with(dir.path(), dir.path(), |_, _| {
+                Err(std::io::Error::from_raw_os_error(libc::ENOTTY))
+            }),
+            Unsupported
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reflink_clone_windows_errors_are_classified_conservatively() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_INVALID_FUNCTION, ERROR_NOT_SAME_DEVICE,
+            ERROR_NOT_SUPPORTED,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        for code in [ERROR_NOT_SAME_DEVICE, ERROR_NOT_SUPPORTED] {
+            let result = reflink_supported_between_with(dir.path(), dir.path(), |_, _| {
+                Err(std::io::Error::from_raw_os_error(code as i32))
+            });
+            assert_eq!(result, Unsupported, "Windows error {code}");
+        }
+        for code in [ERROR_DISK_FULL, ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION] {
+            let result = reflink_supported_between_with(dir.path(), dir.path(), |_, _| {
+                Err(std::io::Error::from_raw_os_error(code as i32))
+            });
+            assert!(matches!(result, Unknown(_)), "Windows error {code}");
+        }
+        let result = reflink_supported_between_with(dir.path(), dir.path(), |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "file smaller than one cluster",
+            ))
+        });
+        assert!(matches!(result, Unknown(_)));
+    }
+
+    #[test]
+    fn reflink_probe_reports_success_from_a_successful_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = reflink_supported_between_with(dir.path(), dir.path(), |src, dest| {
+            std::fs::copy(src, dest)?;
+            Ok(())
+        });
+        assert_eq!(result, Supported);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
     fn probe_reports_reflinks_for_a_staging_dir_it_creates() {
         let dir = tempfile::tempdir().unwrap();
         let staging_dir = dir.path().join("store").join("staging");
-        let report = probe_link_layout(dir.path(), &staging_dir);
-        assert!(report.ficlone_supported.is_some(), "{report:?}");
+        let report = probe_link_layout_with(dir.path(), &staging_dir, |src, dst| {
+            assert!(src.is_dir() && dst.is_dir());
+            Supported
+        });
+        assert_eq!(report.ficlone_supported, Supported);
     }
 
     #[cfg(unix)]
@@ -896,9 +1053,10 @@ mod tests {
     }
 
     #[test]
-    fn ficlone_probe_returns_none_for_missing_dir() {
+    fn ficlone_probe_reports_missing_source_dir() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such-dir");
-        assert!(reflink_supported_between(&missing, &missing).is_none());
+        let result = reflink_supported_between(&missing, &missing);
+        assert!(matches!(result, Unknown(reason) if reason.contains("temporary source")));
     }
 }

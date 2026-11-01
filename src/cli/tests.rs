@@ -43,6 +43,8 @@ fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
 
 #[test]
 fn doctor_link_layout_classifies_reflinks_and_unknown_probes() {
+    use crate::link_probe::ReflinkProbe::{Supported, Unknown, Unsupported};
+
     let dir = tempfile::tempdir().unwrap();
     let build = dir.path().join("build");
     let staging = dir.path().join("staging");
@@ -50,22 +52,22 @@ fn doctor_link_layout_classifies_reflinks_and_unknown_probes() {
     let mut probe = crate::link_probe::probe_link_layout(&build, &staging);
     probe.hardlink_supported = false;
     probe.error_kind = Some("CrossesDevices".into());
-    probe.ficlone_supported = Some(true);
+    probe.ficlone_supported = Supported;
 
-    probe.reflink_build_to_staging = Some(true);
-    probe.reflink_staging_to_build = Some(true);
+    probe.reflink_build_to_staging = Supported;
+    probe.reflink_staging_to_build = Supported;
     let check = doctor_link_layout_check(&probe, &build, &staging);
     assert!(check.pass, "{}", check.detail);
     assert!(check.fix.is_none());
     assert!(check.detail.contains("hardlink fallback unavailable"));
     assert!(!check.detail.contains("SAME mount"));
 
-    probe.reflink_staging_to_build = Some(false);
+    probe.reflink_staging_to_build = Unsupported;
     let check = doctor_link_layout_check(&probe, &build, &staging);
     assert!(!check.pass);
     assert!(check.fix.unwrap().contains("SAME mount"));
     assert!(check.detail.contains("EXDEV"));
-    assert!(check.detail.contains("staging → build failed"));
+    assert!(check.detail.contains("staging → build unsupported"));
 
     probe.error_kind = Some("PermissionDenied".into());
     let check = doctor_link_layout_check(&probe, &build, &staging);
@@ -80,15 +82,15 @@ fn doctor_link_layout_classifies_reflinks_and_unknown_probes() {
     assert!(!check.detail.contains("SAME mount"));
     probe.error_kind = Some("CrossesDevices".into());
 
-    probe.reflink_staging_to_build = None;
+    probe.reflink_staging_to_build = Unknown("not attempted".into());
     let check = doctor_link_layout_check(&probe, &build, &staging);
     assert!(!check.pass);
     assert!(check.fix.unwrap().contains("retry the reflink probes"));
     assert!(check.detail.contains("staging → build unknown"));
     assert!(!check.detail.contains("SAME mount"));
 
-    probe.reflink_build_to_staging = None;
-    probe.reflink_staging_to_build = Some(true);
+    probe.reflink_build_to_staging = Unknown("not attempted".into());
+    probe.reflink_staging_to_build = Supported;
     let check = doctor_link_layout_check(&probe, &build, &staging);
     assert!(!check.pass);
     assert!(check.detail.contains("build → staging unknown"));
@@ -98,6 +100,70 @@ fn doctor_link_layout_classifies_reflinks_and_unknown_probes() {
     assert!(check.pass);
     assert!(check.fix.is_none());
     assert!(check.detail.contains("hardlink build-tree"));
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_link_layout_reports_injected_reflink_errors_without_moving_mounts() {
+    use crate::link_probe::{ReflinkProbe, reflink_supported_between_with};
+
+    let dir = tempfile::tempdir().unwrap();
+    let build = dir.path().join("build");
+    let staging = dir.path().join("staging");
+    fs::create_dir(&build).unwrap();
+    fs::create_dir(&staging).unwrap();
+    let mut probe = crate::link_probe::probe_link_layout(&build, &staging);
+    probe.hardlink_supported = false;
+    probe.error_kind = Some("CrossesDevices".into());
+    probe.ficlone_supported = ReflinkProbe::Supported;
+
+    for errno in [libc::ENOSPC, libc::EACCES, libc::EIO] {
+        for failed_forward in [true, false] {
+            let result = reflink_supported_between_with(&build, &staging, |_, _| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+            probe.reflink_build_to_staging = if failed_forward {
+                result.clone()
+            } else {
+                ReflinkProbe::Supported
+            };
+            probe.reflink_staging_to_build = if failed_forward {
+                ReflinkProbe::Unsupported
+            } else {
+                result
+            };
+            let check = doctor_link_layout_check(&probe, &build, &staging);
+            let fix = check.fix.unwrap();
+            assert!(!check.pass, "{}", check.detail);
+            assert!(check.detail.contains(if failed_forward {
+                "build → staging unknown"
+            } else {
+                "staging → build unknown"
+            }));
+            assert!(
+                check
+                    .detail
+                    .contains(&std::io::Error::from_raw_os_error(errno).to_string())
+            );
+            assert!(
+                fix.contains("free space") && fix.contains("permissions") && fix.contains("retry")
+            );
+            assert!(!fix.contains("SAME mount"), "{fix}");
+            assert!(!check.detail.contains("SAME mount"), "{}", check.detail);
+        }
+    }
+
+    for errno in [libc::EXDEV, libc::EOPNOTSUPP] {
+        probe.reflink_build_to_staging =
+            reflink_supported_between_with(&build, &staging, |_, _| {
+                Err(std::io::Error::from_raw_os_error(errno))
+            });
+        probe.reflink_staging_to_build = ReflinkProbe::Supported;
+        let check = doctor_link_layout_check(&probe, &build, &staging);
+        assert!(!check.pass);
+        assert!(check.detail.contains("build → staging unsupported"));
+        assert!(check.fix.unwrap().contains("SAME mount"));
+    }
 }
 
 #[test]

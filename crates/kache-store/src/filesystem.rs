@@ -71,7 +71,7 @@ pub fn snapshot_workspace_target(
 use target_inventory::snapshot_workspace_target_with;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-mod target_inventory {
+pub(crate) mod target_inventory {
     use super::{Path, PathBuf, PathIdentity, TargetSymlinkSnapshot, directory_identity};
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -83,7 +83,7 @@ mod target_inventory {
         }
     }
 
-    fn open_directory(path: &Path, follow: bool) -> Option<File> {
+    pub(crate) fn open_directory(path: &Path, follow: bool) -> Option<File> {
         let mut flags = libc::O_PATH | libc::O_DIRECTORY;
         if !follow {
             flags |= libc::O_NOFOLLOW;
@@ -95,7 +95,7 @@ mod target_inventory {
             .ok()
     }
 
-    fn open_symlink(path: &Path) -> Option<File> {
+    pub(crate) fn open_symlink(path: &Path) -> Option<File> {
         let flags = libc::O_PATH | libc::O_NOFOLLOW;
         let file = OpenOptions::new()
             .read(true)

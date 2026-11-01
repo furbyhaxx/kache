@@ -1,5 +1,9 @@
 use crate::ArtifactPolicy;
 use crate::blob_validation::validate_blob_metadata;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::filesystem::target_inventory::{
+    open_directory as open_inventory_directory, open_symlink as open_inventory_symlink,
+};
 use anyhow::{Context, Result};
 pub use kache_format::{CachedFile, EntryMeta};
 use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, params};
@@ -6893,38 +6897,9 @@ pub struct EntryInfo {
     pub content_hash: Option<String>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn open_inventory_directory(path: &Path, follow: bool) -> Option<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut flags = libc::O_PATH | libc::O_DIRECTORY;
-    if !follow {
-        flags |= libc::O_NOFOLLOW;
-    }
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)
-        .ok()
-}
-
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn open_inventory_directory(_path: &Path, _follow: bool) -> Option<fs::File> {
     None
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn open_inventory_symlink(path: &Path) -> Option<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
-        .open(path)
-        .ok()?;
-    file.metadata()
-        .ok()?
-        .file_type()
-        .is_symlink()
-        .then_some(file)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]

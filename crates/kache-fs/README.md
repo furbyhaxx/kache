@@ -12,6 +12,7 @@ Filesystem measurements, file identity, and native cloning and copying. Built fo
 - `try_reflink` creates an independent file that shares blocks where the filesystem supports it. It refuses an existing destination and returns the error so you can fall back.
 - `copy_writable` copies bytes with an explicit writable mode.
 - `file_identity` and `directory_identity` return the device and inode (the volume serial and file index on Windows).
+- `exchange_entries` atomically swaps two entries in an open parent directory on Linux; other platforms return an unsupported error. Callers must pin and revalidate identities and coordinate consumers.
 
 ## Features
 

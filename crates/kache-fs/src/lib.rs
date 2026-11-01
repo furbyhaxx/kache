@@ -17,6 +17,9 @@ pub use copy::{copy_writable, set_writable_permissions, try_clone_extents_into, 
 mod identity;
 pub use identity::{directory_identity, file_identity, handle_identity};
 
+mod mount_observer;
+pub use mount_observer::{MountChange, MountChangeObserver};
+
 #[cfg(feature = "staging")]
 mod staging;
 #[cfg(feature = "staging")]

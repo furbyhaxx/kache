@@ -1963,10 +1963,19 @@ fn open_external_target_inventory_with(
     write: bool,
     before_sqlite_open: impl FnOnce(),
 ) -> Result<Option<InventoryConnection>> {
+    open_external_target_inventory_mode(cache_dir, write, write, before_sqlite_open)
+}
+
+fn open_external_target_inventory_mode(
+    cache_dir: &Path,
+    write: bool,
+    create_db: bool,
+    before_sqlite_open: impl FnOnce(),
+) -> Result<Option<InventoryConnection>> {
     use std::io::Read;
 
     let requested_path = cache_dir.join(EXTERNAL_TARGET_INVENTORY_DB);
-    if !write {
+    if !create_db {
         match fs::symlink_metadata(&requested_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -2022,14 +2031,14 @@ fn open_external_target_inventory_with(
     validate_inventory_directory(cache_dir, &directory_path, &directory)?;
     validate_inventory_file(&lock_path, &lock.file)?;
     let path = directory_path.join(EXTERNAL_TARGET_INVENTORY_DB);
-    if !write {
+    if !create_db {
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
     }
-    let mut file = open_inventory_file(&path, write)?;
+    let mut file = open_inventory_file(&path, create_db)?;
     let metadata = file.metadata()?;
     if metadata.len() >= 20 {
         let mut header = [0; 20];
@@ -2068,6 +2077,18 @@ fn open_external_target_inventory_with(
     db.revalidate()?;
     db.busy_timeout(EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT)?;
     let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if write && generation == 0 {
+        let has_objects: bool =
+            db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema)", [], |row| {
+                row.get(0)
+            })?;
+        let application_id: i64 =
+            db.pragma_query_value(None, "application_id", |row| row.get(0))?;
+        let freelist: i64 = db.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+        if has_objects || application_id != 0 || freelist != 0 {
+            anyhow::bail!("unrecognized inventory schema 0: {}", path.display());
+        }
+    }
     if write && (generation == 0 || generation == 1) {
         let transaction =
             rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
@@ -4767,11 +4788,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Peek at the next external inventory pass without creating or migrating its database.
+    /// Peek at the next external inventory pass without creating its database.
     ///
-    /// A missing database or version 1 inventory has not reserved a pass yet.
+    /// A writable store recovers or migrates an existing inventory; a read-only
+    /// store never modifies it. A missing database has not reserved a pass yet.
     pub fn next_external_inventory_turn(&self) -> Result<u64> {
-        let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
+        let Some(db) = open_external_target_inventory_mode(
+            &self.config.cache_dir,
+            !self.read_only,
+            false,
+            || {},
+        )?
+        else {
             return Ok(0);
         };
         let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;

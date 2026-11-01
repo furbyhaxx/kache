@@ -2335,7 +2335,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn external_inventory_caps_records_and_rotates_candidates() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{OpenOptionsExt, symlink};
 
         if Command::new("git")
             .arg("--version")
@@ -2395,6 +2395,12 @@ mod tests {
             .unwrap()
         );
         assert!(store.external_target_observations().unwrap().is_empty());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(config.cache_dir.join("external-target-inventory.db"))
+            .unwrap();
 
         assert_eq!(
             discover(&store, &config.external_target_roots, DISCOVERY_TIME, 0).unwrap(),

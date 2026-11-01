@@ -632,9 +632,15 @@ fn discover_within(
     homes: &[PathBuf],
     turn: u64,
 ) -> Result<usize> {
-    discover_within_using(store, external_roots, deadline, homes, turn, |path| {
-        crate::cache_fs::probe(path).is_local == Some(true)
-    })
+    discover_within_using(
+        store,
+        external_roots,
+        deadline,
+        homes,
+        turn,
+        |path| crate::cache_fs::probe(path).is_local == Some(true),
+        observe_external_before_deadline,
+    )
 }
 
 fn observe_external_before_deadline(
@@ -658,6 +664,14 @@ fn discover_within_using(
     homes: &[PathBuf],
     turn: u64,
     is_local: impl Fn(&Path) -> bool,
+    observe_external: impl Fn(
+        &Store,
+        &Path,
+        &Path,
+        &[PathBuf],
+        &kache_store::filesystem::TargetSymlinkSnapshot,
+        Instant,
+    ) -> Result<bool>,
 ) -> Result<usize> {
     let tracked = store.tracked_target_roots(0)?;
     let mut known: HashSet<_> = tracked.iter().map(|root| root.identity).collect();
@@ -701,6 +715,21 @@ fn discover_within_using(
         !external_roots.is_empty(),
     ));
 
+    let mut covered = HashSet::new();
+    let mut found = 0;
+    // What the surveys found is recorded whatever the time: a few inserts.
+    for (target, workspace) in surveys.iter().flat_map(|survey| &survey.targets) {
+        if !covered.insert(workspace.clone()) {
+            continue;
+        }
+        if let Some(id) = crate::machine::directory_identity(target)
+            && !known.insert(id)
+        {
+            continue;
+        }
+        found += usize::from(store.remember_discovered_target_root(target, workspace)?);
+    }
+
     if !external_roots.is_empty() {
         // Keep source spellings so the snapshot can recheck their resolution.
         let sources = tracked
@@ -730,7 +759,7 @@ fn discover_within_using(
         let links: Vec<_> = surveys.iter().flat_map(|survey| &survey.links).collect();
         let turn = external_candidate_turn(turn, links.len());
         let mut candidates = 0;
-        for workspace in rotated(links, turn) {
+        'external: for workspace in rotated(links, turn) {
             if Instant::now() >= deadline || candidates == MAX_EXTERNAL_RECORDS {
                 break;
             }
@@ -765,27 +794,19 @@ fn discover_within_using(
                 if !is_local(&snapshot.backing_path) {
                     continue;
                 }
-                observe_external_before_deadline(
-                    store, workspace, root, &sources, &snapshot, deadline,
-                )?;
+                if let Err(error) =
+                    observe_external(store, workspace, root, &sources, &snapshot, deadline)
+                {
+                    tracing::warn!(
+                        "cannot inventory external target {} under {}: {error:#}",
+                        workspace.display(),
+                        root.display()
+                    );
+                    break 'external;
+                }
                 break;
             }
         }
-    }
-
-    let mut covered = HashSet::new();
-    let mut found = 0;
-    // What the surveys found is recorded whatever the time: a few inserts.
-    for (target, workspace) in surveys.into_iter().flat_map(|survey| survey.targets) {
-        if !covered.insert(workspace.clone()) {
-            continue;
-        }
-        if let Some(id) = crate::machine::directory_identity(&target)
-            && !known.insert(id)
-        {
-            continue;
-        }
-        found += usize::from(store.remember_discovered_target_root(&target, &workspace)?);
     }
     Ok(found)
 }
@@ -1401,6 +1422,7 @@ mod tests {
             &[],
             0,
             |path| path != storage && local(path),
+            observe_external_before_deadline,
         )
         .unwrap();
         assert!(isolated.external_target_observations().unwrap().is_empty());
@@ -1411,6 +1433,7 @@ mod tests {
             &[],
             0,
             |path| path != shared && path != sibling.join("tagged") && local(path),
+            observe_external_before_deadline,
         )
         .unwrap();
         assert!(isolated.external_target_observations().unwrap().is_empty());
@@ -1475,6 +1498,149 @@ mod tests {
             .unwrap();
         assert_eq!(app, &old_app);
         assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn external_inventory_error_keeps_ordinary_discovery() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, Mutex};
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("source/repo");
+        let sibling = base.join("source/sibling");
+        let storage = base.join("storage");
+        let backing = storage.join("backing");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        std::fs::write(sibling.join(".gitignore"), "target\n").unwrap();
+        let built = cargo_target(&repo.join("built"));
+        let normal = cargo_target(&sibling.join("normal"));
+        let workspace = sibling.join("external");
+        let later = sibling.join("later");
+        for source in [&workspace, &later] {
+            std::fs::create_dir(source).unwrap();
+            std::fs::write(source.join("Cargo.toml"), "[workspace]\n").unwrap();
+            symlink(&backing, source.join("target")).unwrap();
+        }
+
+        let config = crate::test_support::test_config(base.join("cache"));
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &repo.join("built"))
+            .unwrap();
+        let before_snapshot = Cell::new(None);
+        let calls = Cell::new(0);
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(Arc::clone(&writer)))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            discover_within_using(
+                &store,
+                std::slice::from_ref(&storage),
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                0,
+                |path| {
+                    if path == workspace.join("target") {
+                        before_snapshot.set(Some(
+                            store
+                                .tracked_target_roots(0)
+                                .unwrap()
+                                .iter()
+                                .any(|row| row.path == normal && row.discovered),
+                        ));
+                    }
+                    true
+                },
+                |_, observed_workspace, observed_root, _, _, _| {
+                    assert_eq!(observed_workspace, workspace);
+                    assert_eq!(observed_root, storage);
+                    calls.set(calls.get() + 1);
+                    Err(anyhow::anyhow!("injected inventory failure"))
+                },
+            )
+        });
+        assert_eq!(calls.get(), 1, "the external observation must be attempted");
+        assert_eq!(
+            before_snapshot.get(),
+            Some(true),
+            "ordinary target must be registered before external inventory: {result:?}"
+        );
+        assert_eq!(result.unwrap(), 1);
+        let rows = store.tracked_target_roots(0).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.path == normal && row.discovered));
+        assert!(store.external_target_observations().unwrap().is_empty());
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "WARN",
+            "injected inventory failure",
+            workspace.to_str().unwrap(),
+            storage.to_str().unwrap(),
+        ] {
+            assert!(log.contains(expected), "{expected} missing from {log}");
+        }
+
+        assert_eq!(
+            discover_within_using(
+                &store,
+                std::slice::from_ref(&storage),
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                0,
+                |_| true,
+                observe_external_before_deadline,
+            )
+            .unwrap(),
+            0
+        );
+        let observations = store.external_target_observations().unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(
+            observations
+                .iter()
+                .any(|row| row.workspace_path == workspace)
+        );
+        assert!(observations.iter().any(|row| row.workspace_path == later));
+        assert_eq!(
+            discover_within_using(
+                &store,
+                &[],
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                0,
+                |_| panic!("locality must not be checked without external roots"),
+                |_, _, _, _, _, _| panic!("external observation must not run without roots"),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[cfg(target_os = "linux")]

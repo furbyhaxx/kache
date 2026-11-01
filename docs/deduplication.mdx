@@ -31,6 +31,8 @@ Restored reflinks and copies are writable by their owner, so a later compiler in
 
 Reflinks have independent inodes. A later write copies changed blocks instead of modifying the store blob.
 
+Run `kache doctor` from a build directory to check sharing with its selected store. The `Link layout` check tries reflinks in both directions as well as a hardlink into staging. Separate bind mounts can allow the reflinks while denying the hardlink fallback; in that case the check passes and reports the missing fallback. A staging-only reflink result does not prove that cloning works across both paths.
+
 ## Sharing existing target files
 
 A large compiler output in a target directory can be a byte-for-byte copy of a blob the store already holds, for example when another worktree compiled the same artifact. With `cache.auto_share_target_files` on (the default), the daemon replaces such files with clones of the blob, a little at a time while the machine is idle. Each file keeps its path, mode and modification time, so Cargo still sees it as fresh.

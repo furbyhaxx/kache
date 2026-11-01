@@ -7656,10 +7656,36 @@ fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
         };
     }
     let probe = crate::link_probe::probe_link_layout(build_dir, &staging);
+    doctor_link_layout_check(&probe, build_dir, &staging)
+}
+
+fn doctor_link_layout_check(
+    probe: &crate::link_probe::LinkLayoutReport,
+    build_dir: &std::path::Path,
+    staging: &std::path::Path,
+) -> Check {
+    let pass = probe.sharing_supported();
+    let fix = if pass {
+        None
+    } else if !probe.cross_reflinks_determined() {
+        Some("check that the build and staging directories are accessible and retry the reflink probes".into())
+    } else if probe.error_kind.as_deref() == Some("CrossesDevices") {
+        Some("put the cache and build tree on the SAME mount for zero-copy sharing; if this layout is intentional, expect copies (see `kache report` copy reasons)".into())
+    } else if probe.error_kind.as_deref() == Some("PermissionDenied") {
+        Some("ensure one uid owns the cache and can access the build directory".into())
+    } else {
+        Some("check that the build and staging directories are accessible and writable".into())
+    };
     Check {
-        label: "Link layout", pass: probe.hardlink_supported,
-        detail: format!("{} (build: {}, staging: {})", crate::link_probe::format_probe_detail(&probe), crate::link_probe::shown_path(build_dir), crate::link_probe::shown_path(&staging)),
-        fix: (!probe.hardlink_supported).then(|| "put the cache and build tree on the SAME mount for zero-copy sharing; if this layout is intentional, expect copies (see `kache report` copy reasons)".into()),
+        label: "Link layout",
+        pass,
+        detail: format!(
+            "{} (build: {}, staging: {})",
+            crate::link_probe::format_probe_detail(probe),
+            crate::link_probe::shown_path(build_dir),
+            crate::link_probe::shown_path(staging)
+        ),
+        fix,
     }
 }
 

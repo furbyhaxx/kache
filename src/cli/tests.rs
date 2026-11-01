@@ -38,7 +38,66 @@ fn doctor_link_layout_uses_the_mapped_store_and_leaves_missing_shards_absent() {
     );
     let failed = doctor_link_layout(&config, &dir.path().join("absent-build"));
     assert!(!failed.pass);
-    assert!(failed.fix.unwrap().contains("SAME mount"));
+    assert!(failed.fix.unwrap().contains("retry the reflink probes"));
+}
+
+#[test]
+fn doctor_link_layout_classifies_reflinks_and_unknown_probes() {
+    let dir = tempfile::tempdir().unwrap();
+    let build = dir.path().join("build");
+    let staging = dir.path().join("staging");
+    fs::create_dir(&build).unwrap();
+    let mut probe = crate::link_probe::probe_link_layout(&build, &staging);
+    probe.hardlink_supported = false;
+    probe.error_kind = Some("CrossesDevices".into());
+    probe.ficlone_supported = Some(true);
+
+    probe.reflink_build_to_staging = Some(true);
+    probe.reflink_staging_to_build = Some(true);
+    let check = doctor_link_layout_check(&probe, &build, &staging);
+    assert!(check.pass, "{}", check.detail);
+    assert!(check.fix.is_none());
+    assert!(check.detail.contains("hardlink fallback unavailable"));
+    assert!(!check.detail.contains("SAME mount"));
+
+    probe.reflink_staging_to_build = Some(false);
+    let check = doctor_link_layout_check(&probe, &build, &staging);
+    assert!(!check.pass);
+    assert!(check.fix.unwrap().contains("SAME mount"));
+    assert!(check.detail.contains("EXDEV"));
+    assert!(check.detail.contains("staging → build failed"));
+
+    probe.error_kind = Some("PermissionDenied".into());
+    let check = doctor_link_layout_check(&probe, &build, &staging);
+    assert!(!check.pass);
+    assert!(check.detail.contains("EPERM"));
+    assert!(check.fix.unwrap().contains("one uid owns the cache"));
+    assert!(!check.detail.contains("SAME mount"));
+    probe.error_kind = Some("Other".into());
+    let check = doctor_link_layout_check(&probe, &build, &staging);
+    assert!(!check.pass);
+    assert!(check.fix.unwrap().contains("accessible and writable"));
+    assert!(!check.detail.contains("SAME mount"));
+    probe.error_kind = Some("CrossesDevices".into());
+
+    probe.reflink_staging_to_build = None;
+    let check = doctor_link_layout_check(&probe, &build, &staging);
+    assert!(!check.pass);
+    assert!(check.fix.unwrap().contains("retry the reflink probes"));
+    assert!(check.detail.contains("staging → build unknown"));
+    assert!(!check.detail.contains("SAME mount"));
+
+    probe.reflink_build_to_staging = None;
+    probe.reflink_staging_to_build = Some(true);
+    let check = doctor_link_layout_check(&probe, &build, &staging);
+    assert!(!check.pass);
+    assert!(check.detail.contains("build → staging unknown"));
+
+    probe.hardlink_supported = true;
+    let check = doctor_link_layout_check(&probe, &build, &staging);
+    assert!(check.pass);
+    assert!(check.fix.is_none());
+    assert!(check.detail.contains("hardlink build-tree"));
 }
 
 #[test]

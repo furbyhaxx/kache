@@ -1,17 +1,8 @@
-//! Layout probe for `kache doctor`: can the build tree hardlink into
-//! `<store>/staging`, and if not, why (#835)?
+//! Probe hardlinks and bidirectional reflinks between a build tree and staging.
 //!
-//! On ext4 CI 0% of store blobs are multi-link. The most likely cause is
-//! `link(2)` returning EXDEV across two bind mounts of one filesystem (same
-//! `st_dev`, different vfsmounts), with both ingest and restore falling
-//! silently to a byte copy. This probe makes that visible: a temp file in the
-//! build tree linked into `<store>/staging`, reporting EXDEV with both mount
-//! roots (from `/proc/self/mountinfo`), EPERM with `protected_hardlinks` +
-//! uid/owner, and FICLONE support.
-//!
-//! Observability only: the probe creates and removes two temp files, never
-//! changing what gets linked.
+//! This is observability only; it does not change how artifacts are shared.
 
+use std::io::Write;
 use std::path::Path;
 
 /// Outcome of [`probe_link_layout`].
@@ -35,27 +26,39 @@ pub struct LinkLayoutReport {
     pub source_owner: Option<u32>,
     /// Owner uid of the staging dir, if determinable (unix).
     pub dest_owner: Option<u32>,
-    /// Whether FICLONE (CoW reflink) works in `<store>/staging`: `Some(true)`
-    /// on CoW filesystems, `Some(false)` where the ioctl fails (ext4), `None`
-    /// when the probe could not run.
+    /// Whether a staging-local reflink succeeded; `None` means it was not attempted.
     pub ficlone_supported: Option<bool>,
+    /// Whether a reflink from the build tree into staging succeeded.
+    pub reflink_build_to_staging: Option<bool>,
+    /// Whether a reflink from staging into the build tree succeeded.
+    pub reflink_staging_to_build: Option<bool>,
 }
 
-/// Probe whether a build-tree file can be hardlinked into `<store>/staging`.
-///
-/// Creates a temp file in `build_dir`, links it into `staging_dir`, then
-/// removes both. On success reports `hardlink_supported = true`; on failure
-/// classifies the errno and gathers mount/owner/FICLONE context. Best-effort:
-/// missing context is `None`, never an error.
-pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutReport {
-    let pid = std::process::id();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let source_tmp = build_dir.join(format!(".kache-link-probe-{pid}-{nonce}"));
-    let dest_tmp = staging_dir.join(format!(".kache-link-probe-{pid}-{nonce}.link"));
+impl LinkLayoutReport {
+    pub(crate) fn sharing_supported(&self) -> bool {
+        self.hardlink_supported
+            || (self.reflink_build_to_staging == Some(true)
+                && self.reflink_staging_to_build == Some(true))
+    }
 
+    pub(crate) fn cross_reflinks_determined(&self) -> bool {
+        self.reflink_build_to_staging.is_some() && self.reflink_staging_to_build.is_some()
+    }
+}
+
+/// Probe hardlinks and reflinks between `build_dir` and `staging_dir`.
+///
+/// Probe files are created exclusively in temporary paths and removed on
+/// return. A reflink result is `None` when the probe could not be attempted.
+pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutReport {
+    probe_link_layout_with(build_dir, staging_dir, reflink_supported_between)
+}
+
+fn probe_link_layout_with(
+    build_dir: &Path,
+    staging_dir: &Path,
+    mut reflink_probe: impl FnMut(&Path, &Path) -> Option<bool>,
+) -> LinkLayoutReport {
     let mut report = LinkLayoutReport {
         hardlink_supported: false,
         error_kind: None,
@@ -67,10 +70,10 @@ pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutRepo
         source_owner: None,
         dest_owner: None,
         ficlone_supported: None,
+        reflink_build_to_staging: None,
+        reflink_staging_to_build: None,
     };
 
-    // The build dir may not exist in a fresh doctor run (e.g. cwd deleted);
-    // surface that as an Other failure rather than panicking.
     if let Err(e) = std::fs::create_dir_all(staging_dir) {
         report.error_kind = Some("CreateDirFailed".to_string());
         report.error_message = Some(format!(
@@ -79,32 +82,59 @@ pub fn probe_link_layout(build_dir: &Path, staging_dir: &Path) -> LinkLayoutRepo
         ));
         return report;
     }
-    // Probed once staging exists: a first doctor run creates it above.
-    report.ficlone_supported = ficlone_supported_in(staging_dir);
-    if let Err(e) = std::fs::write(&source_tmp, b"kache-link-probe") {
+    report.ficlone_supported = reflink_probe(staging_dir, staging_dir);
+    report.reflink_build_to_staging = reflink_probe(build_dir, staging_dir);
+    report.reflink_staging_to_build = reflink_probe(staging_dir, build_dir);
+
+    let mut source_tmp = match tempfile::Builder::new()
+        .prefix(".kache-link-probe-")
+        .tempfile_in(build_dir)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            report.error_kind = Some(io_kind_name(&e));
+            report.error_message = Some(format!(
+                "creating probe file in {}: {e}",
+                build_dir.display()
+            ));
+            return report;
+        }
+    };
+    if let Err(e) = source_tmp.write_all(b"kache-link-probe") {
         report.error_kind = Some(io_kind_name(&e));
-        report.error_message = Some(format!("creating probe file {}: {e}", source_tmp.display()));
-        let _ = std::fs::remove_file(&source_tmp);
+        report.error_message = Some(format!(
+            "writing probe file in {}: {e}",
+            build_dir.display()
+        ));
         return report;
     }
-    report.source_owner = file_owner(&source_tmp);
+    report.source_owner = file_owner(source_tmp.path());
     report.dest_owner = file_owner(staging_dir);
 
-    match std::fs::hard_link(&source_tmp, &dest_tmp) {
-        Ok(()) => {
-            report.hardlink_supported = true;
-            let _ = std::fs::remove_file(&dest_tmp);
-            let _ = std::fs::remove_file(&source_tmp);
+    let dest_tmp = match tempfile::Builder::new()
+        .prefix(".kache-link-probe-")
+        .tempdir_in(staging_dir)
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            report.error_kind = Some(io_kind_name(&e));
+            report.error_message = Some(format!(
+                "creating probe directory in {}: {e}",
+                staging_dir.display()
+            ));
+            return report;
         }
+    };
+    let dest_path = dest_tmp.path().join("link");
+    match std::fs::hard_link(source_tmp.path(), &dest_path) {
+        Ok(()) => report.hardlink_supported = true,
         Err(e) => {
             report.error_kind = Some(io_kind_name(&e));
             report.error_message = Some(format!(
                 "linking {} into {}: {e}",
-                source_tmp.display(),
-                dest_tmp.display()
+                source_tmp.path().display(),
+                dest_path.display()
             ));
-            let _ = std::fs::remove_file(&dest_tmp);
-            let _ = std::fs::remove_file(&source_tmp);
         }
     }
     report
@@ -130,19 +160,23 @@ fn io_kind_name(e: &std::io::Error) -> String {
 
 /// Human detail for an EXDEV probe failure, with both mount roots.
 pub(crate) fn format_exdev_detail(source_mount: Option<&str>, dest_mount: Option<&str>) -> String {
+    format!(
+        "{}. Put the cache and build tree on the SAME mount for zero-copy sharing",
+        format_exdev_cause(source_mount, dest_mount)
+    )
+}
+
+fn format_exdev_cause(source_mount: Option<&str>, dest_mount: Option<&str>) -> String {
     match (source_mount, dest_mount) {
         (Some(src), Some(dst)) if exdev_mounts_differ(src, dst) => format!(
             "EXDEV: build tree is on mount `{src}` but `<store>/staging` is on mount `{dst}` — \
-             Linux refuses link() across mounts, including two bind mounts of one filesystem. \
-             Put the cache and build tree on the SAME mount for zero-copy sharing"
+             Linux refuses link() across mounts, including two bind mounts of one filesystem"
         ),
         (Some(mnt), Some(_)) => format!(
             "EXDEV even though both paths resolve under mount `{mnt}` — the two directories \
-             are on different vfsmounts (e.g. separate bind mounts of one filesystem). Put the \
-             cache and build tree on the SAME mount for zero-copy sharing"
+             are on different vfsmounts (e.g. separate bind mounts of one filesystem)"
         ),
-        _ => "EXDEV: hardlink across mounts refused — put the cache and build tree on the SAME \
-              mount for zero-copy sharing (mount roots could not be determined)"
+        _ => "EXDEV: hardlink across mounts refused (mount roots could not be determined)"
             .to_string(),
     }
 }
@@ -171,17 +205,33 @@ pub(crate) fn format_eperm_detail(
 /// Human summary for the doctor check, dispatching on the probe outcome.
 /// Pure so each arm is unit-testable without bind mounts.
 pub(crate) fn format_probe_detail(report: &LinkLayoutReport) -> String {
+    let cross_reflinks = format!(
+        "cross-path reflinks: build → staging {}, staging → build {}",
+        reflink_probe_status(report.reflink_build_to_staging),
+        reflink_probe_status(report.reflink_staging_to_build),
+    );
     if report.hardlink_supported {
         let ficlone = match report.ficlone_supported {
-            Some(true) => "reflinks supported",
-            Some(false) => "reflinks unsupported on this filesystem",
-            None => "reflink support unknown",
+            Some(true) => "staging reflinks supported",
+            Some(false) => "staging reflink probe failed",
+            None => "staging reflink support unknown",
         };
-        return format!("hardlink build-tree → <store>/staging works ({ficlone})");
+        return format!(
+            "hardlink build-tree → <store>/staging works ({ficlone}; {cross_reflinks})"
+        );
     }
     let kind = report.error_kind.as_deref().unwrap_or("Unknown");
-    if kind == "CrossesDevices" {
-        format_exdev_detail(report.source_mount.as_deref(), report.dest_mount.as_deref())
+    if report.sharing_supported() {
+        return format!(
+            "{cross_reflinks}; hardlink fallback unavailable (build-tree → <store>/staging failed: {kind})"
+        );
+    }
+    let hardlink_detail = if kind == "CrossesDevices" {
+        if report.cross_reflinks_determined() {
+            format_exdev_detail(report.source_mount.as_deref(), report.dest_mount.as_deref())
+        } else {
+            format_exdev_cause(report.source_mount.as_deref(), report.dest_mount.as_deref())
+        }
     } else if kind == "PermissionDenied" {
         format_eperm_detail(
             report.protected_hardlinks.as_deref(),
@@ -194,6 +244,15 @@ pub(crate) fn format_probe_detail(report: &LinkLayoutReport) -> String {
             "hardlink build-tree → <store>/staging failed ({kind}): {}",
             report.error_message.as_deref().unwrap_or("unknown error")
         )
+    };
+    format!("{hardlink_detail}; {cross_reflinks}")
+}
+
+fn reflink_probe_status(result: Option<bool>) -> &'static str {
+    match result {
+        Some(true) => "works",
+        Some(false) => "failed",
+        None => "unknown",
     }
 }
 
@@ -328,35 +387,18 @@ fn file_owner(path: &Path) -> Option<u32> {
     }
 }
 
-/// Whether FICLONE works in `dir`: create two temps and try to clone one into
-/// the other. `Some(true)` on CoW filesystems, `Some(false)` where the ioctl
-/// fails (ext4), `None` when the probe could not run.
-fn ficlone_supported_in(dir: &Path) -> Option<bool> {
-    if !dir.exists() {
-        return None;
-    }
-    let pid = std::process::id();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let src = dir.join(format!(".kache-ficlone-probe-{pid}-{nonce}.src"));
-    let dst = dir.join(format!(".kache-ficlone-probe-{pid}-{nonce}.dst"));
-    let probed = (|| -> Option<bool> {
-        std::fs::write(&src, b"kache-ficlone-probe").ok()?;
-        match crate::link::try_reflink(&src, &dst) {
-            Ok(()) => Some(true),
-            Err(_) => {
-                // `try_reflink` on Linux removes a failed dst; on other
-                // platforms ensure no litter remains.
-                let _ = std::fs::remove_file(&dst);
-                Some(false)
-            }
-        }
-    })();
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&dst);
-    probed
+fn reflink_supported_between(source_dir: &Path, dest_dir: &Path) -> Option<bool> {
+    let mut source = tempfile::Builder::new()
+        .prefix(".kache-reflink-probe-")
+        .tempfile_in(source_dir)
+        .ok()?;
+    // ReFS block cloning requires at least one complete filesystem cluster.
+    source.write_all(&vec![b'k'; 128 * 1024]).ok()?;
+    let dest = tempfile::Builder::new()
+        .prefix(".kache-reflink-probe-")
+        .tempdir_in(dest_dir)
+        .ok()?;
+    Some(crate::link::try_reflink(source.path(), &dest.path().join("clone")).is_ok())
 }
 
 #[cfg(test)]
@@ -375,6 +417,8 @@ mod tests {
             source_owner: None,
             dest_owner: None,
             ficlone_supported: None,
+            reflink_build_to_staging: None,
+            reflink_staging_to_build: None,
         }
     }
 
@@ -601,7 +645,7 @@ mod tests {
         report.hardlink_supported = true;
         report.ficlone_supported = Some(false);
         let got = format_probe_detail(&report);
-        assert!(got.contains("reflinks unsupported"), "{got}");
+        assert!(got.contains("staging reflink probe failed"), "{got}");
         assert!(!got.contains("ext4"), "{got}");
     }
 
@@ -646,6 +690,148 @@ mod tests {
     }
 
     #[test]
+    fn sharing_requires_a_hardlink_or_both_cross_path_reflinks() {
+        for hardlink in [false, true] {
+            for forward in [None, Some(false), Some(true)] {
+                for reverse in [None, Some(false), Some(true)] {
+                    let mut report = empty_report();
+                    report.hardlink_supported = hardlink;
+                    report.ficlone_supported = Some(true);
+                    report.reflink_build_to_staging = forward;
+                    report.reflink_staging_to_build = reverse;
+                    assert_eq!(
+                        report.sharing_supported(),
+                        hardlink || (forward == Some(true) && reverse == Some(true)),
+                        "hardlink={hardlink}, forward={forward:?}, reverse={reverse:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reflinks_in_both_directions_report_unavailable_hardlink_fallback() {
+        let mut report = empty_report();
+        report.error_kind = Some("CrossesDevices".to_string());
+        report.ficlone_supported = Some(false);
+        report.reflink_build_to_staging = Some(true);
+        report.reflink_staging_to_build = Some(true);
+        let detail = format_probe_detail(&report);
+        assert!(report.sharing_supported());
+        assert!(detail.contains("build → staging works"), "{detail}");
+        assert!(detail.contains("staging → build works"), "{detail}");
+        assert!(detail.contains("hardlink fallback unavailable"), "{detail}");
+        assert!(detail.contains("CrossesDevices"), "{detail}");
+        assert!(!detail.contains("SAME mount"), "{detail}");
+    }
+
+    #[test]
+    fn unknown_cross_path_reflinks_do_not_claim_success_or_suggest_moving_mounts() {
+        for (forward, reverse) in [
+            (None, None),
+            (None, Some(true)),
+            (Some(true), None),
+            (Some(false), None),
+            (None, Some(false)),
+        ] {
+            let mut report = empty_report();
+            report.error_kind = Some("CrossesDevices".to_string());
+            report.ficlone_supported = Some(true);
+            report.reflink_build_to_staging = forward;
+            report.reflink_staging_to_build = reverse;
+            let detail = format_probe_detail(&report);
+            assert!(!report.sharing_supported(), "{detail}");
+            assert!(detail.contains("EXDEV"), "{detail}");
+            assert!(detail.contains("unknown"), "{detail}");
+            assert!(!detail.contains("SAME mount"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn failed_cross_path_reflink_keeps_exdev_diagnostic() {
+        for (forward, reverse) in [(true, false), (false, true), (false, false)] {
+            let mut report = empty_report();
+            report.error_kind = Some("CrossesDevices".to_string());
+            report.reflink_build_to_staging = Some(forward);
+            report.reflink_staging_to_build = Some(reverse);
+            let detail = format_probe_detail(&report);
+            assert!(!report.sharing_supported());
+            assert!(detail.contains("EXDEV"), "{detail}");
+            assert!(detail.contains("SAME mount"), "{detail}");
+            assert!(detail.contains("failed"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn probe_records_each_cross_path_direction_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        let staging = dir.path().join("staging");
+        std::fs::create_dir(&build).unwrap();
+        for (forward, reverse) in [(Some(true), Some(false)), (None, Some(true))] {
+            let mut calls = Vec::new();
+            let report = probe_link_layout_with(&build, &staging, |src, dst| {
+                calls.push((src.to_path_buf(), dst.to_path_buf()));
+                if src == staging && dst == staging {
+                    Some(true)
+                } else if src == build && dst == staging {
+                    forward
+                } else if src == staging && dst == build {
+                    reverse
+                } else {
+                    panic!("unexpected reflink paths: {src:?} → {dst:?}");
+                }
+            });
+            assert_eq!(report.ficlone_supported, Some(true));
+            assert_eq!(report.reflink_build_to_staging, forward);
+            assert_eq!(report.reflink_staging_to_build, reverse);
+            assert_eq!(calls.len(), 3);
+        }
+    }
+
+    #[test]
+    fn probes_preserve_existing_files_and_clean_up_on_success_and_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = dir.path().join("build");
+        let staging = dir.path().join("staging");
+        std::fs::create_dir(&build).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        let existing_build = build.join(".kache-link-probe-existing");
+        let existing_staging = staging.join(".kache-reflink-probe-existing");
+        std::fs::write(&existing_build, b"build sentinel").unwrap();
+        std::fs::write(&existing_staging, b"staging sentinel").unwrap();
+
+        let report = probe_link_layout(&build, &staging);
+        assert!(report.hardlink_supported, "{report:?}");
+        assert!(report.reflink_build_to_staging.is_some(), "{report:?}");
+        assert!(report.reflink_staging_to_build.is_some(), "{report:?}");
+        assert_eq!(
+            report.reflink_build_to_staging,
+            reflink_supported_between(&build, &staging)
+        );
+        assert_eq!(
+            report.reflink_staging_to_build,
+            reflink_supported_between(&staging, &build)
+        );
+        assert_eq!(
+            reflink_supported_between(&build, &dir.path().join("missing")),
+            None
+        );
+        let failed = probe_link_layout(&existing_build, &staging);
+        assert!(!failed.hardlink_supported);
+        assert_eq!(failed.reflink_build_to_staging, None);
+        assert_eq!(failed.reflink_staging_to_build, None);
+
+        assert_eq!(std::fs::read(&existing_build).unwrap(), b"build sentinel");
+        assert_eq!(
+            std::fs::read(&existing_staging).unwrap(),
+            b"staging sentinel"
+        );
+        assert_eq!(std::fs::read_dir(&build).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 1);
+    }
+
+    #[test]
     fn probe_succeeds_on_same_device_tempdir() {
         let dir = tempfile::tempdir().unwrap();
         let build_dir = dir.path().join("build");
@@ -681,7 +867,7 @@ mod tests {
         // CoW or not, an existing dir yields a determinate answer; a missing
         // dir yields None. Do not assert true/false: that varies by
         // filesystem (APFS vs ext4) and would flake.
-        assert!(ficlone_supported_in(dir.path()).is_some());
+        assert!(reflink_supported_between(dir.path(), dir.path()).is_some());
     }
 
     #[test]
@@ -713,6 +899,6 @@ mod tests {
     fn ficlone_probe_returns_none_for_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such-dir");
-        assert!(ficlone_supported_in(&missing).is_none());
+        assert!(reflink_supported_between(&missing, &missing).is_none());
     }
 }

@@ -5050,6 +5050,37 @@ mod external_target_inventory {
     }
 
     #[test]
+    fn external_target_inventory_releases_lock_with_duplicate_open() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let guard = f.inventory_db();
+        let inherited = guard.lock_file.file.try_clone().unwrap();
+        drop(guard);
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::external_target_inventory::external_target_inventory_cooperating_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_INVENTORY_DIR", &f.store.config.cache_dir)
+            .env("KACHE_TEST_INVENTORY_WRITE", "0")
+            .env("KACHE_TEST_INVENTORY_BUSY", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(inherited);
+    }
+
+    #[test]
     fn external_target_inventory_creation_waits_for_cooperating_sidecar() {
         let _serial = serialize_inventory_tests();
         let f = Fixture::new();

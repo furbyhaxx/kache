@@ -1830,7 +1830,7 @@ struct InventoryConnection {
     // Drop the SQLite connection and DB fd before releasing either lock.
     db: Connection,
     database_file: fs::File,
-    lock_file: fs::File,
+    lock_file: StoreLock,
     directory: fs::File,
     cache_dir: PathBuf,
     directory_path: PathBuf,
@@ -1843,7 +1843,7 @@ impl InventoryConnection {
             &self.cache_dir,
             &self.directory_path,
             &self.directory,
-            &self.lock_file,
+            &self.lock_file.file,
             &self.database_file,
         )
     }
@@ -2009,8 +2009,10 @@ fn open_external_target_inventory_with(
     validate_inventory_directory(cache_dir, &directory_path, &directory)?;
 
     let lock_path = directory_path.join(EXTERNAL_TARGET_INVENTORY_LOCK);
-    let lock = open_inventory_file(&lock_path, write)?;
-    while !StoreLock::try_lock_file(&lock)? {
+    let lock = StoreLock {
+        file: open_inventory_file(&lock_path, write)?,
+    };
+    while !StoreLock::try_lock_file(&lock.file)? {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             anyhow::bail!("inventory lock is busy: {}", lock_path.display());
@@ -2018,7 +2020,7 @@ fn open_external_target_inventory_with(
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
     validate_inventory_directory(cache_dir, &directory_path, &directory)?;
-    validate_inventory_file(&lock_path, &lock)?;
+    validate_inventory_file(&lock_path, &lock.file)?;
     let path = directory_path.join(EXTERNAL_TARGET_INVENTORY_DB);
     if !write {
         match fs::symlink_metadata(&path) {
@@ -2043,7 +2045,7 @@ fn open_external_target_inventory_with(
     }
 
     before_sqlite_open();
-    validate_inventory_paths(cache_dir, &directory_path, &directory, &lock, &file)?;
+    validate_inventory_paths(cache_dir, &directory_path, &directory, &lock.file, &file)?;
     let flags = if write {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {

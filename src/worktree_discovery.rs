@@ -26,6 +26,8 @@ const LISTING_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LISTING_BYTES: u64 = 4 << 20;
 /// External workspace candidates one discovery pass may inspect.
 const MAX_EXTERNAL_RECORDS: usize = 8;
+/// Source roots one discovery pass may probe for external inventory.
+const MAX_EXTERNAL_SOURCES: usize = 16;
 /// Repositories one discovery pass may ask Git about.
 const DISCOVERY_STEPS: usize = 2_000;
 /// How long one discovery pass may spend.
@@ -731,89 +733,158 @@ fn discover_within_using(
     }
 
     if !external_roots.is_empty() {
-        // Keep source spellings so the snapshot can recheck their resolution.
-        let sources = tracked
-            .iter()
-            .map(|root| &root.workspace_root)
-            .chain(surveys.iter().flat_map(|survey| {
-                survey
-                    .trees
-                    .iter()
-                    .filter(|tree| readable(tree, homes))
-                    .map(|tree| &tree.path)
-                    .chain(survey.targets.iter().map(|(_, workspace)| workspace))
-                    .chain(&survey.links)
-                    .chain(&survey.sources)
-            }))
-            .filter(|path| !shielded(path, homes))
-            .take_while(|_| Instant::now() < deadline)
-            .filter_map(|path| {
-                let resolved = path.canonicalize().ok()?;
-                (!shielded(&resolved, homes) && resolved.is_dir() && is_local(&resolved))
-                    .then(|| path.clone())
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut covered_links = HashSet::new();
-        let links: Vec<_> = surveys.iter().flat_map(|survey| &survey.links).collect();
-        let turn = external_candidate_turn(turn, links.len());
-        let mut candidates = 0;
-        'external: for workspace in rotated(links, turn) {
-            if Instant::now() >= deadline || candidates == MAX_EXTERNAL_RECORDS {
-                break;
-            }
-            if !covered_links.insert(workspace) || shielded(workspace, homes) {
-                continue;
-            }
-            let Ok(resolved) = workspace.canonicalize() else {
-                continue;
-            };
-            if shielded(&resolved, homes)
-                || !is_local(&resolved)
-                || !is_local(&workspace.join("target"))
-            {
-                continue;
-            }
-            candidates += 1;
-            for root in external_roots {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                if !is_local(root) {
-                    continue;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                let Some(snapshot) =
-                    kache_store::filesystem::snapshot_workspace_target(workspace, root, &sources)
-                else {
-                    continue;
-                };
-                if !is_local(&snapshot.backing_path) {
-                    continue;
-                }
-                if let Err(error) =
-                    observe_external(store, workspace, root, &sources, &snapshot, deadline)
-                {
-                    tracing::warn!(
-                        "cannot inventory external target {} under {}: {error:#}",
-                        workspace.display(),
-                        root.display()
-                    );
-                    break 'external;
-                }
-                break;
-            }
-        }
+        let sources =
+            tracked
+                .iter()
+                .map(|root| &root.workspace_root)
+                .chain(surveys.iter().flat_map(|survey| {
+                    survey
+                        .trees
+                        .iter()
+                        .filter(|tree| readable(tree, homes))
+                        .map(|tree| &tree.path)
+                        .chain(survey.targets.iter().map(|(_, workspace)| workspace))
+                        .chain(&survey.links)
+                        .chain(&survey.sources)
+                }));
+        let links = surveys.iter().flat_map(|survey| &survey.links);
+        inventory_external(
+            store,
+            external_roots,
+            deadline,
+            homes,
+            turn,
+            sources,
+            links,
+            is_local,
+            observe_external,
+            Instant::now,
+        );
     }
     Ok(found)
+}
+
+fn inventory_external<'a>(
+    store: &Store,
+    external_roots: &[PathBuf],
+    deadline: Instant,
+    homes: &[PathBuf],
+    turn: u64,
+    source_paths: impl IntoIterator<Item = &'a PathBuf>,
+    links: impl IntoIterator<Item = &'a PathBuf>,
+    is_local: impl Fn(&Path) -> bool,
+    observe_external: impl Fn(
+        &Store,
+        &Path,
+        &Path,
+        &[PathBuf],
+        &kache_store::filesystem::TargetSymlinkSnapshot,
+        Instant,
+    ) -> Result<bool>,
+    now: impl Fn() -> Instant,
+) {
+    // Leave half the remaining time for candidates, subject to slow filesystem calls.
+    let start = now();
+    let source_deadline = start + deadline.saturating_duration_since(start) / 2;
+    let source_paths = source_paths
+        .into_iter()
+        .take_while(|_| now() < source_deadline)
+        .filter(|path| !shielded(path, homes))
+        .collect::<BTreeSet<_>>();
+    let source_turn = external_candidate_turn(turn, source_paths.len());
+    let mut sources = Vec::new();
+    for path in rotated(source_paths.into_iter().collect(), source_turn)
+        .into_iter()
+        .take(MAX_EXTERNAL_SOURCES)
+    {
+        if now() >= source_deadline {
+            break;
+        }
+        let Ok(resolved) = path.canonicalize() else {
+            continue;
+        };
+        if now() >= source_deadline {
+            break;
+        }
+        if shielded(&resolved, homes) || !resolved.is_dir() {
+            continue;
+        }
+        if now() >= source_deadline {
+            break;
+        }
+        if is_local(&resolved) {
+            // Preserve the spelling for snapshot revalidation.
+            sources.push(path.clone());
+        }
+    }
+    let links: Vec<_> = links
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let turn = external_candidate_turn(turn, links.len());
+    let mut candidates = 0;
+    'external: for workspace in rotated(links, turn) {
+        if now() >= deadline || candidates == MAX_EXTERNAL_RECORDS {
+            break;
+        }
+        if shielded(workspace, homes) {
+            continue;
+        }
+        let Ok(resolved) = workspace.canonicalize() else {
+            continue;
+        };
+        if shielded(&resolved, homes)
+            || !is_local(&resolved)
+            || !is_local(&workspace.join("target"))
+        {
+            continue;
+        }
+        candidates += 1;
+        for root in external_roots {
+            if now() >= deadline {
+                break;
+            }
+            if !is_local(root) {
+                continue;
+            }
+            if now() >= deadline {
+                break;
+            }
+            let Some(snapshot) =
+                kache_store::filesystem::snapshot_workspace_target(workspace, root, &sources)
+            else {
+                continue;
+            };
+            if !is_local(&snapshot.backing_path) {
+                continue;
+            }
+            if let Err(error) =
+                observe_external(store, workspace, root, &sources, &snapshot, deadline)
+            {
+                tracing::warn!(
+                    "cannot inventory external target {} under {}: {error:#}",
+                    workspace.display(),
+                    root.display()
+                );
+                break 'external;
+            }
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn private_inventory_cache(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     fn git(repo: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -1133,6 +1204,160 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn external_candidates_reach_all_repositories_as_outer_order_changes() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let storage = base.join("storage");
+        let backing = storage.join("backing");
+        std::fs::create_dir_all(&backing).unwrap();
+        let surveys: Vec<_> = (0..9)
+            .map(|index| {
+                let repo = base.join(format!("repo-{index}"));
+                let workspace = repo.join("app");
+                std::fs::create_dir_all(&workspace).unwrap();
+                std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+                symlink(&backing, workspace.join("target")).unwrap();
+                Survey {
+                    trees: vec![Worktree {
+                        path: repo,
+                        bare: false,
+                        locked: false,
+                        prunable: false,
+                    }],
+                    targets: Vec::new(),
+                    links: vec![workspace],
+                    sources: Vec::new(),
+                }
+            })
+            .collect();
+        let store = Store::open(&crate::test_support::test_config(base.join("cache"))).unwrap();
+        let mut original_passes = Vec::new();
+        for duplicate in [false, true] {
+            let visited = RefCell::new(HashSet::new());
+            let mut passes = Vec::new();
+            for turn in 0..2 {
+                let ordered = rotated(surveys.iter().collect(), turn);
+                let mut links: Vec<_> = ordered.iter().flat_map(|survey| &survey.links).collect();
+                if duplicate {
+                    links.extend([links[0]; 2]);
+                }
+                let pass = RefCell::new(Vec::new());
+                inventory_external(
+                    &store,
+                    std::slice::from_ref(&storage),
+                    Instant::now() + DISCOVERY_TIME,
+                    &[],
+                    turn,
+                    links.iter().copied(),
+                    links.iter().copied(),
+                    |_| true,
+                    |_, workspace, _, _, _, _| {
+                        pass.borrow_mut().push(workspace.to_path_buf());
+                        visited.borrow_mut().insert(workspace.to_path_buf());
+                        Ok(true)
+                    },
+                    Instant::now,
+                );
+                let pass = pass.into_inner();
+                assert_eq!(pass.len(), 8);
+                passes.push(pass);
+            }
+            assert_eq!(visited.borrow().len(), 9);
+            if duplicate {
+                assert_eq!(passes, original_passes);
+            } else {
+                original_passes = passes;
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn external_source_preparation_is_deduplicated_bounded_and_rotated() {
+        use std::cell::{Cell, RefCell};
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let storage = base.join("storage");
+        let backing = storage.join("backing");
+        let workspace = base.join("workspace");
+        let source_parent = base.join("sources");
+        std::fs::create_dir_all(&backing).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        symlink(&backing, workspace.join("target")).unwrap();
+        let sources: Vec<_> = (0..40)
+            .map(|index| {
+                let source = source_parent.join(format!("source-{index:02}"));
+                std::fs::create_dir_all(&source).unwrap();
+                source
+            })
+            .collect();
+        let nonlocal = sources[3].clone();
+        let missing = source_parent.join("missing");
+        let mut paths = vec![sources[0].clone(); 40];
+        paths.extend(sources.iter().cloned());
+        paths.push(missing.clone());
+        let store = Store::open(&crate::test_support::test_config(base.join("cache"))).unwrap();
+        for timed in [true, false] {
+            let mut first_probes = Vec::new();
+            let mut all_probes = HashSet::new();
+            for turn in 0..41 {
+                let start = Instant::now();
+                let clock = Cell::new(start);
+                let probes = RefCell::new(Vec::new());
+                let observed = RefCell::new(Vec::new());
+                inventory_external(
+                    &store,
+                    std::slice::from_ref(&storage),
+                    start + Duration::from_secs(12),
+                    &[],
+                    turn,
+                    &paths,
+                    std::slice::from_ref(&workspace),
+                    |path| {
+                        if path.starts_with(&source_parent) {
+                            probes.borrow_mut().push(path.to_path_buf());
+                            if timed {
+                                clock.set(clock.get() + Duration::from_secs(1));
+                            }
+                        }
+                        path != nonlocal
+                    },
+                    |_, candidate, _, prepared, _, _| {
+                        observed.borrow_mut().push(candidate.to_path_buf());
+                        assert!(prepared.len() <= 16);
+                        assert!(!prepared.contains(&nonlocal));
+                        assert!(!prepared.contains(&missing));
+                        Ok(true)
+                    },
+                    || clock.get(),
+                );
+                let probes = probes.into_inner();
+                assert_eq!(observed.into_inner(), vec![workspace.clone()]);
+                assert!(!probes.is_empty());
+                assert!(
+                    probes.len() <= 16,
+                    "too many source probes: {}",
+                    probes.len()
+                );
+                assert_eq!(probes.iter().collect::<HashSet<_>>().len(), probes.len());
+                all_probes.extend(probes.iter().cloned());
+                if turn == 0 {
+                    first_probes = probes;
+                } else if turn == 1 {
+                    assert_ne!(first_probes[0], probes[0]);
+                }
+            }
+            assert_eq!(all_probes, sources.iter().cloned().collect());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn listing_a_worktree_never_runs_its_filesystem_monitor() {
@@ -1386,6 +1611,7 @@ mod tests {
 
         let mut config = crate::test_support::test_config(dir.path().join("cache"));
         config.external_target_roots = vec![dir.path().join("absent-root"), storage.clone()];
+        private_inventory_cache(&config.cache_dir);
         let store = Store::open(&config).unwrap();
         store
             .remember_target_root(&built, &repo.join("rust"))
@@ -1410,6 +1636,7 @@ mod tests {
         assert!(store.external_target_observations().unwrap().is_empty());
 
         let isolated_config = crate::test_support::test_config(dir.path().join("cache-locality"));
+        private_inventory_cache(&isolated_config.cache_dir);
         let isolated = Store::open(&isolated_config).unwrap();
         isolated
             .remember_target_root(&built, &repo.join("rust"))
@@ -1548,6 +1775,7 @@ mod tests {
         let mut first_observations = HashSet::new();
         for turn in [0, 1] {
             let config = crate::test_support::test_config(base.join(format!("cache-{turn}")));
+            private_inventory_cache(&config.cache_dir);
             let store = Store::open(&config).unwrap();
             store
                 .remember_target_root(&built, &repo.join("built"))
@@ -1684,6 +1912,7 @@ mod tests {
         }
         let mut config = crate::test_support::test_config(dir.path().join("cache"));
         config.external_target_roots = vec![storage];
+        private_inventory_cache(&config.cache_dir);
         let store = Store::open(&config).unwrap();
         store
             .remember_target_root(&built, &repo.join("built"))

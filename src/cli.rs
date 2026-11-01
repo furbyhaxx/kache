@@ -8121,7 +8121,7 @@ pub fn doctor(
             println!("  Restarting daemon left over from before the upgrade...");
             let outcome = crate::daemon::restart_daemon_for_stale_client(cfg);
             if let Some(note) = stale_restart_note(&outcome) {
-                println!("  {note}");
+                println!("  {}", terminal_safe_text(&note));
             }
             // Re-read either way: the outgoing daemon is gone now, so the report
             // should describe what is there, not what answered a moment ago.
@@ -8318,7 +8318,7 @@ pub fn doctor(
     println!(
         "{}\n",
         term::paint(
-            format!("  v{version} · {rustc_version}"),
+            format!("  v{version} · {}", terminal_safe_text(&rustc_version)),
             term::Style::Muted
         )
     );

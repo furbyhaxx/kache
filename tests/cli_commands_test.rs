@@ -808,6 +808,44 @@ fn doctor_human_groups_each_check_once() {
 
 #[cfg(unix)]
 #[test]
+fn doctor_escapes_rustc_version_for_humans_but_not_json() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let e = env();
+    let bin = e.home.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let rustc = bin.join("rustc");
+    std::fs::write(
+        &rustc,
+        b"#!/bin/sh\nprintf 'rustc 1.99.0 \\033]0;probe\\007\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+
+    let human = e.cmd().env("PATH", &path).arg("doctor").output().unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(!human.contains("\x1b]0;probe\x07"), "{human:?}");
+    assert!(human.contains("\\u{1b}]0;probe\\u{7}"), "{human:?}");
+
+    let json = e
+        .cmd()
+        .env("PATH", &path)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(json["rustc"].as_str().unwrap().contains("\x1b]0;probe\x07"));
+}
+
+#[cfg(unix)]
+#[test]
 fn doctor_escapes_link_layout_paths_for_humans_but_not_json() {
     let e = env();
     let name = "build-\x1b[2J-\x1b]0;spoof\x07\nname";

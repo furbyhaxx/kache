@@ -332,6 +332,593 @@ fn watch_with(
     }
 }
 
+/// An idle observation that keeps the kache reservation and existing Cargo
+/// profile locks held until the caller finishes its final deletion checks.
+#[allow(dead_code)]
+pub(crate) struct VerifiedIdle {
+    since: SystemTime,
+    _reservation: crate::target_use::Reservation,
+    _profiles: Vec<Held>,
+}
+
+#[allow(dead_code)]
+impl VerifiedIdle {
+    pub(crate) fn since(&self) -> SystemTime {
+        self.since
+    }
+}
+
+/// Revalidate a boot-bound watch, returning a lock guard only after `window`.
+/// The caller must keep a nonempty epoch stable throughout a watch, replacing it
+/// on daemon restart or any mount-change event, and synchronize changes with
+/// the returned guard. A probe cannot detect unobserved temporary remounts, so
+/// mount read-observation options must remain unchanged throughout the window.
+/// The guard cannot prevent Cargo from creating a new, previously absent profile.
+#[allow(dead_code)]
+pub(crate) fn verified_watch(
+    cache_dir: &Path,
+    target_dir: &Path,
+    now: SystemTime,
+    not_before: SystemTime,
+    window: Duration,
+    epoch: &[u8],
+) -> Option<VerifiedIdle> {
+    #[cfg(target_os = "linux")]
+    {
+        let ops = VerifiedOps {
+            epoch,
+            boot: &linux_boot_id,
+            uptime: &linux_boot_time,
+            probe: &verified_shows_reads,
+            arm: &verified_arm_file,
+            read: &verified_read_file,
+            write: &write_verified,
+        };
+        verified_watch_with(cache_dir, target_dir, now, not_before, window, &ops)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cache_dir, target_dir, now, not_before, window, epoch);
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VerifiedRecord {
+    version: u8,
+    boot: String,
+    epoch: String,
+    since: SystemTime,
+    uptime: Duration,
+    target: VerifiedIdentity,
+    mount: String,
+    fingerprints: String,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct VerifiedIdentity {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+    canonical: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+struct VerifiedOps<'a> {
+    epoch: &'a [u8],
+    boot: &'a dyn Fn() -> Option<String>,
+    uptime: &'a dyn Fn() -> Option<Duration>,
+    probe: &'a dyn Fn(&Path) -> std::io::Result<bool>,
+    arm: &'a dyn Fn(&Path, &std::fs::Metadata) -> std::io::Result<filetime::FileTime>,
+    read: &'a dyn Fn(&Path, &std::fs::Metadata) -> std::io::Result<()>,
+    write: &'a dyn Fn(&Path, &VerifiedRecord) -> anyhow::Result<()>,
+}
+
+#[cfg(target_os = "linux")]
+fn verified_open_file(path: &Path, expected: &std::fs::Metadata) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.dev() != expected.dev() || metadata.ino() != expected.ino() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn verified_arm_file(
+    path: &Path,
+    expected: &std::fs::Metadata,
+) -> std::io::Result<filetime::FileTime> {
+    let file = verified_open_file(path, expected)?;
+    let modified = filetime::FileTime::from_last_modification_time(&file.metadata()?);
+    let seconds = modified
+        .unix_seconds()
+        .checked_sub(1)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    let armed = filetime::FileTime::from_unix_time(seconds, 0);
+    filetime::set_file_handle_times(&file, Some(armed), None)?;
+    Ok(armed)
+}
+
+#[cfg(target_os = "linux")]
+fn verified_read_file(path: &Path, expected: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::io::Read;
+    let read = verified_open_file(path, expected)?.read(&mut [0])?;
+    if (read == 0) != (expected.len() == 0) {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verified_shows_reads(target: &Path) -> std::io::Result<bool> {
+    if !matches!(
+        crate::cache_fs::classify(&crate::cache_fs::probe(target)),
+        crate::cache_fs::CacheFsVerdict::Local
+    ) {
+        return Ok(false);
+    }
+    let probe = tempfile::Builder::new().prefix(PROBE).tempfile_in(target)?;
+    let result = (|| {
+        std::fs::write(probe.path(), b"probe")?;
+        let armed = arm_file(probe.path())?;
+        std::fs::read(probe.path())?;
+        let accessed = filetime::FileTime::from_last_access_time(&std::fs::metadata(probe.path())?);
+        Ok(moved_past(accessed, armed))
+    })();
+    probe.close()?;
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_id() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = text.trim();
+    let valid = id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    valid.then(|| id.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_time() -> Option<Duration> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: time is a valid writable timespec and CLOCK_BOOTTIME is supported on Linux.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(time.tv_sec).ok()?;
+    let nanos = u32::try_from(time.tv_nsec).ok()?;
+    (nanos < 1_000_000_000).then(|| Duration::new(seconds, nanos))
+}
+
+#[cfg(target_os = "linux")]
+fn verified_record(cache_dir: &Path, target_dir: &Path) -> PathBuf {
+    let digest = blake3::hash(target_dir.as_os_str().as_encoded_bytes()).to_hex();
+    cache_dir.join("unit-watch-verified").join(&digest[..16])
+}
+
+#[cfg(target_os = "linux")]
+fn write_verified(path: &Path, record: &VerifiedRecord) -> anyhow::Result<()> {
+    crate::atomic::atomic_replace(path, &serde_json::to_vec(record)?)?;
+    crate::atomic::fsync_dir(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("missing record directory"))?,
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verified_identity(target: &Path) -> Option<VerifiedIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(target).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+    Some(VerifiedIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+        canonical: std::fs::canonicalize(target).ok()?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn verified_mount_id(path: &Path) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).ok()?;
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).ok()?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn verified_mount(target: &Path) -> Option<(u64, String)> {
+    let id = verified_mount_id(target)?;
+    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let line = info.lines().find(|line| {
+        line.split_whitespace()
+            .next()
+            .and_then(|part| part.parse::<u64>().ok())
+            == Some(id)
+    })?;
+    Some((id, blake3::hash(line.as_bytes()).to_hex().to_string()))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+struct VerifiedProfile {
+    path: PathBuf,
+    fingerprints: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+fn verified_entries(dir: &Path) -> Option<Vec<PathBuf>> {
+    let mut result = std::fs::read_dir(dir)
+        .ok()?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .ok()?;
+    result.sort();
+    Some(result)
+}
+
+#[cfg(target_os = "linux")]
+fn verified_directory(path: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verified_profile(profile: &Path) -> Option<Option<VerifiedProfile>> {
+    let shared = profile.join(".fingerprint");
+    let build = profile.join("build");
+    let deps = profile.join("deps");
+    let examples = profile.join("examples");
+    let has_shared = verified_directory(&shared)?;
+    let has_build = verified_directory(&build)?;
+    let has_deps = verified_directory(&deps)?;
+    let has_examples = verified_directory(&examples)?;
+    let has_incremental = verified_directory(&profile.join("incremental"))?;
+    let mut has_lock = false;
+    for name in LOCKS {
+        match std::fs::symlink_metadata(profile.join(name)) {
+            Ok(metadata) if metadata.is_file() => has_lock = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+    }
+    if !has_shared && !has_build && !has_deps && !has_examples && !has_incremental && !has_lock {
+        return Some(None);
+    }
+    let mut fingerprints = Vec::new();
+    let mut shared_units = Vec::new();
+    if has_shared {
+        for dir in verified_entries(&shared)? {
+            if !std::fs::symlink_metadata(&dir).ok()?.is_dir() {
+                return None;
+            }
+            let name = dir.file_name()?.to_str()?;
+            let package = crate::cargo_layout::legacy_unit_package(name)?;
+            shared_units.push((
+                package.replace('-', "_"),
+                name[package.len() + 1..].to_owned(),
+            ));
+            fingerprints.push(dir);
+        }
+    }
+    if has_build {
+        for package in verified_entries(&build)? {
+            if !std::fs::symlink_metadata(&package).ok()?.is_dir() {
+                return None;
+            }
+            let name = package.file_name()?.to_str()?;
+            if crate::cargo_layout::legacy_unit_package(name).is_some() {
+                if !fingerprints.contains(&shared.join(name)) {
+                    return None;
+                }
+                continue;
+            }
+            let units = verified_entries(&package)?;
+            if units.is_empty() {
+                return None;
+            }
+            for unit in units {
+                let metadata = std::fs::symlink_metadata(&unit).ok()?;
+                if !metadata.is_dir()
+                    || !crate::cargo_layout::is_unit_hash(unit.file_name()?.to_str()?)
+                {
+                    return None;
+                }
+                let fingerprint = unit.join("fingerprint");
+                if !verified_directory(&fingerprint)? {
+                    return None;
+                }
+                fingerprints.push(fingerprint);
+            }
+        }
+    }
+    for (present, dir) in [(has_deps, deps), (has_examples, examples)] {
+        if present {
+            for output in verified_entries(&dir)? {
+                let metadata = std::fs::symlink_metadata(&output).ok()?;
+                if metadata.is_symlink() {
+                    return None;
+                }
+                let name = output.file_name()?.to_str()?;
+                if let Some((stem, hash)) = hashed_name(name)
+                    && !shared_units.iter().any(|(package, known)| {
+                        (package == stem || package == stem.strip_prefix("lib").unwrap_or(stem))
+                            && known == hash
+                    })
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    if fingerprints.is_empty() {
+        return None;
+    }
+    fingerprints.sort();
+    Some(Some(VerifiedProfile {
+        path: profile.to_path_buf(),
+        fingerprints,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn verified_profiles(target: &Path) -> Option<Vec<VerifiedProfile>> {
+    let mut profiles = Vec::new();
+    for dir in verified_entries(target)? {
+        let metadata = std::fs::symlink_metadata(&dir).ok()?;
+        if metadata.is_symlink() {
+            return None;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        if let Some(profile) = verified_profile(&dir)? {
+            profiles.push(profile);
+            continue;
+        }
+        for nested in verified_entries(&dir)? {
+            let metadata = std::fs::symlink_metadata(&nested).ok()?;
+            if metadata.is_symlink() {
+                return None;
+            }
+            if metadata.is_dir()
+                && let Some(profile) = verified_profile(&nested)?
+            {
+                profiles.push(profile);
+            }
+        }
+    }
+    (!profiles.is_empty()).then_some(profiles)
+}
+
+#[cfg(target_os = "linux")]
+fn verified_fingerprints(
+    profiles: &[VerifiedProfile],
+    mount: u64,
+) -> Option<(Vec<PathBuf>, String)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut files = Vec::new();
+    let mut digest = blake3::Hasher::new();
+    for profile in profiles {
+        for fingerprint in &profile.fingerprints {
+            for path in std::iter::once(fingerprint.clone()).chain(verified_entries(fingerprint)?) {
+                let metadata = std::fs::symlink_metadata(&path).ok()?;
+                if verified_mount_id(&path)? != mount {
+                    return None;
+                }
+                if path == *fingerprint {
+                    if !metadata.is_dir() {
+                        return None;
+                    }
+                } else if metadata.is_file() {
+                    files.push(path.clone());
+                } else {
+                    return None;
+                }
+                let name = path.as_os_str().as_encoded_bytes();
+                digest.update(&(name.len() as u64).to_le_bytes());
+                digest.update(name);
+                for field in [
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime() as u64,
+                    metadata.ctime_nsec() as u64,
+                    metadata.mtime() as u64,
+                    metadata.mtime_nsec() as u64,
+                ] {
+                    digest.update(&field.to_le_bytes());
+                }
+                if metadata.is_file() {
+                    digest.update(&metadata.atime().to_le_bytes());
+                    digest.update(&metadata.atime_nsec().to_le_bytes());
+                }
+            }
+            if !files
+                .iter()
+                .any(|file| file.parent() == Some(fingerprint.as_path()))
+            {
+                return None;
+            }
+        }
+    }
+    Some((files, digest.finalize().to_hex().to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn verified_watch_with(
+    cache_dir: &Path,
+    target_dir: &Path,
+    now: SystemTime,
+    not_before: SystemTime,
+    window: Duration,
+    ops: &VerifiedOps<'_>,
+) -> Option<VerifiedIdle> {
+    let reservation = crate::target_use::try_exclusive(cache_dir).ok()??;
+    let path = verified_record(cache_dir, target_dir);
+    let parent = path.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let old = std::fs::read(&path);
+    if !forget_armed(&path) || crate::atomic::fsync_dir(parent).is_err() {
+        return None;
+    }
+    let old = match old {
+        Ok(bytes) => serde_json::from_slice::<VerifiedRecord>(&bytes).ok(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    if window.is_zero() || ops.epoch.is_empty() {
+        return None;
+    }
+    let epoch = blake3::hash(ops.epoch).to_hex().to_string();
+    let boot = (ops.boot)()?;
+    let uptime = (ops.uptime)()?;
+    if now < not_before {
+        return None;
+    }
+    let target_before = verified_identity(target_dir)?;
+    let (mount_id, mount) = verified_mount(target_dir)?;
+    let profiles = verified_profiles(target_dir)?;
+    let mut locks = Vec::new();
+    for profile in &profiles {
+        locks.push(hold(&profile.path)?);
+    }
+    if verified_profiles(target_dir)? != profiles {
+        return None;
+    }
+    let (files, fingerprints) = verified_fingerprints(&profiles, mount_id)?;
+    if !(ops.probe)(target_dir).ok()? {
+        return None;
+    }
+    let after_probe = verified_identity(target_dir)?;
+    if target_before.dev != after_probe.dev
+        || target_before.ino != after_probe.ino
+        || target_before.canonical != after_probe.canonical
+        || verified_mount(target_dir)? != (mount_id, mount.clone())
+        || (ops.boot)().as_ref() != Some(&boot)
+    {
+        return None;
+    }
+    let valid = old.filter(|record| {
+        record.version == 2
+            && record.boot == boot
+            && record.epoch == epoch
+            && record.target == target_before
+            && record.mount == mount
+            && record.fingerprints == fingerprints
+            && record.since >= not_before
+            && record.since <= now
+            && record.uptime <= uptime
+    });
+    let (since, started, final_fingerprints) = if let Some(record) = valid {
+        (record.since, record.uptime, fingerprints)
+    } else {
+        let legacy = armed_record(cache_dir, target_dir);
+        if !forget_armed(&legacy) {
+            return None;
+        }
+        if let Some(parent) = legacy.parent().filter(|parent| parent.exists()) {
+            crate::atomic::fsync_dir(parent).ok()?;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let mut armed_files = Vec::new();
+        for file in &files {
+            let metadata = std::fs::symlink_metadata(file).ok()?;
+            if metadata.modified().ok()? > now.checked_sub(Duration::from_secs(2))? {
+                return None;
+            }
+            if metadata.nlink() != 1 {
+                return None;
+            }
+            let armed = (ops.arm)(file, &metadata).ok()?;
+            (ops.read)(file, &metadata).ok()?;
+            let read = std::fs::symlink_metadata(file).ok()?;
+            if !read.is_file()
+                || metadata.dev() != read.dev()
+                || metadata.ino() != read.ino()
+                || metadata.modified().ok()? != read.modified().ok()?
+                || !moved_past(filetime::FileTime::from_last_access_time(&read), armed)
+            {
+                return None;
+            }
+            let armed = (ops.arm)(file, &metadata).ok()?;
+            let after = std::fs::symlink_metadata(file).ok()?;
+            if metadata.dev() != after.dev()
+                || metadata.ino() != after.ino()
+                || metadata.modified().ok()? != after.modified().ok()?
+                || filetime::FileTime::from_last_access_time(&after) != armed
+                || filetime::FileTime::from_last_modification_time(&after) <= armed
+            {
+                return None;
+            }
+            armed_files.push((file, armed));
+        }
+        if verified_profiles(target_dir)? != profiles {
+            return None;
+        }
+        let (after_files, fingerprint_hash) = verified_fingerprints(&profiles, mount_id)?;
+        if after_files != files {
+            return None;
+        }
+        for (file, armed) in armed_files {
+            let metadata = std::fs::symlink_metadata(file).ok()?;
+            if filetime::FileTime::from_last_access_time(&metadata) != armed {
+                return None;
+            }
+        }
+        (now, (ops.uptime)()?, fingerprint_hash)
+    };
+    if (ops.boot)().as_ref() != Some(&boot)
+        || verified_identity(target_dir)? != after_probe
+        || verified_mount(target_dir)? != (mount_id, mount.clone())
+        || verified_profiles(target_dir)? != profiles
+        || verified_fingerprints(&profiles, mount_id)?.1 != final_fingerprints
+    {
+        return None;
+    }
+    let elapsed = (ops.uptime)()?.checked_sub(started)?;
+    let record = VerifiedRecord {
+        version: 2,
+        boot,
+        epoch,
+        since,
+        uptime: started,
+        target: after_probe,
+        mount,
+        fingerprints: final_fingerprints,
+    };
+    (ops.write)(&path, &record).ok()?;
+    (elapsed >= window).then_some(VerifiedIdle {
+        since,
+        _reservation: reservation,
+        _profiles: locks,
+    })
+}
+
 /// Where the moment `target_dir` was armed is recorded.
 fn armed_record(cache_dir: &Path, target_dir: &Path) -> PathBuf {
     let digest = blake3::hash(target_dir.as_os_str().as_encoded_bytes()).to_hex();
@@ -719,6 +1306,496 @@ mod tests {
             write(&unit.join("fingerprint/lib-serde"), "fp");
             write(&unit.join("out/libserde.rlib"), "rlib-bytes");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn simulated_read(path: &Path) -> std::io::Result<()> {
+        filetime::set_file_atime(path, filetime::FileTime::now())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn verified_test_watch(
+        cache: &Path,
+        target: &Path,
+        now: SystemTime,
+        boot: Option<&str>,
+    ) -> Option<VerifiedIdle> {
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            boot: &|| boot.map(str::to_owned),
+            uptime: &|| now.duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| Ok(true),
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        verified_watch_with(
+            cache,
+            target,
+            now,
+            SystemTime::UNIX_EPOCH,
+            Duration::from_secs(12 * 3600),
+            &ops,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_restarts_the_twelve_hour_window_after_a_read() {
+        for layout in [shared_profile as fn(&Path), per_unit_profile] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = dir.path().join("target");
+            layout(&target.join("debug"));
+            let unrelated = target.join(format!("debug/deps/libother-{OLD}.rlib"));
+            if unrelated.exists() {
+                std::fs::remove_file(unrelated).unwrap();
+            }
+            set_times(&target, ago(40));
+            let start = SystemTime::now() - Duration::from_secs(20 * 3600);
+            let hours = |n: u64| Duration::from_secs(n * 3600);
+            assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+            assert!(
+                verified_test_watch(&cache, &target, start + hours(11), Some("boot-a")).is_none()
+            );
+            let guard =
+                verified_test_watch(&cache, &target, start + hours(12), Some("boot-a")).unwrap();
+            assert_eq!(guard.since(), start);
+            assert!(crate::target_use::try_exclusive(&cache).unwrap().is_none());
+            assert!(hold(&target.join("debug")).is_none());
+            drop(guard);
+            let fingerprint = unit_named(&target.join("debug"), NEW).fingerprint();
+            simulated_read(entries(&fingerprint).first().unwrap()).unwrap();
+            assert!(
+                verified_test_watch(&cache, &target, start + hours(13), Some("boot-a")).is_none()
+            );
+            assert!(
+                verified_test_watch(&cache, &target, start + hours(24), Some("boot-a")).is_none()
+            );
+            let guard =
+                verified_test_watch(&cache, &target, start + hours(25), Some("boot-a")).unwrap();
+            assert_eq!(guard.since(), start + hours(13));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_uses_boot_time_for_the_idle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let now = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        let uptime = std::cell::Cell::new(Duration::from_secs(DAY));
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            boot: &|| Some("boot-a".to_owned()),
+            uptime: &|| Some(uptime.get()),
+            probe: &|_| Ok(true),
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(&cache, &target, now, SystemTime::UNIX_EPOCH, window, &ops)
+                .is_none()
+        );
+        uptime.set(uptime.get() + Duration::from_secs(3600));
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                now + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+        uptime.set(Duration::from_secs(DAY) + window);
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                now + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_some()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_restarts_after_an_observation_epoch_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        let watch = |epoch: &[u8], now: SystemTime| {
+            let ops = VerifiedOps {
+                epoch,
+                boot: &|| Some("boot-a".to_owned()),
+                uptime: &|| now.duration_since(SystemTime::UNIX_EPOCH).ok(),
+                probe: &|_| Ok(true),
+                arm: &verified_arm_file,
+                read: &|file, _| simulated_read(file),
+                write: &write_verified,
+            };
+            verified_watch_with(&cache, &target, now, SystemTime::UNIX_EPOCH, window, &ops)
+        };
+        assert!(watch(b"epoch-a", start).is_none());
+        assert!(watch(b"epoch-a", start + window).is_some());
+        assert!(watch(b"epoch-b", start + window).is_none());
+        assert!(watch(b"epoch-b", start + 2 * window).is_some());
+        assert!(watch(b"", start + 2 * window).is_none());
+        assert!(watch(b"epoch-b", start + 2 * window).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_never_carries_evidence_across_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let later = start + Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        assert!(verified_test_watch(&cache, &target, later, Some("boot-b")).is_none());
+        let after_window = later + Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, after_window, Some("boot-b")).is_some());
+        assert!(verified_test_watch(&cache, &target, after_window, None).is_none());
+        assert!(verified_test_watch(&cache, &target, after_window, Some("boot-b")).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_fails_closed_on_probe_arming_and_record_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        let now = start + window;
+        let boot = || Some("boot-a".to_owned());
+        let uptime = || now.duration_since(SystemTime::UNIX_EPOCH).ok();
+        let good_probe = |_: &Path| Ok(true);
+        let bad_probe = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let no_reads = |_: &Path| Ok(false);
+        let bad_arm = |_: &Path, _: &std::fs::Metadata| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        let bad_read = |_: &Path, _: &std::fs::Metadata| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        let hidden_read = |_: &Path, _: &std::fs::Metadata| Ok(());
+        let fake_read = |file: &Path, _: &std::fs::Metadata| simulated_read(file);
+        let bad_write = |_: &Path, _: &VerifiedRecord| Err(anyhow::anyhow!("write failed"));
+        for (probe, arm, read, write) in [
+            (
+                &bad_probe as &dyn Fn(&Path) -> _,
+                &verified_arm_file as &dyn Fn(&Path, &std::fs::Metadata) -> _,
+                &fake_read as &dyn Fn(&Path, &std::fs::Metadata) -> _,
+                &write_verified as &dyn Fn(&Path, &VerifiedRecord) -> _,
+            ),
+            (&no_reads, &verified_arm_file, &fake_read, &write_verified),
+            (&good_probe, &bad_arm, &fake_read, &write_verified),
+            (&good_probe, &verified_arm_file, &bad_read, &write_verified),
+            (
+                &good_probe,
+                &verified_arm_file,
+                &hidden_read,
+                &write_verified,
+            ),
+            (&good_probe, &verified_arm_file, &fake_read, &bad_write),
+        ] {
+            assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+            read_now(&unit_named(&target.join("debug"), NEW));
+            let ops = VerifiedOps {
+                epoch: b"epoch-a",
+                boot: &boot,
+                uptime: &uptime,
+                probe,
+                arm,
+                read,
+                write,
+            };
+            assert!(
+                verified_watch_with(&cache, &target, now, SystemTime::UNIX_EPOCH, window, &ops)
+                    .is_none()
+            );
+            assert!(verified_test_watch(&cache, &target, now, Some("boot-a")).is_none());
+            std::fs::remove_file(verified_record(&cache, &target)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_detects_rearming_set_changes_and_target_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let mut now = SystemTime::now() - Duration::from_secs(4 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, now, Some("boot-a")).is_none());
+        for change in 0..3 {
+            now += window;
+            match change {
+                0 => {
+                    read_now(&unit_named(&target.join("debug"), NEW));
+                    sweep(&target, None, || true);
+                }
+                1 => {
+                    let fingerprint = unit_named(&target.join("debug"), NEW).fingerprint();
+                    write(&fingerprint.join("new"), "new");
+                    set_times(&fingerprint, ago(40));
+                }
+                _ => {
+                    std::fs::rename(&target, dir.path().join("old-target")).unwrap();
+                    per_unit_profile(&target.join("debug"));
+                    set_times(&target, ago(40));
+                }
+            }
+            assert!(
+                verified_test_watch(&cache, &target, now, Some("boot-a")).is_none(),
+                "change {change}"
+            );
+            assert_eq!(
+                verified_test_watch(&cache, &target, now + window, Some("boot-a"))
+                    .unwrap()
+                    .since(),
+                now
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_rejects_missing_empty_and_unknown_fingerprints() {
+        for per_unit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let target = dir.path().join("target");
+            let profile = target.join("debug");
+            if per_unit {
+                per_unit_profile(&profile);
+            } else {
+                shared_profile(&profile);
+                std::fs::remove_file(profile.join(format!("deps/libother-{OLD}.rlib"))).unwrap();
+            }
+            set_times(&target, ago(40));
+            let now = SystemTime::now() - Duration::from_secs(2 * DAY);
+            let window = Duration::from_secs(12 * 3600);
+            assert!(verified_test_watch(&cache, &target, now, Some("boot-a")).is_none());
+            let fingerprint = unit_named(&profile, NEW).fingerprint();
+            let file = fingerprint.join("lib-serde");
+            std::fs::remove_file(&file).unwrap();
+            assert!(verified_test_watch(&cache, &target, now + window, Some("boot-a")).is_none());
+            assert!(!verified_record(&cache, &target).exists());
+            std::fs::remove_dir(&fingerprint).unwrap();
+            assert!(verified_test_watch(&cache, &target, now + window, Some("boot-a")).is_none());
+            assert!(!verified_record(&cache, &target).exists());
+            write(&file, "restored");
+            set_times(&fingerprint, ago(40));
+            assert!(verified_test_watch(&cache, &target, now + window, Some("boot-a")).is_none());
+            let unknown = profile.join("build/unknown");
+            write(&unknown.join("not-a-hash/fingerprint/file"), "unknown");
+            assert!(
+                verified_test_watch(&cache, &target, now + 2 * window, Some("boot-a")).is_none()
+            );
+            std::fs::remove_dir_all(unknown).unwrap();
+            assert!(
+                verified_test_watch(&cache, &target, now + 2 * window, Some("boot-a")).is_none()
+            );
+            assert!(
+                verified_test_watch(&cache, &target, now + 3 * window, Some("boot-a")).is_some()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_arming_forgets_legacy_evidence_and_busy_locks_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(40));
+        let now = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        write_armed(&armed_record(&cache, &target), now - window).unwrap();
+        read_now(&unit_named(&profile, NEW));
+        assert!(verified_test_watch(&cache, &target, now, Some("boot-a")).is_none());
+        assert_eq!(unused_since(&cache, &target), None);
+        let locks = hold(&profile).unwrap();
+        assert!(verified_test_watch(&cache, &target, now + window, Some("boot-a")).is_none());
+        drop(locks);
+        assert!(verified_test_watch(&cache, &target, now + window, Some("boot-a")).is_none());
+        assert!(verified_test_watch(&cache, &target, now + 2 * window, Some("boot-a")).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_observes_actual_fingerprint_reads_when_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(40));
+        if !verified_shows_reads(&target).unwrap() {
+            return;
+        }
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(
+            verified_watch(
+                &cache,
+                &target,
+                SystemTime::now(),
+                SystemTime::UNIX_EPOCH,
+                window,
+                b"epoch-a"
+            )
+            .is_none()
+        );
+        assert!(verified_record(&cache, &target).exists());
+        let uptime = std::cell::Cell::new(Duration::from_secs(DAY));
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            boot: &linux_boot_id,
+            uptime: &|| Some(uptime.get()),
+            probe: &verified_shows_reads,
+            arm: &verified_arm_file,
+            read: &verified_read_file,
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(&cache, &target, start, SystemTime::UNIX_EPOCH, window, &ops)
+                .is_none()
+        );
+        uptime.set(uptime.get() + window);
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_some()
+        );
+        let fingerprint = unit_named(&profile, NEW).fingerprint();
+        std::fs::read(fingerprint.join("lib-serde")).unwrap();
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_never_arms_when_the_real_probe_cannot_observe_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        if !verified_shows_reads(&target).unwrap() {
+            assert!(
+                verified_watch(
+                    &cache,
+                    &target,
+                    SystemTime::now(),
+                    SystemTime::UNIX_EPOCH,
+                    Duration::from_secs(12 * 3600),
+                    b"epoch-a"
+                )
+                .is_none()
+            );
+            assert!(!verified_record(&cache, &target).exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_file_operations_refuse_replaced_files_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fingerprint");
+        let outside = dir.path().join("outside");
+        write(&file, "original");
+        write(&outside, "outside");
+        let expected = std::fs::metadata(&file).unwrap();
+        std::fs::rename(&file, dir.path().join("original")).unwrap();
+        write(&file, "replacement");
+        assert!(verified_arm_file(&file, &expected).is_err());
+        assert!(verified_read_file(&file, &expected).is_err());
+        std::fs::remove_file(&file).unwrap();
+        symlink(&outside, &file).unwrap();
+        assert!(verified_arm_file(&file, &expected).is_err());
+        assert!(verified_read_file(&file, &expected).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_rechecks_fingerprints_after_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(40));
+        let now = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, now, Some("boot-a")).is_none());
+        let file = unit_named(&profile, NEW).fingerprint().join("lib-serde");
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            boot: &|| Some("boot-a".to_owned()),
+            uptime: &|| (now + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| {
+                simulated_read(&file)?;
+                Ok(true)
+            },
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                now + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+        assert!(!verified_record(&cache, &target).exists());
+        assert!(verified_test_watch(&cache, &target, now + window, Some("boot-a")).is_none());
     }
 
     #[test]

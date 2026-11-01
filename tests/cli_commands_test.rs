@@ -2001,6 +2001,59 @@ fn targets_lists_a_tracked_target_and_flags_its_deleted_worktree() {
 }
 
 #[test]
+fn targets_reports_unavailable_external_inventory_without_hiding_regular_targets() {
+    let e = env();
+    assert!(
+        e.cmd()
+            .args(["targets", "--json"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let workspace = e.home.join("workspace");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    let identity = kache_fs::directory_identity(&target).unwrap();
+    let db = rusqlite::Connection::open(e.cache.join("index.db")).unwrap();
+    db.execute(
+        "INSERT INTO target_roots (path, workspace_root, device, inode) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            target.to_str().unwrap(),
+            workspace.to_str().unwrap(),
+            identity.dev.to_string(),
+            identity.ino.to_string()
+        ],
+    )
+    .unwrap();
+    drop(db);
+    std::fs::create_dir(e.cache.join("external-target-inventory.db")).unwrap();
+
+    let human = e.cmd().arg("targets").output().unwrap();
+    assert!(human.status.success());
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human_stdout.contains("workspace") && human_stdout.contains("target"));
+    assert!(
+        String::from_utf8_lossy(&human.stderr).contains("external target inventory unavailable")
+    );
+
+    let json = e.cmd().args(["targets", "--json"]).output().unwrap();
+    assert!(json.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(json["targets"].as_array().unwrap().len(), 1);
+    assert!(
+        json.get("external_targets")
+            .is_some_and(|value| value.is_null())
+    );
+    assert!(json["external_inventory_error"].as_str().is_some());
+}
+
+#[test]
 fn clean_dry_run_reports_no_targets_in_empty_dir() {
     let e = env();
     // Nothing tracked, and nothing under an empty directory.

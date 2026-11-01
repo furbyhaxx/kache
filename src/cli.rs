@@ -6755,12 +6755,17 @@ fn render_external_target_rows(rows: &[ExternalTargetRow]) -> Vec<String> {
 /// Show tracked target directories and historical external-link observations.
 pub fn targets(config: &Config, json: bool) -> Result<()> {
     let rows = target_rows(config, kache_store::markers::now_epoch_secs() as i64)?;
-    let external = external_target_rows(config)?;
+    let (external, external_error) = match external_target_rows(config) {
+        Ok(rows) => (Some(rows), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     if json {
         #[derive(serde::Serialize)]
         struct Body {
             targets: Vec<TargetRow>,
-            external_targets: Vec<ExternalTargetRow>,
+            external_targets: Option<Vec<ExternalTargetRow>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            external_inventory_error: Option<String>,
             apparent_bytes: u64,
             reclaimable_bytes: u64,
         }
@@ -6772,6 +6777,7 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
                 reclaimable_bytes: rows.iter().map(|row| row.reclaimable_bytes).sum(),
                 targets: rows,
                 external_targets: external,
+                external_inventory_error: external_error,
             },
             next,
         );
@@ -6783,8 +6789,16 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
             println!("{line}");
         }
     }
-    for line in render_external_target_rows(&external) {
-        println!("{line}");
+    if let Some(external) = external {
+        for line in render_external_target_rows(&external) {
+            println!("{line}");
+        }
+    }
+    if let Some(error) = external_error {
+        eprintln!(
+            "warning: external target inventory unavailable: {}",
+            terminal_safe_text(&error)
+        );
     }
     Ok(())
 }

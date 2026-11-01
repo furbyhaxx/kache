@@ -8009,6 +8009,59 @@ fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn external_target_observations_are_visible_but_not_cleanable() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let storage = dir.path().join("storage");
+    let backing = storage.join("build");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&backing).unwrap();
+    symlink(&backing, workspace.join("target")).unwrap();
+    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let snapshot =
+        kache_store::filesystem::snapshot_workspace_target(&workspace, &storage, &[]).unwrap();
+    assert!(
+        store
+            .observe_external_target(&workspace, &storage, &[], &snapshot)
+            .unwrap()
+    );
+
+    let rows = external_target_rows(&config).unwrap();
+    assert_eq!(rows.len(), 1);
+    let rendered = render_external_target_rows(&rows).join("\n");
+    assert!(
+        rendered.contains(&workspace.join("target").display().to_string()),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&backing.display().to_string()),
+        "{rendered}"
+    );
+    assert!(rendered.contains("not eligible for cleanup"), "{rendered}");
+    let json = serde_json::to_value(&rows).unwrap();
+    assert_eq!(json[0]["status"], "inventory_only");
+    let unsafe_row = ExternalTargetRow {
+        path: "/workspace/\u{1b}[2J".into(),
+        backing_path: "/storage/\nname".into(),
+        last_observed: 0,
+        status: "inventory_only",
+    };
+    let safe = render_external_target_rows(&[unsafe_row]).join("\n");
+    assert!(!safe.contains('\u{1b}'), "{safe:?}");
+    assert!(safe.contains("\\u{1b}"), "{safe:?}");
+    assert!(safe.contains("\\nname"), "{safe:?}");
+    assert!(
+        target_rows(&config, kache_store::markers::now_epoch_secs() as i64)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)], true).join("\n");

@@ -6699,14 +6699,68 @@ fn targets_next_actions(rows: &[TargetRow], auto_orphans: bool) -> Vec<crate::ma
     }]
 }
 
-/// Show every tracked target directory with what deleting it would free
-/// and whether its worktree still exists.
+#[derive(serde::Serialize)]
+struct ExternalTargetRow {
+    path: String,
+    backing_path: String,
+    last_observed: i64,
+    status: &'static str,
+}
+
+fn external_target_rows(config: &Config) -> Result<Vec<ExternalTargetRow>> {
+    Ok(Store::open(config)?
+        .external_target_observations()?
+        .into_iter()
+        .map(|observation| ExternalTargetRow {
+            path: observation
+                .workspace_path
+                .join("target")
+                .display()
+                .to_string(),
+            backing_path: observation.snapshot.backing_path.display().to_string(),
+            last_observed: observation.last_observed,
+            status: "inventory_only",
+        })
+        .collect())
+}
+
+fn terminal_safe_path(path: &str) -> String {
+    let mut output = String::with_capacity(path.len());
+    for ch in path.chars() {
+        if ch.is_control() {
+            output.extend(ch.escape_default());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn render_external_target_rows(rows: &[ExternalTargetRow]) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines =
+        vec!["External target observations (historical; not eligible for cleanup):".to_string()];
+    lines.extend(rows.iter().map(|row| {
+        format!(
+            "  {} -> {}",
+            terminal_safe_path(&row.path),
+            terminal_safe_path(&row.backing_path)
+        )
+    }));
+    lines
+}
+
+/// Show tracked target directories and historical external-link observations.
 pub fn targets(config: &Config, json: bool) -> Result<()> {
     let rows = target_rows(config, kache_store::markers::now_epoch_secs() as i64)?;
+    let external = external_target_rows(config)?;
     if json {
         #[derive(serde::Serialize)]
         struct Body {
             targets: Vec<TargetRow>,
+            external_targets: Vec<ExternalTargetRow>,
             apparent_bytes: u64,
             reclaimable_bytes: u64,
         }
@@ -6717,15 +6771,19 @@ pub fn targets(config: &Config, json: bool) -> Result<()> {
                 apparent_bytes: rows.iter().map(|row| row.apparent_bytes).sum(),
                 reclaimable_bytes: rows.iter().map(|row| row.reclaimable_bytes).sum(),
                 targets: rows,
+                external_targets: external,
             },
             next,
         );
     }
     if rows.is_empty() {
         println!("No tracked target directories. Builds through kache register theirs.");
-        return Ok(());
+    } else {
+        for line in render_targets(&rows, config.auto_clean_orphaned_targets) {
+            println!("{line}");
+        }
     }
-    for line in render_targets(&rows, config.auto_clean_orphaned_targets) {
+    for line in render_external_target_rows(&external) {
         println!("{line}");
     }
     Ok(())

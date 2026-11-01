@@ -5,8 +5,9 @@
 //! leads to its repository, and from there to the other repositories in the
 //! same folders. Git lists each repository's worktrees and, in each, the
 //! directories it ignores; every ignored `target/` Cargo has tagged is
-//! recorded. Discovery does not claim a build used the target or make it
-//! eligible for automatic cleanup.
+//! recorded. Ignored target symlinks under configured external roots are
+//! recorded separately as untrusted observations. Discovery does not claim
+//! completeness of source roots or aliases, or authorize cleanup.
 
 use crate::config::Config;
 use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
@@ -75,7 +76,9 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
     if let Err(error) = crate::atomic::atomic_replace(&record, now.to_string().as_bytes()) {
         tracing::warn!("cannot record the target discovery time: {error:#}");
     }
-    match Store::open(config).and_then(|store| discover(&store, DISCOVERY_TIME, now)) {
+    match Store::open(config)
+        .and_then(|store| discover(&store, &config.external_target_roots, DISCOVERY_TIME, now))
+    {
         Ok(0) => {}
         Ok(found) => tracing::info!("found {found} target directories in Git worktrees"),
         Err(error) => tracing::warn!("target discovery failed: {error:#}"),
@@ -278,10 +281,15 @@ fn ignored_target_dirs(worktree: &Path, listing: &[u8]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Cargo's targets in `worktree`, as (target, workspace): each ignored
-/// `target/` Cargo tagged. The workspace is the directory holding it, even
-/// once its Cargo.toml is gone: a removed crate leaves its output behind.
-fn targets_in_worktree(worktree: &Path, deadline: Instant) -> Vec<(PathBuf, PathBuf)> {
+#[derive(Default)]
+struct TargetListing {
+    targets: Vec<(PathBuf, PathBuf)>,
+    links: Vec<PathBuf>,
+    sources: Vec<PathBuf>,
+}
+
+/// Cargo-tagged ignored directories and, when requested, ignored target links.
+fn targets_in_worktree(worktree: &Path, deadline: Instant, include_links: bool) -> TargetListing {
     let Some(listing) = git_output(
         worktree,
         &[
@@ -296,13 +304,41 @@ fn targets_in_worktree(worktree: &Path, deadline: Instant) -> Vec<(PathBuf, Path
         deadline,
         MAX_LISTING_BYTES,
     ) else {
-        return Vec::new();
+        return TargetListing::default();
     };
-    ignored_target_dirs(worktree, &listing)
+    let dirs = ignored_target_dirs(worktree, &listing);
+    let sources = if include_links {
+        dirs.iter()
+            .filter_map(|target| target.parent().map(Path::to_path_buf))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let targets = dirs
         .into_iter()
         .filter(|target| crate::machine::cargo_tagged(target))
         .filter_map(|target| Some((target.clone(), target.parent()?.to_path_buf())))
-        .collect()
+        .collect();
+    let links = if include_links {
+        listing
+            .split(|byte| *byte == 0)
+            .filter(|entry| *entry == b"target" || entry.ends_with(b"/target"))
+            .take_while(|_| Instant::now() < deadline)
+            .filter_map(|entry| std::str::from_utf8(entry).ok())
+            .map(|entry| worktree.join(entry))
+            .filter(|target| {
+                std::fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink())
+            })
+            .filter_map(|target| target.parent().map(Path::to_path_buf))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    TargetListing {
+        targets,
+        links,
+        sources,
+    }
 }
 
 /// Places discovery never reads: the filesystem root, the home folder
@@ -397,6 +433,8 @@ fn homes_from(home: Option<std::ffi::OsString>) -> Vec<PathBuf> {
 struct Survey {
     trees: Vec<Worktree>,
     targets: Vec<(PathBuf, PathBuf)>,
+    links: Vec<PathBuf>,
+    sources: Vec<PathBuf>,
 }
 
 /// Run `task` on each item, several at once (each mostly waits on Git and
@@ -441,6 +479,7 @@ fn survey_all(
     deadline: Instant,
     homes: &[PathBuf],
     turn: u64,
+    include_links: bool,
 ) -> Vec<Survey> {
     // Asked in a turned order, so a pass that runs out of time leaves out
     // different repositories each time; answers go back in the given order.
@@ -461,7 +500,7 @@ fn survey_all(
         .collect();
     let worktrees = rotated(worktrees, turn);
     let listed = in_parallel(&worktrees, |worktree| {
-        targets_in_worktree(worktree, deadline)
+        targets_in_worktree(worktree, deadline, include_links)
     });
     let mut listed: HashMap<_, _> = worktrees.into_iter().zip(listed).collect();
     // In the order given, so builds' workspaces are recorded first.
@@ -481,10 +520,20 @@ fn survey_all(
                 .flat_map(|suffix| workspaces_at(suffix, &available))
                 .map(|workspace| (workspace.join("target"), workspace))
                 .collect();
+            let mut links = Vec::new();
+            let mut sources = Vec::new();
             for tree in &trees {
-                targets.extend(listed.remove(&tree.path).unwrap_or_default());
+                let listing = listed.remove(&tree.path).unwrap_or_default();
+                targets.extend(listing.targets);
+                links.extend(listing.links);
+                sources.extend(listing.sources);
             }
-            Some(Survey { trees, targets })
+            Some(Survey {
+                trees,
+                targets,
+                links,
+                sources,
+            })
         })
         .collect()
 }
@@ -539,17 +588,29 @@ fn by_repository(
 /// worktrees sit in: the same workspace in each sibling worktree, and every
 /// tagged `target/` Git ignores in each worktree, within `time`. A custom
 /// target path outside its worktree is known only when a wrapper recorded it.
-pub(crate) fn discover(store: &Store, time: Duration, now: u64) -> Result<usize> {
+pub(crate) fn discover(
+    store: &Store,
+    external_roots: &[PathBuf],
+    time: Duration,
+    now: u64,
+) -> Result<usize> {
     let homes = homes_from(std::env::var_os(if cfg!(windows) {
         "USERPROFILE"
     } else {
         "HOME"
     }));
-    discover_within(store, Instant::now() + time, &homes, turn_at(now))
+    discover_within(
+        store,
+        external_roots,
+        Instant::now() + time,
+        &homes,
+        turn_at(now),
+    )
 }
 
 fn discover_within(
     store: &Store,
+    external_roots: &[PathBuf],
     deadline: Instant,
     homes: &[PathBuf],
     turn: u64,
@@ -567,7 +628,13 @@ fn discover_within(
         .map(|seed| (seed.clone(), Some(seed)));
     let mut seen = HashSet::new();
     let known_repositories = by_repository(seeds, &mut seen, DISCOVERY_STEPS, deadline, homes);
-    let mut surveys = survey_all(&known_repositories, deadline, homes, turn);
+    let mut surveys = survey_all(
+        &known_repositories,
+        deadline,
+        homes,
+        turn,
+        !external_roots.is_empty(),
+    );
     // One hop out: the repositories beside the worktrees of the known ones.
     // The listing is lazy, so a spent limit stops it at once.
     let neighbourhood: BTreeSet<_> = surveys
@@ -582,7 +649,67 @@ fn discover_within(
         .map(|repository| (repository, None));
     let limit = DISCOVERY_STEPS.saturating_sub(seen.len());
     let neighbours = by_repository(beside, &mut seen, limit, deadline, homes);
-    surveys.extend(survey_all(&neighbours, deadline, homes, turn));
+    surveys.extend(survey_all(
+        &neighbours,
+        deadline,
+        homes,
+        turn,
+        !external_roots.is_empty(),
+    ));
+
+    if !external_roots.is_empty() {
+        // Keep source spellings so the snapshot can recheck their resolution.
+        let sources = tracked
+            .iter()
+            .map(|root| &root.workspace_root)
+            .chain(surveys.iter().flat_map(|survey| {
+                survey
+                    .trees
+                    .iter()
+                    .filter(|tree| readable(tree, homes))
+                    .map(|tree| &tree.path)
+                    .chain(survey.targets.iter().map(|(_, workspace)| workspace))
+                    .chain(&survey.links)
+                    .chain(&survey.sources)
+            }))
+            .filter(|path| !shielded(path, homes))
+            .take_while(|_| Instant::now() < deadline)
+            .filter_map(|path| {
+                let resolved = path.canonicalize().ok()?;
+                (!shielded(&resolved, homes) && resolved.is_dir()).then(|| path.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut covered_links = HashSet::new();
+        let links = surveys.iter().flat_map(|survey| &survey.links).collect();
+        for workspace in rotated(links, turn) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if !covered_links.insert(workspace) || shielded(workspace, homes) {
+                continue;
+            }
+            if !workspace
+                .canonicalize()
+                .is_ok_and(|path| !shielded(&path, homes))
+            {
+                continue;
+            }
+            for root in external_roots {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                let Some(snapshot) =
+                    kache_store::filesystem::snapshot_workspace_target(workspace, root, &sources)
+                else {
+                    continue;
+                };
+                store.observe_external_target(workspace, root, &sources, &snapshot)?;
+                break;
+            }
+        }
+    }
 
     let mut covered = HashSet::new();
     let mut found = 0;
@@ -591,9 +718,10 @@ fn discover_within(
         if !covered.insert(workspace.clone()) {
             continue;
         }
-        if let Some(id) = crate::machine::directory_identity(&target)
-            && !known.insert(id)
-        {
+        let Some(id) = crate::machine::directory_identity(&target) else {
+            continue;
+        };
+        if !known.insert(id) {
             continue;
         }
         found += usize::from(store.remember_discovered_target_root(&target, &workspace)?);
@@ -929,6 +1057,9 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         commit_and_add_worktree(&repo, &dir.path().join("worktree"));
         let target = cargo_target(&repo.join("app"));
+        std::fs::write(repo.join(".git/info/exclude"), "target\n").unwrap();
+        std::fs::create_dir(repo.join("link")).unwrap();
+        std::os::unix::fs::symlink(&target, repo.join("link/target")).unwrap();
         let ran = dir.path().join("monitor-ran");
         let hook = dir.path().join("monitor");
         std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
@@ -954,9 +1085,11 @@ mod tests {
         let found = targets_in_worktree(
             &repo.canonicalize().unwrap(),
             Instant::now() + LISTING_TIMEOUT,
+            true,
         );
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].0, target.canonicalize().unwrap());
+        assert_eq!(found.targets.len(), 1, "{:?}", found.targets);
+        assert_eq!(found.targets[0].0, target.canonicalize().unwrap());
+        assert_eq!(found.links, vec![repo.canonicalize().unwrap().join("link")]);
         assert!(!ran.exists(), "discovery ran the repository's monitor");
     }
 
@@ -987,7 +1120,7 @@ mod tests {
             .remember_target_root(&built, &home.join("tools/rust"))
             .unwrap();
 
-        let pass = |deadline| discover_within(&store, deadline, &homes, 0).unwrap();
+        let pass = |deadline| discover_within(&store, &[], deadline, &homes, 0).unwrap();
         assert_eq!(pass(Instant::now() + DISCOVERY_TIME), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
@@ -1062,7 +1195,7 @@ mod tests {
         store
             .remember_target_root(&built, &repo.join("rust"))
             .unwrap();
-        let pass = || discover_within(&store, Instant::now() + DISCOVERY_TIME, &[], 0);
+        let pass = || discover_within(&store, &[], Instant::now() + DISCOVERY_TIME, &[], 0);
         assert_eq!(pass().unwrap(), 3);
         assert_eq!(pass().unwrap(), 0, "already known");
         let mut discovered: Vec<_> = store
@@ -1080,6 +1213,167 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(discovered, expected);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn discovery_inventories_ignored_external_symlinks_without_tracking_targets() {
+        use std::os::unix::fs::symlink;
+
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let repo = storage.join("source/repo");
+        let sibling = storage.join("source/sibling");
+        std::fs::create_dir_all(&repo).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        std::fs::write(repo.join(".gitignore"), "target\n").unwrap();
+        std::fs::write(sibling.join(".gitignore"), "target\n!rust/target\n").unwrap();
+        let built = cargo_target(&repo.join("rust"));
+        let shared = storage.join("build/shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        assert!(!shared.join("CACHEDIR.TAG").exists());
+        symlink(&shared, repo.join("target")).unwrap();
+        let tagged = cargo_target(&storage.join("build/tagged-workspace"));
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let untagged_source = sibling.join("untagged");
+        std::fs::create_dir_all(untagged_source.join("target")).unwrap();
+        std::fs::write(untagged_source.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::create_dir(sibling.join("regular")).unwrap();
+        std::fs::write(sibling.join("regular/target"), "not a link").unwrap();
+        for (workspace, backing) in [
+            (sibling.join("app"), shared.clone()),
+            (sibling.join("alternate"), shared.clone()),
+            (sibling.join("tagged"), tagged.clone()),
+            (sibling.join("outside"), outside.clone()),
+            (sibling.join("missing"), dir.path().join("missing")),
+            (sibling.join("source-link"), repo.clone()),
+            (sibling.join("untagged-source-link"), untagged_source),
+            (sibling.join("root-link"), storage.clone()),
+            (sibling.join("rust"), tagged),
+        ] {
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            symlink(backing, workspace.join("target")).unwrap();
+        }
+        let listing = git_output(
+            &sibling,
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+            ],
+            LISTING_TIMEOUT,
+            Instant::now() + LISTING_TIMEOUT,
+            MAX_LISTING_BYTES,
+        )
+        .unwrap();
+        assert!(
+            listing
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == b"app/target")
+        );
+        assert!(
+            !listing
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == b"rust/target")
+        );
+
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.external_target_roots = vec![dir.path().join("absent-root"), storage.clone()];
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &repo.join("rust"))
+            .unwrap();
+        let tracked = store.tracked_target_roots(0).unwrap();
+        assert_eq!(tracked.len(), 1);
+
+        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 0);
+        assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
+        assert!(store.external_target_observations().unwrap().is_empty());
+        assert_eq!(
+            discover_within(
+                &store,
+                &config.external_target_roots,
+                Instant::now(),
+                &[],
+                0
+            )
+            .unwrap(),
+            0
+        );
+        assert!(store.external_target_observations().unwrap().is_empty());
+
+        let found = discover(&store, &config.external_target_roots, DISCOVERY_TIME, 0).unwrap();
+        let observations = store.external_target_observations().unwrap();
+        let workspaces: Vec<_> = observations
+            .iter()
+            .map(|row| row.workspace_path.clone())
+            .collect();
+        let mut expected = vec![
+            repo.clone(),
+            sibling.join("alternate"),
+            sibling.join("app"),
+            sibling.join("tagged"),
+        ];
+        expected.sort();
+        assert_eq!(workspaces, expected);
+        let app = observations
+            .iter()
+            .find(|row| row.workspace_path == sibling.join("app"))
+            .unwrap();
+        let alternate = observations
+            .iter()
+            .find(|row| row.workspace_path == sibling.join("alternate"))
+            .unwrap();
+        assert_eq!(
+            app.snapshot.backing_identity,
+            alternate.snapshot.backing_identity
+        );
+        assert_eq!(app.snapshot.backing_path, shared.canonicalize().unwrap());
+        assert_ne!(
+            app.snapshot.symlink_identity,
+            alternate.snapshot.symlink_identity
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|row| row.allowed_storage_root == storage)
+        );
+        assert_eq!(found, 0);
+        assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
+
+        let old_app = app.clone();
+        let app_link = sibling.join("app/target");
+        std::fs::remove_file(&app_link).unwrap();
+        symlink(&outside, &app_link).unwrap();
+        assert_eq!(
+            discover(
+                &store,
+                &config.external_target_roots,
+                DISCOVERY_TIME,
+                FRESH_FOR.as_secs()
+            )
+            .unwrap(),
+            0
+        );
+        let observations = store.external_target_observations().unwrap();
+        let app = observations
+            .iter()
+            .find(|row| row.workspace_path == sibling.join("app"))
+            .unwrap();
+        assert_eq!(app, &old_app);
+        assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
     }
 
     #[test]
@@ -1131,8 +1425,8 @@ mod tests {
             .remember_target_root(&original, &repo.join("rust"))
             .unwrap();
 
-        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 1);
-        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 0);
+        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 1);
+        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 0);
         let roots = store.tracked_target_roots(0).unwrap();
         assert_eq!(roots.len(), 2);
         let sibling_row = roots
@@ -1149,7 +1443,7 @@ mod tests {
         let old_identity = sibling_row.identity;
         std::fs::rename(&found, sibling.join("old-target")).unwrap();
         cargo_target(&sibling.join("rust"));
-        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 1);
+        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 1);
         let replaced = store
             .tracked_target_roots(0)
             .unwrap()
@@ -1177,7 +1471,7 @@ mod tests {
         store.forget_target_root(&found).unwrap();
         std::fs::remove_dir_all(&found).unwrap();
         std::fs::create_dir_all(found.join("debug")).unwrap();
-        assert_eq!(discover(&store, DISCOVERY_TIME, 0).unwrap(), 0);
+        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
 }

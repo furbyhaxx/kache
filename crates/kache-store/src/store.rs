@@ -1819,16 +1819,34 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 const INDEX_SCHEMA_GENERATION: i64 = 9;
 
 const EXTERNAL_TARGET_INVENTORY_DB: &str = "external-target-inventory.db";
+const EXTERNAL_TARGET_INVENTORY_LOCK: &str = "external-target-inventory.lock";
 const EXTERNAL_TARGET_INVENTORY_SCHEMA: i64 = 1;
 const EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
-// Closing a separate header-reading fd can release this process's SQLite locks.
-static EXTERNAL_TARGET_INVENTORY_GATES: [std::sync::Mutex<()>; 8192] =
-    [const { std::sync::Mutex::new(()) }; 8192];
+// A close on any fd for the DB can release another SQLite connection's POSIX locks.
+static EXTERNAL_TARGET_INVENTORY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct InventoryConnection {
+    // Drop the SQLite connection and DB fd before releasing either lock.
     db: Connection,
+    database_file: fs::File,
+    lock_file: fs::File,
+    directory: fs::File,
+    cache_dir: PathBuf,
+    directory_path: PathBuf,
     _gate: std::sync::MutexGuard<'static, ()>,
+}
+
+impl InventoryConnection {
+    fn revalidate(&self) -> Result<()> {
+        validate_inventory_paths(
+            &self.cache_dir,
+            &self.directory_path,
+            &self.directory,
+            &self.lock_file,
+            &self.database_file,
+        )
+    }
 }
 
 impl std::ops::Deref for InventoryConnection {
@@ -1839,114 +1857,178 @@ impl std::ops::Deref for InventoryConnection {
     }
 }
 
-fn open_external_target_inventory(
-    cache_dir: &Path,
-    write: bool,
-) -> Result<Option<InventoryConnection>> {
-    use std::hash::{Hash, Hasher};
-    use std::io::Read;
-
-    let path = cache_dir.join(EXTERNAL_TARGET_INVENTORY_DB);
-    if !write {
-        match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspecting inventory database {}", path.display()));
-            }
-            Ok(_) => {}
-        }
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    fs::canonicalize(cache_dir)?.hash(&mut hasher);
-    let gate = &EXTERNAL_TARGET_INVENTORY_GATES
-        [(hasher.finish() as usize) % EXTERNAL_TARGET_INVENTORY_GATES.len()];
-    let deadline = std::time::Instant::now() + EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT;
-    let gate = loop {
-        match gate.try_lock() {
-            Ok(gate) => break gate,
-            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    anyhow::bail!("inventory database is busy: {}", path.display());
-                }
-                std::thread::sleep(remaining.min(Duration::from_millis(10)));
-            }
-        }
-    };
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            anyhow::bail!(
-                "inventory database is not a regular file: {}",
-                path.display()
-            );
-        }
-        Ok(metadata) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 {
-                    anyhow::bail!("inventory database has multiple links: {}", path.display());
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = metadata;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if !write {
-                return Ok(None);
-            }
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-            }
-            match options.open(&path) {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("creating inventory database {}", path.display())
-                    });
-                }
-            }
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("inspecting inventory database {}", path.display()));
-        }
-    }
-
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("opening inventory database {}", path.display()))?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
+fn inventory_private_metadata(metadata: &fs::Metadata, path: &Path, directory: bool) -> Result<()> {
+    if directory != metadata.is_dir() || (!directory && !metadata.is_file()) {
         anyhow::bail!(
-            "inventory database is not a regular file: {}",
+            "inventory path has an unexpected file type: {}",
             path.display()
         );
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.permissions().mode() & 0o077 != 0 {
-            anyhow::bail!("inventory database is not private: {}", path.display());
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid || metadata.mode() & 0o7077 != 0 {
+            anyhow::bail!("inventory path is not private: {}", path.display());
         }
-        if metadata.nlink() != 1 {
-            anyhow::bail!("inventory database has multiple links: {}", path.display());
+        if !directory && metadata.nlink() != 1 {
+            anyhow::bail!("inventory file has multiple links: {}", path.display());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!(
+            "cannot verify inventory path privacy on this platform: {}",
+            path.display()
+        )
+    }
+}
+
+fn validate_inventory_directory(cache_dir: &Path, path: &Path, handle: &fs::File) -> Result<()> {
+    inventory_private_metadata(&handle.metadata()?, path, true)?;
+    let metadata = fs::symlink_metadata(path)?;
+    inventory_private_metadata(&metadata, path, true)?;
+    if fs::canonicalize(cache_dir)? != path
+        || kache_fs::handle_identity(handle)? != kache_fs::directory_identity(path)?
+    {
+        anyhow::bail!("inventory cache directory changed: {}", cache_dir.display());
+    }
+    Ok(())
+}
+
+fn validate_inventory_file(path: &Path, handle: &fs::File) -> Result<()> {
+    inventory_private_metadata(&handle.metadata()?, path, false)?;
+    inventory_private_metadata(&fs::symlink_metadata(path)?, path, false)?;
+    if kache_fs::handle_identity(handle)? != kache_fs::file_identity(path)? {
+        anyhow::bail!("inventory file changed: {}", path.display());
+    }
+    Ok(())
+}
+
+fn validate_inventory_paths(
+    cache_dir: &Path,
+    directory_path: &Path,
+    directory: &fs::File,
+    lock: &fs::File,
+    database: &fs::File,
+) -> Result<()> {
+    validate_inventory_directory(cache_dir, directory_path, directory)?;
+    validate_inventory_file(&directory_path.join(EXTERNAL_TARGET_INVENTORY_LOCK), lock)?;
+    validate_inventory_file(&directory_path.join(EXTERNAL_TARGET_INVENTORY_DB), database)
+}
+
+fn open_inventory_file(path: &Path, create: bool) -> Result<fs::File> {
+    let mut existing = fs::OpenOptions::new();
+    existing.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        existing.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match existing.open(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            let mut new = fs::OpenOptions::new();
+            new.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                new.mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            match new.open(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    existing.open(path)
+                }
+                result => result,
+            }
+        }
+        result => result,
+    }
+    .with_context(|| format!("opening inventory file {}", path.display()))?;
+    validate_inventory_file(path, &file)?;
+    Ok(file)
+}
+
+fn open_external_target_inventory(
+    cache_dir: &Path,
+    write: bool,
+) -> Result<Option<InventoryConnection>> {
+    open_external_target_inventory_with(cache_dir, write, || {})
+}
+
+fn open_external_target_inventory_with(
+    cache_dir: &Path,
+    write: bool,
+    before_sqlite_open: impl FnOnce(),
+) -> Result<Option<InventoryConnection>> {
+    use std::io::Read;
+
+    let requested_path = cache_dir.join(EXTERNAL_TARGET_INVENTORY_DB);
+    if !write {
+        match fs::symlink_metadata(&requested_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspecting inventory database {}", requested_path.display())
+                });
+            }
+            Ok(_) => {}
         }
     }
+    let deadline = std::time::Instant::now() + EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT;
+    let gate = loop {
+        match EXTERNAL_TARGET_INVENTORY_GATE.try_lock() {
+            Ok(gate) => break gate,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    anyhow::bail!("inventory database is busy: {}", requested_path.display());
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+    };
+
+    let directory_path = fs::canonicalize(cache_dir)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let directory = options.open(&directory_path)?;
+    validate_inventory_directory(cache_dir, &directory_path, &directory)?;
+
+    let lock_path = directory_path.join(EXTERNAL_TARGET_INVENTORY_LOCK);
+    let lock = open_inventory_file(&lock_path, write)?;
+    while !StoreLock::try_lock_file(&lock)? {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("inventory lock is busy: {}", lock_path.display());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    validate_inventory_directory(cache_dir, &directory_path, &directory)?;
+    validate_inventory_file(&lock_path, &lock)?;
+    let path = directory_path.join(EXTERNAL_TARGET_INVENTORY_DB);
+    if !write {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+    }
+    let mut file = open_inventory_file(&path, write)?;
+    let metadata = file.metadata()?;
     if metadata.len() >= 20 {
         let mut header = [0; 20];
         file.read_exact(&mut header)?;
@@ -1960,14 +2042,28 @@ fn open_external_target_inventory(
         );
     }
 
+    before_sqlite_open();
+    validate_inventory_paths(cache_dir, &directory_path, &directory, &lock, &file)?;
     let flags = if write {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
     } | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
         | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    // SQLite opens by path, so a hostile same-UID replacement cannot be excluded
+    // atomically without an fd-aware VFS; these checks protect cooperating users.
     let db = Connection::open_with_flags(&path, flags)
         .with_context(|| format!("opening inventory database {}", path.display()))?;
+    let db = InventoryConnection {
+        db,
+        database_file: file,
+        lock_file: lock,
+        directory,
+        cache_dir: cache_dir.to_path_buf(),
+        directory_path,
+        _gate: gate,
+    };
+    db.revalidate()?;
     db.busy_timeout(EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT)?;
     let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if write && generation == 0 {
@@ -1996,6 +2092,7 @@ fn open_external_target_inventory(
                 path.display()
             );
         }
+        db.revalidate()?;
         transaction.commit()?;
     } else if generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
         anyhow::bail!(
@@ -2003,7 +2100,8 @@ fn open_external_target_inventory(
             path.display()
         );
     }
-    Ok(Some(InventoryConnection { db, _gate: gate }))
+    db.revalidate()?;
+    Ok(Some(db))
 }
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
@@ -4736,6 +4834,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !unchanged() {
             return Ok(false);
         }
+        db.revalidate()?;
         transaction.execute(
             "INSERT INTO external_target_observations
                 (workspace_path, allowed_storage_root, symlink_device, symlink_inode,
@@ -4763,6 +4862,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !unchanged() {
             return Ok(false);
         }
+        db.revalidate()?;
         transaction.commit()?;
         Ok(true)
     }
@@ -4770,6 +4870,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// List stored inventory observations without revalidating their paths.
     ///
     /// These are historical snapshots, not proof that the paths remain valid.
+    /// An existing inventory without a coordination lock cannot be listed until
+    /// a writer creates the lock; read-only listing never creates it. Inventory
+    /// access requires an owner-private cache directory and Unix permissions.
+    /// Coordination covers cooperating Kache processes; arbitrary same-UID
+    /// replacement cannot be made atomic without an fd-aware SQLite VFS.
     pub fn external_target_observations(&self) -> Result<Vec<ExternalTargetObservation>> {
         let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
             return Ok(Vec::new());
@@ -4831,6 +4936,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 last_observed: last,
             });
         }
+        db.revalidate()?;
         Ok(observations)
     }
 

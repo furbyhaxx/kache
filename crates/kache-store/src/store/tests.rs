@@ -4616,6 +4616,15 @@ mod external_target_inventory {
     use crate::filesystem::{TargetSymlinkSnapshot, snapshot_workspace_target};
     use std::os::unix::fs::{MetadataExt, symlink};
 
+    // Independent fixtures share the production process-wide inventory gate.
+    static INVENTORY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serialize_inventory_tests() -> std::sync::MutexGuard<'static, ()> {
+        INVENTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     struct Fixture {
         temp: tempfile::TempDir,
         store: Store,
@@ -4629,6 +4638,9 @@ mod external_target_inventory {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
             let store = Store::open(test_config(&temp.path().join("cache"))).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&store.config.cache_dir, fs::Permissions::from_mode(0o700))
+                .unwrap();
             let allowed = temp.path().join("allowed");
             let backing = allowed.join("build");
             let workspace = temp.path().join("workspace");
@@ -4665,6 +4677,24 @@ mod external_target_inventory {
                 .join(EXTERNAL_TARGET_INVENTORY_DB)
         }
 
+        fn inventory_lock_path(&self) -> PathBuf {
+            self.store
+                .config
+                .cache_dir
+                .join(EXTERNAL_TARGET_INVENTORY_LOCK)
+        }
+
+        fn create_inventory_lock(&self) {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(self.inventory_lock_path())
+                .unwrap();
+        }
+
         fn inventory_db(&self) -> InventoryConnection {
             open_external_target_inventory(&self.store.config.cache_dir, true)
                 .unwrap()
@@ -4674,6 +4704,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_preserves_shared_links_and_first_observation() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let first = f.snapshot(&f.workspace);
         let second = f.snapshot(&f.second_workspace);
@@ -4713,6 +4744,7 @@ mod external_target_inventory {
 
     #[test]
     fn inventory_revalidation_does_not_block_compiler_index_write() {
+        let _serial = serialize_inventory_tests();
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -4748,7 +4780,308 @@ mod external_target_inventory {
     }
 
     #[test]
+    fn external_target_inventory_refuses_missing_lock_on_read_only_store() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        fs::rename(f.inventory_lock_path(), f.temp.path().join("old-lock")).unwrap();
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        let before = ro_tree_snapshot(&f.store.config.cache_dir);
+        assert!(readonly.external_target_observations().is_err());
+        assert!(f.store.external_target_observations().is_err());
+        assert_eq!(ro_tree_snapshot(&f.store.config.cache_dir), before);
+        assert!(f.observe(&f.workspace, &snapshot));
+        assert_eq!(readonly.external_target_observations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn external_target_inventory_rejects_db_replacement_before_sqlite_open() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let path = f.inventory_path();
+        let replacement = f.temp.path().join("replacement.db");
+        fs::copy(&path, &replacement).unwrap();
+        let result = open_external_target_inventory_with(&f.store.config.cache_dir, false, || {
+            fs::rename(&path, f.temp.path().join("original.db")).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+        });
+        assert!(
+            result.is_err(),
+            "opened a replacement after validating the original"
+        );
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_db_replacement_before_commit() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let first = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &first));
+        let path = f.inventory_path();
+        let replacement = f.temp.path().join("replacement.db");
+        fs::copy(&path, &replacement).unwrap();
+        let second = f.snapshot(&f.second_workspace);
+        let result = f.store.observe_external_target_with(
+            &f.second_workspace,
+            &f.allowed,
+            &[],
+            &second,
+            || {
+                fs::rename(&path, f.temp.path().join("old-db")).unwrap();
+                fs::rename(&replacement, &path).unwrap();
+            },
+        );
+        assert!(result.is_err());
+        let rows = f.store.external_target_observations().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].snapshot, first);
+    }
+
+    #[test]
+    fn external_target_inventory_rejects_lock_and_directory_replacement_before_sqlite_open() {
+        let _serial = serialize_inventory_tests();
+        for replace in ["lock", "directory"] {
+            let f = Fixture::new();
+            let snapshot = f.snapshot(&f.workspace);
+            assert!(f.observe(&f.workspace, &snapshot));
+            let result =
+                open_external_target_inventory_with(&f.store.config.cache_dir, false, || {
+                    if replace == "lock" {
+                        let lock = f.inventory_lock_path();
+                        fs::rename(&lock, f.temp.path().join("old-lock")).unwrap();
+                        f.create_inventory_lock();
+                    } else {
+                        let cache = &f.store.config.cache_dir;
+                        fs::rename(cache, f.temp.path().join("old-cache")).unwrap();
+                        fs::create_dir(cache).unwrap();
+                    }
+                });
+            assert!(result.is_err(), "accepted replaced {replace}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a private user and mount namespace"]
+    fn external_target_inventory_bind_aliases_serialize() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let alias = f.temp.path().join("cache-bind");
+        fs::create_dir(&alias).unwrap();
+        let status = std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(&f.store.config.cache_dir)
+            .arg(&alias)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_ne!(
+            fs::canonicalize(&f.store.config.cache_dir).unwrap(),
+            fs::canonicalize(&alias).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&f.store.config.cache_dir).unwrap().ino(),
+            fs::metadata(&alias).unwrap().ino()
+        );
+        let first = f.inventory_db();
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &first.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let second = open_external_target_inventory(&alias, false);
+        let serialized = second.is_err();
+        drop(second);
+        let lock_probe = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::external_target_inventory::external_target_inventory_lock_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_INVENTORY_DB", f.inventory_path())
+            .output()
+            .unwrap();
+        drop(transaction);
+        drop(first);
+        let unmounted = std::process::Command::new("umount")
+            .arg(&alias)
+            .status()
+            .unwrap();
+        assert!(unmounted.success());
+        assert!(
+            serialized,
+            "a bind alias bypassed the process inventory gate"
+        );
+        assert!(
+            lock_probe.status.success(),
+            "SQLite transaction lost its lock: {}\n{}",
+            String::from_utf8_lossy(&lock_probe.stdout),
+            String::from_utf8_lossy(&lock_probe.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a private user and mount namespace"]
+    fn external_target_inventory_bind_read_only_creates_nothing() {
+        let _serial = serialize_inventory_tests();
+        for state in ["missing", "ready", "legacy"] {
+            let f = Fixture::new();
+            if state != "missing" {
+                let snapshot = f.snapshot(&f.workspace);
+                assert!(f.observe(&f.workspace, &snapshot));
+            }
+            if state == "legacy" {
+                fs::rename(f.inventory_lock_path(), f.temp.path().join("old-lock")).unwrap();
+            }
+            let alias = f.temp.path().join("cache-read-only");
+            fs::create_dir(&alias).unwrap();
+            assert!(
+                std::process::Command::new("mount")
+                    .arg("--bind")
+                    .arg(&f.store.config.cache_dir)
+                    .arg(&alias)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                std::process::Command::new("mount")
+                    .args(["-o", "remount,bind,ro"])
+                    .arg(&alias)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let before = ro_tree_snapshot(&alias);
+            let readonly = Store::open_read_only(test_config(&alias)).unwrap();
+            let result = readonly.external_target_observations();
+            match state {
+                "missing" => assert!(result.unwrap().is_empty()),
+                "ready" => assert_eq!(result.unwrap().len(), 1),
+                "legacy" => assert!(result.is_err()),
+                _ => unreachable!(),
+            }
+            drop(readonly);
+            assert_eq!(ro_tree_snapshot(&alias), before, "{state}");
+            drop(f.store);
+            assert!(
+                std::process::Command::new("umount")
+                    .arg(&alias)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[test]
+    fn external_target_inventory_serializes_distinct_cache_paths() {
+        let _serial = serialize_inventory_tests();
+        let first = Fixture::new();
+        let second = Fixture::new();
+        let snapshot = second.snapshot(&second.workspace);
+        assert!(second.observe(&second.workspace, &snapshot));
+        let guard = first.inventory_db();
+        let start = std::time::Instant::now();
+        assert!(second.store.external_target_observations().is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(guard);
+        assert_eq!(
+            second.store.external_target_observations().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn external_target_inventory_cooperating_processes_share_the_sidecar() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let run_child = |write: bool, expect_busy: bool| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::tests::external_target_inventory::external_target_inventory_cooperating_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("KACHE_TEST_INVENTORY_DIR", &f.store.config.cache_dir)
+                .env("KACHE_TEST_INVENTORY_WRITE", if write { "1" } else { "0" })
+                .env("KACHE_TEST_INVENTORY_BUSY", if expect_busy { "1" } else { "0" })
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        for parent_write in [false, true] {
+            let guard = open_external_target_inventory(&f.store.config.cache_dir, parent_write)
+                .unwrap()
+                .unwrap();
+            for child_write in [false, true] {
+                run_child(child_write, true);
+            }
+            drop(guard);
+        }
+        run_child(false, false);
+        run_child(true, false);
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for cooperating inventory lock"]
+    fn external_target_inventory_cooperating_child() {
+        let _serial = serialize_inventory_tests();
+        let cache = PathBuf::from(std::env::var_os("KACHE_TEST_INVENTORY_DIR").unwrap());
+        let write = std::env::var_os("KACHE_TEST_INVENTORY_WRITE").unwrap() == "1";
+        let busy = std::env::var_os("KACHE_TEST_INVENTORY_BUSY").unwrap() == "1";
+        let start = std::time::Instant::now();
+        let result = open_external_target_inventory(&cache, write);
+        assert_eq!(result.is_err(), busy);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn external_target_inventory_creation_waits_for_cooperating_sidecar() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        f.create_inventory_lock();
+        let lock = fs::File::open(f.inventory_lock_path()).unwrap();
+        lock.lock().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::external_target_inventory::external_target_inventory_cooperating_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_INVENTORY_DIR", &f.store.config.cache_dir)
+            .env("KACHE_TEST_INVENTORY_WRITE", "1")
+            .env("KACHE_TEST_INVENTORY_BUSY", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!f.inventory_path().exists());
+        drop(lock);
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+    }
+
+    #[test]
     fn external_target_inventory_concurrent_initialization_preserves_both_rows() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let stores = [
             Store::open(test_config(&f.store.config.cache_dir)).unwrap(),
@@ -4780,6 +5113,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_rejects_stale_retarget_and_replacement() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let old = f.snapshot(&f.workspace);
         assert!(f.observe(&f.workspace, &old));
@@ -4818,6 +5152,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_rolls_back_changes_during_observation() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let original = f.snapshot(&f.workspace);
         assert!(f.observe(&f.workspace, &original));
@@ -4860,6 +5195,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_refuses_root_replacement_during_observation() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let snapshot = f.snapshot(&f.workspace);
         let accepted = f
@@ -4897,6 +5233,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_refuses_untrusted_inputs() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let snapshot = f.snapshot(&f.workspace);
         let mut forged = snapshot.clone();
@@ -4933,6 +5270,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_refuses_non_utf8_paths_without_lossy_collisions() {
+        let _serial = serialize_inventory_tests();
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
@@ -4951,6 +5289,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_missing_and_read_only_listing_creates_nothing() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
         let before = ro_tree_snapshot(&f.store.config.cache_dir);
@@ -4970,13 +5309,21 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_private_journal_and_read_only_snapshot() {
+        let _serial = serialize_inventory_tests();
         use std::os::unix::fs::PermissionsExt;
 
         let f = Fixture::new();
         let first = f.snapshot(&f.workspace);
         assert!(f.observe(&f.workspace, &first));
+        let lock_before = fs::metadata(f.inventory_lock_path()).unwrap();
+        assert_eq!(lock_before.permissions().mode() & 0o077, 0);
+        assert_eq!(lock_before.nlink(), 1);
         let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
         let before = readonly.external_target_observations().unwrap();
+        assert_eq!(
+            fs::metadata(f.inventory_lock_path()).unwrap().ino(),
+            lock_before.ino()
+        );
         let second = f.snapshot(&f.second_workspace);
         let accepted = f
             .store
@@ -5002,6 +5349,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_listing_keeps_writer_locked_across_processes() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let snapshot = f.snapshot(&f.workspace);
         assert!(f.observe(&f.workspace, &snapshot));
@@ -5027,6 +5375,7 @@ mod external_target_inventory {
     #[test]
     #[ignore = "subprocess fixture for external_target_inventory_listing_keeps_writer_locked_across_processes"]
     fn external_target_inventory_lock_child() {
+        let _serial = serialize_inventory_tests();
         let path = std::env::var_os("KACHE_TEST_INVENTORY_DB").unwrap();
         let db = Connection::open(path).unwrap();
         db.busy_timeout(Duration::ZERO).unwrap();
@@ -5042,10 +5391,12 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_refuses_symlinks_and_nonregular_files() {
+        let _serial = serialize_inventory_tests();
         use std::os::unix::net::UnixListener;
 
         for kind in ["symlink", "dangling", "hardlink", "directory", "socket"] {
             let f = Fixture::new();
+            f.create_inventory_lock();
             let path = f.inventory_path();
             let target = f.temp.path().join("unrelated");
             fs::write(&target, b"keep unchanged").unwrap();
@@ -5084,7 +5435,96 @@ mod external_target_inventory {
     }
 
     #[test]
+    fn external_target_inventory_refuses_unsafe_lock_paths() {
+        let _serial = serialize_inventory_tests();
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        for kind in [
+            "symlink",
+            "dangling",
+            "hardlink",
+            "directory",
+            "socket",
+            "insecure",
+        ] {
+            let f = Fixture::new();
+            let snapshot = f.snapshot(&f.workspace);
+            assert!(f.observe(&f.workspace, &snapshot));
+            let lock = f.inventory_lock_path();
+            fs::rename(&lock, f.temp.path().join("old-lock")).unwrap();
+            let target = f.temp.path().join("unrelated");
+            fs::write(&target, b"keep unchanged").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            let _listener = match kind {
+                "symlink" => {
+                    symlink(&target, &lock).unwrap();
+                    None
+                }
+                "dangling" => {
+                    symlink(f.temp.path().join("missing"), &lock).unwrap();
+                    None
+                }
+                "hardlink" => {
+                    fs::hard_link(&target, &lock).unwrap();
+                    None
+                }
+                "directory" => {
+                    fs::create_dir(&lock).unwrap();
+                    None
+                }
+                "socket" => Some(UnixListener::bind(&lock).unwrap()),
+                "insecure" => {
+                    f.create_inventory_lock();
+                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+                    None
+                }
+                _ => unreachable!(),
+            };
+            let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+            let before_lock = fs::symlink_metadata(&lock).unwrap();
+            let before_db = fs::read(f.inventory_path()).unwrap();
+            assert!(readonly.external_target_observations().is_err(), "{kind}");
+            assert!(f.store.external_target_observations().is_err(), "{kind}");
+            assert!(
+                f.store
+                    .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                    .is_err(),
+                "{kind}"
+            );
+            let after_lock = fs::symlink_metadata(&lock).unwrap();
+            assert_eq!(
+                (after_lock.dev(), after_lock.ino(), after_lock.mode()),
+                (before_lock.dev(), before_lock.ino(), before_lock.mode()),
+                "{kind}"
+            );
+            assert_eq!(fs::read(f.inventory_path()).unwrap(), before_db, "{kind}");
+            assert_eq!(fs::read(&target).unwrap(), b"keep unchanged");
+        }
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_insecure_cache_directory() {
+        let _serial = serialize_inventory_tests();
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        fs::set_permissions(&f.store.config.cache_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = ro_tree_snapshot(&f.store.config.cache_dir);
+        assert!(f.store.external_target_observations().is_err());
+        assert!(
+            f.store
+                .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                .is_err()
+        );
+        assert_eq!(ro_tree_snapshot(&f.store.config.cache_dir), before);
+    }
+
+    #[test]
     fn external_target_inventory_surfaces_corruption_and_insecure_permissions() {
+        let _serial = serialize_inventory_tests();
         use std::os::unix::fs::PermissionsExt;
 
         let f = Fixture::new();
@@ -5116,9 +5556,11 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_refuses_wal_without_creating_sidecars() {
+        let _serial = serialize_inventory_tests();
         use std::os::unix::fs::OpenOptionsExt;
 
         let f = Fixture::new();
+        f.create_inventory_lock();
         let path = f.inventory_path();
         fs::OpenOptions::new()
             .write(true)
@@ -5150,6 +5592,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_refuses_unknown_schema() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let snapshot = f.snapshot(&f.workspace);
         assert!(f.observe(&f.workspace, &snapshot));
@@ -5171,6 +5614,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_lock_wait_is_bounded() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let snapshot = f.snapshot(&f.workspace);
         assert!(f.observe(&f.workspace, &snapshot));
@@ -5191,6 +5635,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_cannot_write_to_a_read_only_store() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let snapshot = f.snapshot(&f.workspace);
         let config = test_config(&f.temp.path().join("cache"));
@@ -5205,6 +5650,7 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_has_a_separate_schema() {
+        let _serial = serialize_inventory_tests();
         let f = Fixture::new();
         let tables: i64 = f.store.db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='external_target_observations'", [], |row| row.get(0)).unwrap();
         assert_eq!(tables, 0);

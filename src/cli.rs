@@ -6724,9 +6724,9 @@ fn external_target_rows(config: &Config) -> Result<Vec<ExternalTargetRow>> {
         .collect())
 }
 
-fn terminal_safe_path(path: &str) -> String {
-    let mut output = String::with_capacity(path.len());
-    for ch in path.chars() {
+fn terminal_safe_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for ch in text.chars() {
         if ch.is_control() {
             output.extend(ch.escape_default());
         } else {
@@ -6745,8 +6745,8 @@ fn render_external_target_rows(rows: &[ExternalTargetRow]) -> Vec<String> {
     lines.extend(rows.iter().map(|row| {
         format!(
             "  {} -> {}",
-            terminal_safe_path(&row.path),
-            terminal_safe_path(&row.backing_path)
+            terminal_safe_text(&row.path),
+            terminal_safe_text(&row.backing_path)
         )
     }));
     lines
@@ -7550,6 +7550,25 @@ pub(crate) struct Check {
     fix: Option<String>,
 }
 
+#[derive(serde::Serialize)]
+struct DoctorCheckBody {
+    label: &'static str,
+    pass: bool,
+    optional: bool,
+    detail: String,
+    fix: Option<String>,
+}
+
+fn doctor_check_body(check: &Check, optional: bool) -> DoctorCheckBody {
+    DoctorCheckBody {
+        label: check.label,
+        pass: check.pass,
+        optional,
+        detail: check.detail.clone(),
+        fix: check.fix.clone(),
+    }
+}
+
 /// Doctor's "Remote writes" check. A daemon keeps the write mode it started
 /// with, so it can skip the uploads of a writable process; the daemon is asked
 /// only when this process could upload.
@@ -7715,6 +7734,39 @@ fn doctor_index_quarantines(config: &Config) -> Check {
             fix: Some(format!("ensure {} is readable", config.cache_dir.display())),
         },
     }
+}
+
+fn render_doctor_section(
+    checks: &[Check],
+    section: &str,
+    check_is_optional: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    for check in checks
+        .iter()
+        .filter(|check| doctor_section(check.label) == section)
+    {
+        let (icon, style) = if check.pass {
+            ("✓", term::Style::Success)
+        } else if check_is_optional(check.label) {
+            ("•", term::Style::Muted)
+        } else {
+            ("✗", term::Style::Error)
+        };
+        rows.push((
+            check.label,
+            term::paint(icon, style),
+            terminal_safe_text(&check.detail),
+        ));
+        if let Some(fix) = &check.fix {
+            rows.push((
+                "",
+                term::paint("→", term::Style::Warning),
+                terminal_safe_text(fix),
+            ));
+        }
+    }
+    term::named_sections(&[(section, rows)])
 }
 
 fn doctor_section(label: &str) -> &'static str {
@@ -8225,19 +8277,11 @@ pub fn doctor(
 
     if json {
         #[derive(serde::Serialize)]
-        struct CheckBody {
-            label: &'static str,
-            pass: bool,
-            optional: bool,
-            detail: String,
-            fix: Option<String>,
-        }
-        #[derive(serde::Serialize)]
         struct Body {
             version: &'static str,
             rustc: String,
             issues: usize,
-            checks: Vec<CheckBody>,
+            checks: Vec<DoctorCheckBody>,
         }
         let failed: Vec<&str> = checks
             .iter()
@@ -8253,13 +8297,7 @@ pub fn doctor(
                 issues,
                 checks: checks
                     .iter()
-                    .map(|c| CheckBody {
-                        label: c.label,
-                        pass: c.pass,
-                        optional: check_is_optional(c.label),
-                        detail: c.detail.clone(),
-                        fix: c.fix.clone(),
-                    })
+                    .map(|c| doctor_check_body(c, check_is_optional(c.label)))
                     .collect(),
             },
             next,
@@ -8288,24 +8326,7 @@ pub fn doctor(
     let check_results: Vec<(&str, bool)> = checks.iter().map(|c| (c.label, c.pass)).collect();
     let downgraded_daemon = daemon_footnote_needed(daemon_optional, &check_results);
     for section in ["Setup", "Storage", "Services"] {
-        let mut rows = Vec::new();
-        for check in checks
-            .iter()
-            .filter(|check| doctor_section(check.label) == section)
-        {
-            let (icon, style) = if check.pass {
-                ("✓", term::Style::Success)
-            } else if check_is_optional(check.label) {
-                ("•", term::Style::Muted)
-            } else {
-                ("✗", term::Style::Error)
-            };
-            rows.push((check.label, term::paint(icon, style), check.detail.clone()));
-            if let Some(fix) = &check.fix {
-                rows.push(("", term::paint("→", term::Style::Warning), fix.clone()));
-            }
-        }
-        for line in term::named_sections(&[(section, rows)]) {
+        for line in render_doctor_section(&checks, section, check_is_optional) {
             println!("{line}");
         }
         println!();

@@ -167,6 +167,55 @@ fn doctor_link_layout_reports_injected_reflink_errors_without_moving_mounts() {
 }
 
 #[test]
+fn doctor_render_escapes_controls_but_json_preserves_them() {
+    use crate::link_probe::ReflinkProbe;
+    use std::path::Path;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = crate::link_probe::probe_link_layout(dir.path(), dir.path());
+    probe.hardlink_supported = false;
+    let reason = "probe\x1b[31m\u{9b}2J\nfailed";
+    probe.reflink_build_to_staging = ReflinkProbe::Unknown(reason.into());
+    probe.reflink_staging_to_build = ReflinkProbe::Supported;
+    let build = Path::new("/build/\x1b[2J\nworkspace");
+    let staging = Path::new("/cache/\x1b]0;spoof\x07staging");
+    let fix = "fix \x1b]52;c;data\x07\nretry\rnow";
+    let mut check = doctor_link_layout_check(&probe, build, staging);
+    check.fix = Some(fix.into());
+
+    let lines = render_doctor_section(std::slice::from_ref(&check), "Storage", |_| false);
+    assert!(
+        lines.iter().all(|line| !line.chars().any(char::is_control)),
+        "control character in doctor output: {lines:?}"
+    );
+    let text = lines.join("\n");
+    assert!(text.contains("/build/\\u{1b}[2J\\nworkspace"), "{text}");
+    assert!(
+        text.contains("/cache/\\u{1b}]0;spoof\\u{7}staging"),
+        "{text}"
+    );
+    assert!(
+        text.contains("probe\\u{1b}[31m\\u{9b}2J\\nfailed"),
+        "{text}"
+    );
+    assert!(
+        text.contains("fix \\u{1b}]52;c;data\\u{7}\\nretry\\rnow"),
+        "{text}"
+    );
+    assert!(text.contains("✗"));
+    assert!(text.contains("→"));
+
+    let json = serde_json::to_string(&doctor_check_body(&check, false)).unwrap();
+    let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let json_detail = decoded["detail"].as_str().unwrap();
+    assert_eq!(json_detail, check.detail);
+    assert!(json_detail.contains(build.to_str().unwrap()));
+    assert!(json_detail.contains(staging.to_str().unwrap()));
+    assert!(json_detail.contains(reason));
+    assert_eq!(decoded["fix"], fix);
+}
+
+#[test]
 fn shutdown_summary_status_distinguishes_partial_totals_from_cancellation() {
     assert_eq!(summary_status_suffix(false, false), "");
     assert_eq!(summary_status_suffix(true, false), ", CANCELLED");
@@ -4797,6 +4846,48 @@ fn doctor_groups_each_label_by_its_component() {
     }
     assert_eq!(doctor_section("RUSTC_WRAPPER"), "Setup");
     assert_eq!(doctor_section("Other"), "Setup");
+
+    let checks = [
+        Check {
+            label: "RUSTC_WRAPPER",
+            pass: true,
+            detail: "ready".into(),
+            fix: None,
+        },
+        Check {
+            label: "Link layout",
+            pass: false,
+            detail: "unavailable".into(),
+            fix: Some("retry".into()),
+        },
+        Check {
+            label: "Daemon version",
+            pass: false,
+            detail: "optional".into(),
+            fix: None,
+        },
+    ];
+    let setup = render_doctor_section(&checks, "Setup", |_| false).join("\n");
+    assert!(
+        setup.contains("RUSTC_WRAPPER") && setup.contains("✓"),
+        "{setup}"
+    );
+    assert!(!setup.contains("Link layout"), "{setup}");
+    let storage = render_doctor_section(&checks, "Storage", |_| false).join("\n");
+    assert!(
+        storage.contains("Link layout") && storage.contains("✗"),
+        "{storage}"
+    );
+    assert!(
+        storage.contains("→") && storage.contains("retry"),
+        "{storage}"
+    );
+    let services = render_doctor_section(&checks, "Services", |_| true).join("\n");
+    assert!(
+        services.contains("Daemon version") && services.contains("•"),
+        "{services}"
+    );
+    assert!(!services.contains("✗"), "{services}");
 }
 
 #[test]

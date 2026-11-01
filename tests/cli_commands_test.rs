@@ -806,6 +806,47 @@ fn doctor_human_groups_each_check_once() {
     assert!(text[services..].contains("  Daemon version "), "{text}");
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_escapes_link_layout_paths_for_humans_but_not_json() {
+    let e = env();
+    let name = "build-\x1b[2J-\x1b]0;spoof\x07\nname";
+    let workspace = e.home.join(name);
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = std::fs::canonicalize(&workspace).unwrap();
+
+    let human = e
+        .cmd()
+        .current_dir(&workspace)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("build-\\u{1b}[2J-\\u{1b}]0;spoof\\u{7}\\nname"));
+    assert!(!human.contains("\x1b[2J"));
+    assert!(!human.contains("\x1b]0;spoof\x07"));
+    assert!(human.contains("All checks passed.") || human.contains("issue"));
+
+    let json = e
+        .cmd()
+        .current_dir(&workspace)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let detail = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Link layout")
+        .unwrap()["detail"]
+        .as_str()
+        .unwrap();
+    assert!(detail.contains(workspace.to_str().unwrap()), "{detail:?}");
+}
+
 #[test]
 fn init_plan_matches_the_requested_components_and_keeps_prompt_lines_separate() {
     let e = env();

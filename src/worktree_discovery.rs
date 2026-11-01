@@ -1503,7 +1503,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn external_inventory_error_keeps_ordinary_discovery() {
-        use std::cell::Cell;
+        use std::cell::RefCell;
         use std::os::unix::fs::symlink;
         use std::sync::{Arc, Mutex};
 
@@ -1545,102 +1545,110 @@ mod tests {
             symlink(&backing, source.join("target")).unwrap();
         }
 
-        let config = crate::test_support::test_config(base.join("cache"));
-        let store = Store::open(&config).unwrap();
-        store
-            .remember_target_root(&built, &repo.join("built"))
-            .unwrap();
-        let before_snapshot = Cell::new(None);
-        let calls = Cell::new(0);
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = Arc::clone(&output);
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || Capture(Arc::clone(&writer)))
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, || {
-            discover_within_using(
-                &store,
-                std::slice::from_ref(&storage),
-                Instant::now() + DISCOVERY_TIME,
-                &[],
-                0,
-                |path| {
-                    if path == workspace.join("target") {
-                        before_snapshot.set(Some(
-                            store
+        let mut first_observations = HashSet::new();
+        for turn in [0, 1] {
+            let config = crate::test_support::test_config(base.join(format!("cache-{turn}")));
+            let store = Store::open(&config).unwrap();
+            store
+                .remember_target_root(&built, &repo.join("built"))
+                .unwrap();
+            let before_snapshot = RefCell::new(Vec::new());
+            let calls = RefCell::new(Vec::new());
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let writer = Arc::clone(&output);
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || Capture(Arc::clone(&writer)))
+                .finish();
+            let result = tracing::subscriber::with_default(subscriber, || {
+                discover_within_using(
+                    &store,
+                    std::slice::from_ref(&storage),
+                    Instant::now() + DISCOVERY_TIME,
+                    &[],
+                    turn,
+                    |path| {
+                        if path == workspace.join("target") || path == later.join("target") {
+                            let registered = store
                                 .tracked_target_roots(0)
                                 .unwrap()
                                 .iter()
-                                .any(|row| row.path == normal && row.discovered),
-                        ));
-                    }
-                    true
-                },
-                |_, observed_workspace, observed_root, _, _, _| {
-                    assert_eq!(observed_workspace, workspace);
-                    assert_eq!(observed_root, storage);
-                    calls.set(calls.get() + 1);
-                    Err(anyhow::anyhow!("injected inventory failure"))
-                },
-            )
-        });
-        assert_eq!(calls.get(), 1, "the external observation must be attempted");
-        assert_eq!(
-            before_snapshot.get(),
-            Some(true),
-            "ordinary target must be registered before external inventory: {result:?}"
-        );
-        assert_eq!(result.unwrap(), 1);
-        let rows = store.tracked_target_roots(0).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|row| row.path == normal && row.discovered));
-        assert!(store.external_target_observations().unwrap().is_empty());
-        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        for expected in [
-            "WARN",
-            "injected inventory failure",
-            workspace.to_str().unwrap(),
-            storage.to_str().unwrap(),
-        ] {
-            assert!(log.contains(expected), "{expected} missing from {log}");
-        }
+                                .any(|row| row.path == normal && row.discovered);
+                            before_snapshot
+                                .borrow_mut()
+                                .push((path.to_path_buf(), registered));
+                        }
+                        true
+                    },
+                    |_, observed_workspace, observed_root, _, _, _| {
+                        assert_eq!(observed_root, storage);
+                        calls.borrow_mut().push(observed_workspace.to_path_buf());
+                        Err(anyhow::anyhow!("injected inventory failure"))
+                    },
+                )
+            });
+            let calls = calls.into_inner();
+            assert_eq!(calls.len(), 1, "the external slice must stop on failure");
+            let observed_workspace = &calls[0];
+            assert!(observed_workspace == &workspace || observed_workspace == &later);
+            first_observations.insert(observed_workspace.clone());
+            assert_eq!(
+                before_snapshot.into_inner(),
+                vec![(observed_workspace.join("target"), true)],
+                "ordinary target must be registered before external inventory: {result:?}"
+            );
+            assert_eq!(result.unwrap(), 1);
+            let rows = store.tracked_target_roots(0).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().any(|row| row.path == normal && row.discovered));
+            assert!(store.external_target_observations().unwrap().is_empty());
+            let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            for expected in [
+                "WARN",
+                "injected inventory failure",
+                observed_workspace.to_str().unwrap(),
+                storage.to_str().unwrap(),
+            ] {
+                assert!(log.contains(expected), "{expected} missing from {log}");
+            }
 
-        assert_eq!(
-            discover_within_using(
-                &store,
-                std::slice::from_ref(&storage),
-                Instant::now() + DISCOVERY_TIME,
-                &[],
-                0,
-                |_| true,
-                observe_external_before_deadline,
-            )
-            .unwrap(),
-            0
-        );
-        let observations = store.external_target_observations().unwrap();
-        assert_eq!(observations.len(), 2);
-        assert!(
-            observations
-                .iter()
-                .any(|row| row.workspace_path == workspace)
-        );
-        assert!(observations.iter().any(|row| row.workspace_path == later));
-        assert_eq!(
-            discover_within_using(
-                &store,
-                &[],
-                Instant::now() + DISCOVERY_TIME,
-                &[],
-                0,
-                |_| panic!("locality must not be checked without external roots"),
-                |_, _, _, _, _, _| panic!("external observation must not run without roots"),
-            )
-            .unwrap(),
-            0
-        );
+            assert_eq!(
+                discover_within_using(
+                    &store,
+                    std::slice::from_ref(&storage),
+                    Instant::now() + DISCOVERY_TIME,
+                    &[],
+                    0,
+                    |_| true,
+                    observe_external_before_deadline,
+                )
+                .unwrap(),
+                0
+            );
+            let observations = store.external_target_observations().unwrap();
+            assert_eq!(observations.len(), 2);
+            assert!(
+                observations
+                    .iter()
+                    .any(|row| row.workspace_path == workspace)
+            );
+            assert!(observations.iter().any(|row| row.workspace_path == later));
+            assert_eq!(
+                discover_within_using(
+                    &store,
+                    &[],
+                    Instant::now() + DISCOVERY_TIME,
+                    &[],
+                    0,
+                    |_| panic!("locality must not be checked without external roots"),
+                    |_, _, _, _, _, _| panic!("external observation must not run without roots"),
+                )
+                .unwrap(),
+                0
+            );
+        }
+        assert_eq!(first_observations, HashSet::from([workspace, later]));
     }
 
     #[cfg(target_os = "linux")]

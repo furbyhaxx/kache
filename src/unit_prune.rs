@@ -338,7 +338,7 @@ fn watch_with(
 pub(crate) struct VerifiedIdle {
     since: SystemTime,
     _reservation: crate::target_use::Reservation,
-    _profiles: Vec<Held>,
+    profiles: Vec<(PathBuf, Held)>,
 }
 
 #[allow(dead_code)]
@@ -346,6 +346,65 @@ impl VerifiedIdle {
     pub(crate) fn since(&self) -> SystemTime {
         self.since
     }
+
+    /// Recheck the held Cargo locks under the original or renamed target root.
+    /// The root must not be a symlink or contain `..`. This point-in-time check
+    /// cannot detect a replacement restored between checks, prevent later
+    /// replacement, or protect consumers that do not take Cargo locks.
+    pub(crate) fn locks_match(&self, root: &Path) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            verified_locks_match(root, &self.profiles)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verified_locks_match(root: &Path, profiles: &[(PathBuf, Held)]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if root
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return false;
+    }
+    let root: PathBuf = root.components().collect();
+    if profiles.is_empty() || !std::fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    profiles.iter().all(|(relative, held)| {
+        let mut profile = root.clone();
+        if relative.as_os_str().is_empty() || held.0.len() != LOCKS.len() {
+            return false;
+        }
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return false;
+            };
+            profile.push(name);
+            if !std::fs::symlink_metadata(&profile).is_ok_and(|m| m.is_dir()) {
+                return false;
+            }
+        }
+        LOCKS.iter().zip(&held.0).all(|(name, file)| {
+            let Ok(path) = std::fs::symlink_metadata(profile.join(name)) else {
+                return false;
+            };
+            let Ok(descriptor) = file.metadata() else {
+                return false;
+            };
+            path.is_file()
+                && descriptor.is_file()
+                && path.dev() == descriptor.dev()
+                && path.ino() == descriptor.ino()
+        })
+    })
 }
 
 /// Revalidate a boot-bound watch, returning a lock guard only after `window`.
@@ -805,9 +864,10 @@ fn verified_watch_with(
     let profiles = verified_profiles(target_dir)?;
     let mut locks = Vec::new();
     for profile in &profiles {
-        locks.push(hold(&profile.path)?);
+        let relative = profile.path.strip_prefix(target_dir).ok()?.to_path_buf();
+        locks.push((relative, hold_with(&profile.path, true)?));
     }
-    if verified_profiles(target_dir)? != profiles {
+    if !verified_locks_match(target_dir, &locks) || verified_profiles(target_dir)? != profiles {
         return None;
     }
     let (files, fingerprints) = verified_fingerprints(&profiles, mount_id)?;
@@ -897,6 +957,7 @@ fn verified_watch_with(
         || verified_mount(target_dir)? != (mount_id, mount.clone())
         || verified_profiles(target_dir)? != profiles
         || verified_fingerprints(&profiles, mount_id)?.1 != final_fingerprints
+        || !verified_locks_match(target_dir, &locks)
     {
         return None;
     }
@@ -912,10 +973,15 @@ fn verified_watch_with(
         fingerprints: final_fingerprints,
     };
     (ops.write)(&path, &record).ok()?;
+    if !verified_locks_match(target_dir, &locks) {
+        let _ = forget_armed(&path);
+        let _ = crate::atomic::fsync_dir(parent);
+        return None;
+    }
     (elapsed >= window).then_some(VerifiedIdle {
         since,
         _reservation: reservation,
-        _profiles: locks,
+        profiles: locks,
     })
 }
 
@@ -1193,14 +1259,27 @@ impl Drop for Held {
 /// Take every Cargo lock of `profile` without waiting, creating any that is
 /// missing. `None` while a build holds one.
 pub(crate) fn hold(profile: &Path) -> Option<Held> {
+    hold_with(profile, false)
+}
+
+fn hold_with(profile: &Path, verified: bool) -> Option<Held> {
+    #[cfg(not(target_os = "linux"))]
+    if verified {
+        return None;
+    }
     let mut held = Held(Vec::new());
     for name in LOCKS {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(profile.join(name))
-            .ok()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(target_os = "linux")]
+        if verified {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(profile.join(name)).ok()?;
+        if verified && !file.metadata().ok()?.is_file() {
+            return None;
+        }
         file.try_lock().ok()?;
         held.0.push(file);
     }
@@ -1337,6 +1416,238 @@ mod tests {
             Duration::from_secs(12 * 3600),
             &ops,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_lock_in_child(path: &Path, available: bool) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("unit_prune::tests::verified_lock_child")
+            .env("KACHE_TEST_LOCK_PATH", path)
+            .env("KACHE_TEST_LOCK_AVAILABLE", available.to_string())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "child failed: {}\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_lock_child() {
+        let Some(path) = std::env::var_os("KACHE_TEST_LOCK_PATH") else {
+            return;
+        };
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let available = std::env::var("KACHE_TEST_LOCK_AVAILABLE").unwrap() == "true";
+        match file.try_lock() {
+            Ok(()) => {
+                assert!(available, "lock was unexpectedly available");
+                file.unlock().unwrap();
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                assert!(!available, "lock was unexpectedly held");
+            }
+            Err(error) => panic!("could not test lock: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_rejects_a_lock_replaced_during_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        let lock = profile.join(LOCKS[0]);
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            boot: &|| Some("boot-a".to_owned()),
+            uptime: &|| (start + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| {
+                assert_lock_in_child(&lock, false);
+                std::fs::rename(&lock, dir.path().join("old-lock"))?;
+                std::fs::write(&lock, "replacement")?;
+                assert_lock_in_child(&lock, true);
+                Ok(true)
+            },
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &write_verified,
+        };
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+        assert!(!verified_record(&cache, &target).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_guard_rechecks_every_lock_under_a_renamed_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        for profile in ["debug", "triple/release"] {
+            per_unit_profile(&target.join(profile));
+        }
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        let guard = verified_test_watch(&cache, &target, start + window, Some("boot-a")).unwrap();
+        assert!(guard.locks_match(&target));
+        assert!(guard.locks_match(&target.join(".")));
+
+        for profile in ["debug", "triple/release"] {
+            for name in LOCKS {
+                let lock = target.join(profile).join(name);
+                let old_lock = dir.path().join("old-lock");
+                assert_lock_in_child(&lock, false);
+                std::fs::rename(&lock, &old_lock).unwrap();
+                assert!(!guard.locks_match(&target), "missing {profile}/{name}");
+                symlink(&old_lock, &lock).unwrap();
+                assert!(!guard.locks_match(&target), "symlink {profile}/{name}");
+                std::fs::remove_file(&lock).unwrap();
+                std::fs::create_dir(&lock).unwrap();
+                assert!(!guard.locks_match(&target), "directory {profile}/{name}");
+                std::fs::remove_dir(&lock).unwrap();
+                write(&lock, "replacement");
+                assert_lock_in_child(&old_lock, false);
+                assert_lock_in_child(&lock, true);
+                assert!(!guard.locks_match(&target), "replaced {profile}/{name}");
+                std::fs::remove_file(&lock).unwrap();
+                std::fs::rename(&old_lock, &lock).unwrap();
+                assert!(guard.locks_match(&target), "restored {profile}/{name}");
+            }
+        }
+
+        let triple = target.join("triple");
+        let moved_triple = dir.path().join("old-triple");
+        std::fs::rename(&triple, &moved_triple).unwrap();
+        symlink(&moved_triple, &triple).unwrap();
+        assert!(!guard.locks_match(&target), "symlinked profile ancestor");
+        std::fs::remove_file(&triple).unwrap();
+        std::fs::rename(&moved_triple, &triple).unwrap();
+        assert!(guard.locks_match(&target));
+
+        let renamed = dir.path().join("renamed-target");
+        std::fs::rename(&target, &renamed).unwrap();
+        assert!(!guard.locks_match(&target));
+        assert!(guard.locks_match(&renamed));
+        symlink(&renamed, &target).unwrap();
+        assert!(!guard.locks_match(&target), "symlinked target root");
+        assert!(
+            !guard.locks_match(&target.join(".")),
+            "symlinked target root with trailing dot"
+        );
+        assert!(
+            !guard.locks_match(&target.join("../renamed-target")),
+            "target root containing parent traversal"
+        );
+        std::fs::remove_file(&target).unwrap();
+        for profile in ["debug", "triple/release"] {
+            per_unit_profile(&target.join(profile));
+            drop(hold(&target.join(profile)).unwrap());
+        }
+        assert!(!guard.locks_match(&target), "replacement target root");
+        assert_lock_in_child(&renamed.join("debug").join(LOCKS[0]), false);
+        drop(guard);
+        for profile in ["debug", "triple/release"] {
+            for name in LOCKS {
+                assert_lock_in_child(&renamed.join(profile).join(name), true);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_lock_acquisition_refuses_symlinks_and_nonregular_files() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{OpenOptionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let original = dir.path().join("original");
+        write(&original, "lock");
+        let lock = profile.join(LOCKS[0]);
+        symlink(&original, &lock).unwrap();
+        assert!(hold_with(&profile, true).is_none());
+        assert!(hold(&profile).is_some());
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        assert!(hold_with(&profile, true).is_none());
+        std::fs::remove_dir(&lock).unwrap();
+        let path = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is NUL-terminated and names a file in the test directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&lock)
+            .unwrap();
+        assert!(hold_with(&profile, true).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_forgets_a_record_if_a_lock_changes_while_writing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = dir.path().join("target");
+        let profile = target.join("debug");
+        per_unit_profile(&profile);
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        let lock = profile.join(LOCKS[0]);
+        let ops = VerifiedOps {
+            epoch: b"epoch-a",
+            boot: &|| Some("boot-a".to_owned()),
+            uptime: &|| (start + window).duration_since(SystemTime::UNIX_EPOCH).ok(),
+            probe: &|_| Ok(true),
+            arm: &verified_arm_file,
+            read: &|file, _| simulated_read(file),
+            write: &|path, record| {
+                write_verified(path, record)?;
+                std::fs::rename(&lock, dir.path().join("old-lock"))?;
+                std::fs::write(&lock, "replacement")?;
+                Ok(())
+            },
+        };
+        assert!(
+            verified_watch_with(
+                &cache,
+                &target,
+                start + window,
+                SystemTime::UNIX_EPOCH,
+                window,
+                &ops
+            )
+            .is_none()
+        );
+        assert!(!verified_record(&cache, &target).exists());
+        assert!(verified_test_watch(&cache, &target, start + window, Some("boot-a")).is_none());
     }
 
     #[cfg(target_os = "linux")]

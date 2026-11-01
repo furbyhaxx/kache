@@ -24,6 +24,8 @@ const MAX_INVENTORY_BYTES: u64 = 1 << 20;
 /// How long Git may take to list one worktree's ignored directories.
 const LISTING_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LISTING_BYTES: u64 = 4 << 20;
+/// External workspace candidates one discovery pass may inspect.
+const MAX_EXTERNAL_RECORDS: usize = 8;
 /// Repositories one discovery pass may ask Git about.
 const DISCOVERY_STEPS: usize = 2_000;
 /// How long one discovery pass may spend.
@@ -410,6 +412,21 @@ fn rotated<T>(mut items: Vec<T>, turn: u64) -> Vec<T> {
     items
 }
 
+/// A coprime step reaches every candidate even when a pass stops early.
+fn external_candidate_turn(turn: u64, count: usize) -> u64 {
+    let step = (1..=MAX_EXTERNAL_RECORDS)
+        .rev()
+        .find(|step| {
+            let (mut a, mut b) = (count, *step);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a == 1
+        })
+        .unwrap_or(1);
+    turn.wrapping_mul(step as u64)
+}
+
 /// The turn for [`rotated`] at `now` (Unix seconds): the hour, as discovery
 /// runs at most hourly.
 fn turn_at(now: u64) -> u64 {
@@ -615,6 +632,33 @@ fn discover_within(
     homes: &[PathBuf],
     turn: u64,
 ) -> Result<usize> {
+    discover_within_using(store, external_roots, deadline, homes, turn, |path| {
+        crate::cache_fs::probe(path).is_local == Some(true)
+    })
+}
+
+fn observe_external_before_deadline(
+    store: &Store,
+    workspace: &Path,
+    root: &Path,
+    sources: &[PathBuf],
+    snapshot: &kache_store::filesystem::TargetSymlinkSnapshot,
+    deadline: Instant,
+) -> Result<bool> {
+    if Instant::now() >= deadline {
+        return Ok(false);
+    }
+    store.observe_external_target(workspace, root, sources, snapshot)
+}
+
+fn discover_within_using(
+    store: &Store,
+    external_roots: &[PathBuf],
+    deadline: Instant,
+    homes: &[PathBuf],
+    turn: u64,
+    is_local: impl Fn(&Path) -> bool,
+) -> Result<usize> {
     let tracked = store.tracked_target_roots(0)?;
     let mut known: HashSet<_> = tracked.iter().map(|root| root.identity).collect();
     // Every tracked target leads to its repository, a target found through
@@ -676,27 +720,40 @@ fn discover_within(
             .take_while(|_| Instant::now() < deadline)
             .filter_map(|path| {
                 let resolved = path.canonicalize().ok()?;
-                (!shielded(&resolved, homes) && resolved.is_dir()).then(|| path.clone())
+                (!shielded(&resolved, homes) && resolved.is_dir() && is_local(&resolved))
+                    .then(|| path.clone())
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         let mut covered_links = HashSet::new();
-        let links = surveys.iter().flat_map(|survey| &survey.links).collect();
+        let links: Vec<_> = surveys.iter().flat_map(|survey| &survey.links).collect();
+        let turn = external_candidate_turn(turn, links.len());
+        let mut candidates = 0;
         for workspace in rotated(links, turn) {
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || candidates == MAX_EXTERNAL_RECORDS {
                 break;
             }
             if !covered_links.insert(workspace) || shielded(workspace, homes) {
                 continue;
             }
-            if !workspace
-                .canonicalize()
-                .is_ok_and(|path| !shielded(&path, homes))
+            let Ok(resolved) = workspace.canonicalize() else {
+                continue;
+            };
+            if shielded(&resolved, homes)
+                || !is_local(&resolved)
+                || !is_local(&workspace.join("target"))
             {
                 continue;
             }
+            candidates += 1;
             for root in external_roots {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                if !is_local(root) {
+                    continue;
+                }
                 if Instant::now() >= deadline {
                     break;
                 }
@@ -705,7 +762,12 @@ fn discover_within(
                 else {
                     continue;
                 };
-                store.observe_external_target(workspace, root, &sources, &snapshot)?;
+                if !is_local(&snapshot.backing_path) {
+                    continue;
+                }
+                observe_external_before_deadline(
+                    store, workspace, root, &sources, &snapshot, deadline,
+                )?;
                 break;
             }
         }
@@ -718,10 +780,9 @@ fn discover_within(
         if !covered.insert(workspace.clone()) {
             continue;
         }
-        let Some(id) = crate::machine::directory_identity(&target) else {
-            continue;
-        };
-        if !known.insert(id) {
+        if let Some(id) = crate::machine::directory_identity(&target)
+            && !known.insert(id)
+        {
             continue;
         }
         found += usize::from(store.remember_discovered_target_root(&target, &workspace)?);
@@ -1041,6 +1102,16 @@ mod tests {
         assert!(rotated(Vec::<u8>::new(), 7).is_empty());
     }
 
+    #[test]
+    fn external_candidate_turn_reaches_every_position() {
+        for count in [2, 8, 16, 17, 24] {
+            let starts: HashSet<_> = (0..count)
+                .map(|turn| external_candidate_turn(turn as u64, count) % count as u64)
+                .collect();
+            assert_eq!(starts.len(), count);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn listing_a_worktree_never_runs_its_filesystem_monitor() {
@@ -1228,6 +1299,9 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
+        if crate::cache_fs::probe(dir.path()).is_local != Some(true) {
+            return;
+        }
         let storage = dir.path().join("storage");
         let repo = storage.join("source/repo");
         let sibling = storage.join("source/sibling");
@@ -1314,6 +1388,33 @@ mod tests {
         );
         assert!(store.external_target_observations().unwrap().is_empty());
 
+        let isolated_config = crate::test_support::test_config(dir.path().join("cache-locality"));
+        let isolated = Store::open(&isolated_config).unwrap();
+        isolated
+            .remember_target_root(&built, &repo.join("rust"))
+            .unwrap();
+        let local = |path: &Path| crate::cache_fs::probe(path).is_local == Some(true);
+        discover_within_using(
+            &isolated,
+            &config.external_target_roots,
+            Instant::now() + DISCOVERY_TIME,
+            &[],
+            0,
+            |path| path != storage && local(path),
+        )
+        .unwrap();
+        assert!(isolated.external_target_observations().unwrap().is_empty());
+        discover_within_using(
+            &isolated,
+            &config.external_target_roots,
+            Instant::now() + DISCOVERY_TIME,
+            &[],
+            0,
+            |path| path != shared && path != sibling.join("tagged") && local(path),
+        )
+        .unwrap();
+        assert!(isolated.external_target_observations().unwrap().is_empty());
+
         let found = discover(&store, &config.external_target_roots, DISCOVERY_TIME, 0).unwrap();
         let observations = store.external_target_observations().unwrap();
         let workspaces: Vec<_> = observations
@@ -1373,6 +1474,110 @@ mod tests {
             .find(|row| row.workspace_path == sibling.join("app"))
             .unwrap();
         assert_eq!(app, &old_app);
+        assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_inventory_caps_records_and_rotates_candidates() {
+        use std::os::unix::fs::symlink;
+
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        if crate::cache_fs::probe(dir.path()).is_local != Some(true) {
+            return;
+        }
+        let repo = dir.path().join("source/repo");
+        let sibling = dir.path().join("source/sibling");
+        let storage = dir.path().join("storage");
+        let backing = storage.join("backing");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        std::fs::write(sibling.join(".gitignore"), "target\n").unwrap();
+        let built = cargo_target(&repo.join("built"));
+        for index in 0..(2 * MAX_EXTERNAL_RECORDS + 1) {
+            let workspace = sibling.join(format!("app-{index:02}"));
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            symlink(&backing, workspace.join("target")).unwrap();
+        }
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        config.external_target_roots = vec![storage];
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &repo.join("built"))
+            .unwrap();
+        let tracked = store.tracked_target_roots(0).unwrap();
+        assert_eq!(tracked.len(), 1);
+        let workspace = sibling.join("app-00");
+        let sources: Vec<_> = [repo.clone(), sibling.clone()]
+            .into_iter()
+            .chain(
+                (0..2 * MAX_EXTERNAL_RECORDS + 1)
+                    .map(|index| sibling.join(format!("app-{index:02}"))),
+            )
+            .collect();
+        let root = &config.external_target_roots[0];
+        let snapshot =
+            kache_store::filesystem::snapshot_workspace_target(&workspace, root, &sources).unwrap();
+        assert!(
+            !observe_external_before_deadline(
+                &store,
+                &workspace,
+                root,
+                &sources,
+                &snapshot,
+                Instant::now(),
+            )
+            .unwrap()
+        );
+        assert!(store.external_target_observations().unwrap().is_empty());
+
+        assert_eq!(
+            discover(&store, &config.external_target_roots, DISCOVERY_TIME, 0).unwrap(),
+            0
+        );
+        assert_eq!(
+            store.external_target_observations().unwrap().len(),
+            MAX_EXTERNAL_RECORDS
+        );
+        assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
+        assert_eq!(
+            discover(
+                &store,
+                &config.external_target_roots,
+                DISCOVERY_TIME,
+                FRESH_FOR.as_secs()
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.external_target_observations().unwrap().len(),
+            2 * MAX_EXTERNAL_RECORDS
+        );
+        assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
+        assert_eq!(
+            discover(
+                &store,
+                &config.external_target_roots,
+                DISCOVERY_TIME,
+                2 * FRESH_FOR.as_secs()
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.external_target_observations().unwrap().len(),
+            2 * MAX_EXTERNAL_RECORDS + 1
+        );
         assert_eq!(store.tracked_target_roots(0).unwrap(), tracked);
     }
 

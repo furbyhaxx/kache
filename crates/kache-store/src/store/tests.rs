@@ -4610,6 +4610,293 @@ fn test_incremental_dir_registry_deduplicates_and_cleans() {
     assert_eq!(count_after, 0);
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod external_target_inventory {
+    use super::*;
+    use crate::filesystem::{TargetSymlinkSnapshot, snapshot_workspace_target};
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    struct Fixture {
+        temp: tempfile::TempDir,
+        store: Store,
+        allowed: PathBuf,
+        workspace: PathBuf,
+        second_workspace: PathBuf,
+        backing: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(test_config(&temp.path().join("cache"))).unwrap();
+            let allowed = temp.path().join("allowed");
+            let backing = allowed.join("build");
+            let workspace = temp.path().join("workspace");
+            let second_workspace = temp.path().join("other-workspace");
+            fs::create_dir_all(&backing).unwrap();
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&second_workspace).unwrap();
+            symlink(&backing, workspace.join("target")).unwrap();
+            symlink(&backing, second_workspace.join("target")).unwrap();
+            Self {
+                temp,
+                store,
+                allowed,
+                workspace,
+                second_workspace,
+                backing,
+            }
+        }
+
+        fn snapshot(&self, workspace: &Path) -> TargetSymlinkSnapshot {
+            snapshot_workspace_target(workspace, &self.allowed, &[]).unwrap()
+        }
+
+        fn observe(&self, workspace: &Path, snapshot: &TargetSymlinkSnapshot) -> bool {
+            self.store
+                .observe_external_target(workspace, &self.allowed, &[], snapshot)
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn external_target_inventory_preserves_shared_links_and_first_observation() {
+        let f = Fixture::new();
+        let first = f.snapshot(&f.workspace);
+        let second = f.snapshot(&f.second_workspace);
+        assert!(f.observe(&f.workspace, &first));
+        assert!(f.observe(&f.second_workspace, &second));
+        let rows = f.store.external_target_observations().unwrap();
+        assert_eq!(rows.len(), 2);
+        let a = rows
+            .iter()
+            .find(|row| row.workspace_path == fs::canonicalize(&f.workspace).unwrap())
+            .unwrap();
+        let b = rows
+            .iter()
+            .find(|row| row.workspace_path == fs::canonicalize(&f.second_workspace).unwrap())
+            .unwrap();
+        assert_eq!(
+            a.allowed_storage_root,
+            fs::canonicalize(&f.allowed).unwrap()
+        );
+        assert_eq!(a.snapshot, first);
+        assert_eq!(b.snapshot, second);
+        assert_eq!(a.snapshot.backing_identity, b.snapshot.backing_identity);
+        assert_ne!(a.snapshot.symlink_identity, b.snapshot.symlink_identity);
+        assert!(a.first_observed > 0 && a.last_observed >= a.first_observed);
+
+        f.store.db.execute("UPDATE external_target_observations SET first_observed = 100, last_observed = 101 WHERE workspace_path = ?1", [a.workspace_path.to_str().unwrap()]).unwrap();
+        assert!(f.observe(&f.workspace, &first));
+        let rows = f.store.external_target_observations().unwrap();
+        let a = rows
+            .iter()
+            .find(|row| row.workspace_path == fs::canonicalize(&f.workspace).unwrap())
+            .unwrap();
+        assert_eq!(a.first_observed, 100);
+        assert!(a.last_observed > 101);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn external_target_inventory_rejects_stale_retarget_and_replacement() {
+        let f = Fixture::new();
+        let old = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &old));
+        let link = f.workspace.join("target");
+        let other = f.allowed.join("other");
+        fs::create_dir(&other).unwrap();
+        fs::rename(&link, f.workspace.join("old-link")).unwrap();
+        symlink(&other, &link).unwrap();
+        assert!(!f.observe(&f.workspace, &old));
+        assert_eq!(
+            f.store.external_target_observations().unwrap()[0].snapshot,
+            old
+        );
+        let replacement = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &replacement));
+        assert_eq!(
+            f.store.external_target_observations().unwrap()[0].snapshot,
+            replacement
+        );
+
+        fs::rename(&other, f.allowed.join("old-other")).unwrap();
+        fs::create_dir(&other).unwrap();
+        assert!(!f.observe(&f.workspace, &replacement));
+        assert_eq!(
+            f.store.external_target_observations().unwrap()[0].snapshot,
+            replacement
+        );
+
+        fs::rename(&link, f.workspace.join("other-old-link")).unwrap();
+        symlink(&other, &link).unwrap();
+        assert!(
+            !f.observe(&f.workspace, &replacement),
+            "new link to same backing"
+        );
+    }
+
+    #[test]
+    fn external_target_inventory_rolls_back_changes_during_observation() {
+        let f = Fixture::new();
+        let original = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &original));
+        let current = f.snapshot(&f.second_workspace);
+        let result = f
+            .store
+            .observe_external_target_with(&f.second_workspace, &f.allowed, &[], &current, || {
+                let link = f.second_workspace.join("target");
+                fs::remove_file(&link).unwrap();
+                symlink(&f.backing, &link).unwrap();
+                assert_ne!(
+                    fs::symlink_metadata(&link).unwrap().ino(),
+                    current.symlink_identity.inode
+                );
+            })
+            .unwrap();
+        assert!(!result);
+        let rows = f.store.external_target_observations().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].snapshot, original);
+
+        f.store
+            .db
+            .execute(
+                "UPDATE external_target_observations SET last_observed = 101",
+                [],
+            )
+            .unwrap();
+        let before = f.store.external_target_observations().unwrap();
+        let result = f
+            .store
+            .observe_external_target_with(&f.workspace, &f.allowed, &[], &original, || {
+                let link = f.workspace.join("target");
+                fs::remove_file(&link).unwrap();
+                symlink(&f.backing, &link).unwrap();
+            })
+            .unwrap();
+        assert!(!result);
+        assert_eq!(f.store.external_target_observations().unwrap(), before);
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_root_replacement_during_observation() {
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        let accepted = f
+            .store
+            .observe_external_target_with(&f.workspace, &f.allowed, &[], &snapshot, || {
+                let old = f.workspace.with_file_name("old-workspace");
+                fs::rename(&f.workspace, &old).unwrap();
+                fs::create_dir(&f.workspace).unwrap();
+                fs::rename(old.join("target"), f.workspace.join("target")).unwrap();
+            })
+            .unwrap();
+        assert!(
+            !accepted,
+            "workspace changed while the link stayed the same"
+        );
+        assert!(f.store.external_target_observations().unwrap().is_empty());
+
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        let accepted = f
+            .store
+            .observe_external_target_with(&f.workspace, &f.allowed, &[], &snapshot, || {
+                let old = f.allowed.with_file_name("old-allowed");
+                fs::rename(&f.allowed, &old).unwrap();
+                fs::create_dir(&f.allowed).unwrap();
+                fs::rename(old.join("build"), &f.backing).unwrap();
+            })
+            .unwrap();
+        assert!(
+            !accepted,
+            "allowed root changed while the backing stayed the same"
+        );
+        assert!(f.store.external_target_observations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_untrusted_inputs() {
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        let mut forged = snapshot.clone();
+        forged.backing_path = f.workspace.clone();
+        assert!(!f.observe(&f.workspace, &forged));
+        assert!(!f.observe(&f.second_workspace, &snapshot));
+        assert!(
+            !f.store
+                .observe_external_target(&f.workspace, &f.backing, &[], &snapshot)
+                .unwrap()
+        );
+        assert!(
+            !f.store
+                .observe_external_target(&f.workspace, &f.allowed, &[f.backing.clone()], &snapshot)
+                .unwrap()
+        );
+        assert!(
+            !f.store
+                .observe_external_target(
+                    &f.workspace,
+                    &f.allowed,
+                    &[f.workspace.join("missing")],
+                    &snapshot
+                )
+                .unwrap()
+        );
+        assert!(f.store.external_target_observations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_non_utf8_paths_without_lossy_collisions() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let f = Fixture::new();
+        let workspace = f
+            .workspace
+            .parent()
+            .unwrap()
+            .join(OsString::from_vec(b"bad-\xff".to_vec()));
+        fs::create_dir(&workspace).unwrap();
+        symlink(&f.backing, workspace.join("target")).unwrap();
+        let snapshot = f.snapshot(&workspace);
+        assert!(!f.observe(&workspace, &snapshot));
+        assert!(f.store.external_target_observations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_target_inventory_cannot_write_to_a_read_only_store() {
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        let config = test_config(&f.temp.path().join("cache"));
+        let readonly = Store::open_read_only(&config).unwrap();
+        assert!(
+            readonly
+                .observe_external_target(&f.workspace, &f.allowed, &[], &snapshot)
+                .is_err()
+        );
+        assert!(f.store.external_target_observations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_target_inventory_migrates_previous_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.db");
+        let db = open_index_db(&path).unwrap();
+        db.execute_batch("DROP TABLE external_target_observations; PRAGMA user_version = 9;")
+            .unwrap();
+        drop(db);
+        let db = open_index_db(&path).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let tables: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='external_target_observations'", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, INDEX_SCHEMA_GENERATION);
+        assert_eq!(tables, 1);
+    }
+}
+
 #[test]
 fn target_root_registry_is_local_bounded_provenance_with_identity() {
     let dir = tempfile::tempdir().unwrap();

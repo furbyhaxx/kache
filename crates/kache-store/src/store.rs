@@ -1030,6 +1030,21 @@ pub enum GuardedRemoval {
     Unreclaimable,
 }
 
+/// A historical observation of one workspace's external target symlink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalTargetObservation {
+    /// Canonical workspace path containing the observed `target` link.
+    pub workspace_path: PathBuf,
+    /// Canonical storage root allowed at observation time.
+    pub allowed_storage_root: PathBuf,
+    /// The link and backing identities observed at that time.
+    pub snapshot: crate::filesystem::TargetSymlinkSnapshot,
+    /// Unix seconds when this workspace's target path was first observed.
+    pub first_observed: i64,
+    /// Unix seconds of its most recent inventory observation.
+    pub last_observed: i64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TrackedTargetRoot {
     pub path: PathBuf,
@@ -1771,6 +1786,20 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     let _ = db
         .execute_batch("ALTER TABLE target_roots ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0");
 
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS external_target_observations (
+            workspace_path       TEXT PRIMARY KEY,
+            allowed_storage_root TEXT NOT NULL,
+            symlink_device       TEXT NOT NULL,
+            symlink_inode        TEXT NOT NULL,
+            backing_path         TEXT NOT NULL,
+            backing_device       TEXT NOT NULL,
+            backing_inode        TEXT NOT NULL,
+            first_observed       INTEGER NOT NULL,
+            last_observed        INTEGER NOT NULL
+        );",
+    )?;
+
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
     db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
 
@@ -1797,7 +1826,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    older release stamps back each time it opens the index; nothing such
 ///    a release records is served. An index can carry 9 and still lack a
 ///    column (`file_hash::has_rule_columns`), so the open checks them too.
-const INDEX_SCHEMA_GENERATION: i64 = 9;
+/// 10: `external_target_observations`, separate from cleanup provenance.
+const INDEX_SCHEMA_GENERATION: i64 = 10;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
@@ -4451,6 +4481,179 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
+    /// Record one workspace link after re-inspecting it against the supplied roots.
+    ///
+    /// The caller must supply the authorized storage root and all additional
+    /// source roots. Stale or unsafe snapshots and uninspectable paths return
+    /// `Ok(false)` without changing the index, as do non-UTF-8 workspace, storage,
+    /// or backing paths. The first observation belongs to the workspace path,
+    /// even when a later observation records different identities. Paths may
+    /// change after reinspection; these times are not evidence of use, ownership,
+    /// or deletion safety.
+    pub fn observe_external_target(
+        &self,
+        workspace_root: &Path,
+        allowed_storage_root: &Path,
+        source_roots: &[PathBuf],
+        snapshot: &crate::filesystem::TargetSymlinkSnapshot,
+    ) -> Result<bool> {
+        self.observe_external_target_with(
+            workspace_root,
+            allowed_storage_root,
+            source_roots,
+            snapshot,
+            || {},
+        )
+    }
+
+    fn observe_external_target_with(
+        &self,
+        workspace_root: &Path,
+        allowed_storage_root: &Path,
+        source_roots: &[PathBuf],
+        snapshot: &crate::filesystem::TargetSymlinkSnapshot,
+        after_write: impl FnOnce(),
+    ) -> Result<bool> {
+        self.refuse_write("record an external target observation")?;
+        let (Ok(workspace), Ok(storage)) = (
+            fs::canonicalize(workspace_root),
+            fs::canonicalize(allowed_storage_root),
+        ) else {
+            return Ok(false);
+        };
+        let (Some(workspace_text), Some(storage_text), Some(backing_text)) = (
+            workspace.to_str(),
+            storage.to_str(),
+            snapshot.backing_path.to_str(),
+        ) else {
+            return Ok(false);
+        };
+        let link = workspace.join("target");
+        let (Some(workspace_handle), Some(storage_handle), Some(link_handle), Some(backing_handle)) = (
+            open_inventory_directory(&workspace, false),
+            open_inventory_directory(&storage, false),
+            open_inventory_symlink(&link),
+            open_inventory_directory(&link, true),
+        ) else {
+            return Ok(false);
+        };
+        let unchanged = || {
+            fs::canonicalize(workspace_root).is_ok_and(|path| path == workspace)
+                && fs::canonicalize(allowed_storage_root).is_ok_and(|path| path == storage)
+                && inventory_directory_matches(&workspace, &workspace_handle)
+                && inventory_directory_matches(&storage, &storage_handle)
+                && inventory_handle_matches(&link_handle, snapshot.symlink_identity)
+                && inventory_handle_matches(&backing_handle, snapshot.backing_identity)
+                && crate::filesystem::snapshot_workspace_target(
+                    workspace_root,
+                    allowed_storage_root,
+                    source_roots,
+                )
+                .as_ref()
+                    == Some(snapshot)
+        };
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !unchanged() {
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO external_target_observations
+                (workspace_path, allowed_storage_root, symlink_device, symlink_inode,
+                 backing_path, backing_device, backing_inode, first_observed, last_observed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, unixepoch(), unixepoch())
+             ON CONFLICT(workspace_path) DO UPDATE SET
+                allowed_storage_root = excluded.allowed_storage_root,
+                symlink_device = excluded.symlink_device,
+                symlink_inode = excluded.symlink_inode,
+                backing_path = excluded.backing_path,
+                backing_device = excluded.backing_device,
+                backing_inode = excluded.backing_inode,
+                last_observed = excluded.last_observed",
+            params![
+                workspace_text,
+                storage_text,
+                snapshot.symlink_identity.device.to_string(),
+                snapshot.symlink_identity.inode.to_string(),
+                backing_text,
+                snapshot.backing_identity.device.to_string(),
+                snapshot.backing_identity.inode.to_string()
+            ],
+        )?;
+        after_write();
+        if !unchanged() {
+            return Ok(false);
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    /// List stored inventory observations without revalidating their paths.
+    ///
+    /// These are historical snapshots, not proof that the paths remain valid.
+    pub fn external_target_observations(&self) -> Result<Vec<ExternalTargetObservation>> {
+        let mut stmt = self.db.prepare(
+            "SELECT workspace_path, allowed_storage_root, symlink_device, symlink_inode,
+                    backing_path, backing_device, backing_inode, first_observed, last_observed
+             FROM external_target_observations ORDER BY workspace_path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+        let mut observations = Vec::new();
+        for row in rows {
+            let (
+                workspace,
+                storage,
+                link_device,
+                link_inode,
+                backing,
+                backing_device,
+                backing_inode,
+                first,
+                last,
+            ) = row?;
+            observations.push(ExternalTargetObservation {
+                workspace_path: workspace.into(),
+                allowed_storage_root: storage.into(),
+                snapshot: crate::filesystem::TargetSymlinkSnapshot {
+                    backing_path: backing.into(),
+                    symlink_identity: crate::filesystem::PathIdentity {
+                        device: link_device
+                            .parse()
+                            .context("invalid observed symlink device")?,
+                        inode: link_inode
+                            .parse()
+                            .context("invalid observed symlink inode")?,
+                    },
+                    backing_identity: crate::filesystem::PathIdentity {
+                        device: backing_device
+                            .parse()
+                            .context("invalid observed backing device")?,
+                        inode: backing_inode
+                            .parse()
+                            .context("invalid observed backing inode")?,
+                    },
+                },
+                first_observed: first,
+                last_observed: last,
+            });
+        }
+        Ok(observations)
+    }
+
     /// Remember a Cargo target root without putting absolute paths in cache
     /// entries or remote data. Updates are debounced to keep compiler-wrapper
     /// writes off the hot path.
@@ -6688,6 +6891,57 @@ pub struct EntryInfo {
     pub last_accessed: String,
     pub hit_count: u64,
     pub content_hash: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_inventory_directory(path: &Path, follow: bool) -> Option<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut flags = libc::O_PATH | libc::O_DIRECTORY;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn open_inventory_directory(_path: &Path, _follow: bool) -> Option<fs::File> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_inventory_symlink(path: &Path) -> Option<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    file.metadata()
+        .ok()?
+        .file_type()
+        .is_symlink()
+        .then_some(file)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn open_inventory_symlink(_path: &Path) -> Option<fs::File> {
+    None
+}
+
+fn inventory_handle_matches(handle: &fs::File, expected: crate::filesystem::PathIdentity) -> bool {
+    kache_fs::handle_identity(handle)
+        .is_ok_and(|id| id.dev == expected.device && id.ino == expected.inode)
+}
+
+fn inventory_directory_matches(path: &Path, handle: &fs::File) -> bool {
+    matches!(
+        (kache_fs::directory_identity(path), kache_fs::handle_identity(handle)),
+        (Ok(path), Ok(handle)) if path == handle
+    )
 }
 
 /// Commit a transaction this code began, or roll it back. A failed `COMMIT`

@@ -18,7 +18,10 @@ mod exchange;
 pub use exchange::exchange_entries;
 
 mod identity;
-pub use identity::{directory_identity, file_identity, handle_identity};
+pub use identity::{
+    ExportedFileHandle, OpaqueFileHandle, directory_identity, export_file_handle, file_identity,
+    handle_identity,
+};
 
 mod mount_observer;
 pub use mount_observer::{MountChange, MountChangeObserver};

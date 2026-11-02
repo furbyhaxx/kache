@@ -8237,6 +8237,7 @@ fn external_target_observations_are_visible_but_not_cleanable() {
     let backing = storage.join("build");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&backing).unwrap();
+    fs::write(backing.join("keep"), b"preserve").unwrap();
     symlink(&backing, workspace.join("target")).unwrap();
     let cache = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
@@ -8281,6 +8282,23 @@ fn external_target_observations_are_visible_but_not_cleanable() {
         target_rows(&config, kache_store::markers::now_epoch_secs() as i64)
             .unwrap()
             .is_empty()
+    );
+    drop(store);
+    clean_with_terminal(
+        &config,
+        false,
+        true,
+        true,
+        CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(0)),
+        false,
+    )
+    .unwrap();
+    assert_eq!(fs::read(backing.join("keep")).unwrap(), b"preserve");
+    assert!(
+        fs::symlink_metadata(workspace.join("target"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
 

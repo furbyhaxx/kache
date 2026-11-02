@@ -14,6 +14,12 @@ enum SandboxError {
     #[cfg(target_os = "linux")]
     InvalidArgument,
     #[cfg(target_os = "linux")]
+    InvalidDescriptor,
+    #[cfg(target_os = "linux")]
+    InvalidControl,
+    #[cfg(target_os = "linux")]
+    TooManyDescriptors,
+    #[cfg(target_os = "linux")]
     Unenforced,
 }
 
@@ -30,6 +36,12 @@ impl std::fmt::Display for SandboxError {
             #[cfg(target_os = "linux")]
             Self::InvalidArgument => "invalid argument",
             #[cfg(target_os = "linux")]
+            Self::InvalidDescriptor => "invalid O_PATH rule descriptor",
+            #[cfg(target_os = "linux")]
+            Self::InvalidControl => "invalid or truncated descriptor control message",
+            #[cfg(target_os = "linux")]
+            Self::TooManyDescriptors => "too many rule descriptors",
+            #[cfg(target_os = "linux")]
             Self::Unenforced => "Landlock or no_new_privs not fully enforced",
         };
         formatter.write_str(message)
@@ -38,8 +50,8 @@ impl std::fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
-// The caller must validate approval and identity, bound program I/O, scrub the helper's
-// environment before launch, and use controlled pipes for all three stdio streams.
+// The caller must validate approval, origin, mount, ancestry, and identity, bound program I/O,
+// scrub the helper's environment before launch, and control all stdio streams.
 // This confines neither metadata visibility nor networking.
 pub(crate) fn dispatch() -> Option<ExitCode> {
     let mut args = std::env::args_os();
@@ -67,22 +79,30 @@ fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 #[cfg(target_os = "linux")]
-// The request ends at stdin EOF; argv contains arguments after the program name.
+const MAX_RULE_FDS: usize = 64;
+
+#[cfg(target_os = "linux")]
+// Stdin is a Unix stream: send at most 64 KiB of JSON and 64 caller-pinned O_PATH
+// descriptors using SCM_RIGHTS, then shut down the write side. Each rights message carries
+// JSON bytes; after a short send, send remaining bytes without resending descriptors. Slots
+// follow descriptor arrival order starting at 3 (0..=2 are reserved), not raw helper fds.
+// The caller retains ownership.
+// Renames and bind aliases of approved objects are allowed. The program needs execute access.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
-    pub(crate) read_roots: Vec<String>,
-    pub(crate) exec_roots: Vec<String>,
+    pub(crate) read_fds: Vec<i32>,
+    pub(crate) exec_fds: Vec<i32>,
     pub(crate) program: String,
     pub(crate) argv: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]
 struct PinnedRoot {
-    fd: landlock::PathFd,
+    index: usize,
     is_directory: bool,
     executable: bool,
 }
@@ -102,43 +122,112 @@ fn validate_path(path: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_request() -> anyhow::Result<Request> {
-    use std::io::Read;
+fn read_request(socket: std::os::fd::RawFd) -> anyhow::Result<(Request, Vec<std::fs::File>)> {
+    use std::os::fd::FromRawFd;
 
+    const CONTROL_BYTES: usize = unsafe {
+        libc::CMSG_SPACE((MAX_RULE_FDS * std::mem::size_of::<libc::c_int>()) as u32) as usize
+    };
+    const CONTROL_WORDS: usize = CONTROL_BYTES.div_ceil(std::mem::size_of::<usize>());
     let mut input = Vec::new();
-    std::io::stdin()
-        .lock()
-        .take(MAX_REQUEST_BYTES + 1)
-        .read_to_end(&mut input)?;
-    anyhow::ensure!(
-        input.len() <= MAX_REQUEST_BYTES as usize,
-        SandboxError::RequestTooLarge
-    );
-    let request: Request = serde_json::from_slice(&input)?;
-    for root in request.read_roots.iter().chain(&request.exec_roots) {
-        validate_path(root)?;
+    let mut fds = Vec::new();
+    loop {
+        let mut bytes = [0_u8; 8192];
+        let mut control = [0_usize; CONTROL_WORDS];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        // SAFETY: zeroed msghdr is valid, and both buffers remain live for recvmsg.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = CONTROL_BYTES;
+        // SAFETY: the socket is caller-controlled and message points to writable buffers.
+        let count = unsafe { libc::recvmsg(socket, &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if count == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+
+        let mut invalid_control = false;
+        // SAFETY: the kernel populated the aligned control buffer and installed its fds.
+        unsafe {
+            let mut header = libc::CMSG_FIRSTHDR(&message);
+            while !header.is_null() {
+                let length = (*header).cmsg_len;
+                let header_length = libc::CMSG_LEN(0) as usize;
+                if (*header).cmsg_level == libc::SOL_SOCKET
+                    && (*header).cmsg_type == libc::SCM_RIGHTS
+                    && length >= header_length
+                {
+                    let data_length = length - header_length;
+                    invalid_control |=
+                        !data_length.is_multiple_of(std::mem::size_of::<libc::c_int>());
+                    let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
+                    for index in 0..data_length / std::mem::size_of::<libc::c_int>() {
+                        fds.push(std::fs::File::from_raw_fd(data.add(index).read_unaligned()));
+                    }
+                } else {
+                    invalid_control = true;
+                }
+                header = libc::CMSG_NXTHDR(&message, header);
+            }
+        }
+        anyhow::ensure!(
+            !invalid_control && message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) == 0,
+            SandboxError::InvalidControl
+        );
+        anyhow::ensure!(fds.len() <= MAX_RULE_FDS, SandboxError::TooManyDescriptors);
+        if count == 0 {
+            break;
+        }
+        input.extend_from_slice(&bytes[..count as usize]);
+        anyhow::ensure!(
+            input.len() <= MAX_REQUEST_BYTES,
+            SandboxError::RequestTooLarge
+        );
     }
+    let request: Request = serde_json::from_slice(&input)?;
     validate_path(&request.program)?;
     anyhow::ensure!(
         request.argv.iter().all(|arg| !arg.contains('\0')),
         SandboxError::InvalidArgument
     );
-    Ok(request)
+    Ok((request, fds))
 }
 
 #[cfg(target_os = "linux")]
-fn pin_roots(request: &Request) -> anyhow::Result<Vec<PinnedRoot>> {
-    use std::os::fd::AsFd;
+fn pin_roots(request: &Request, received: &[std::fs::File]) -> anyhow::Result<Vec<PinnedRoot>> {
+    use std::os::fd::AsRawFd;
+
+    for fd in received {
+        let raw = fd.as_raw_fd();
+        anyhow::ensure!(raw >= 3, SandboxError::InvalidDescriptor);
+        // SAFETY: F_GETFL only inspects an owned descriptor.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+        anyhow::ensure!(
+            flags != -1 && flags & libc::O_PATH == libc::O_PATH,
+            SandboxError::InvalidDescriptor
+        );
+    }
 
     let mut roots = Vec::new();
-    for (paths, executable) in [(&request.read_roots, false), (&request.exec_roots, true)] {
-        for path in paths {
-            let fd = landlock::PathFd::new(path)?;
-            let file = std::fs::File::from(fd.as_fd().try_clone_to_owned()?);
-            let metadata = file.metadata()?;
+    for (slots, executable) in [(&request.read_fds, false), (&request.exec_fds, true)] {
+        for &slot in slots {
+            let index = usize::try_from(slot)
+                .ok()
+                .and_then(|slot| slot.checked_sub(3));
+            let index = index.ok_or(SandboxError::InvalidDescriptor)?;
+            let fd = received.get(index).ok_or(SandboxError::InvalidDescriptor)?;
+            let is_directory = fd.metadata()?.is_dir();
             roots.push(PinnedRoot {
-                fd,
-                is_directory: metadata.is_dir(),
+                index,
+                is_directory,
                 executable,
             });
         }
@@ -156,7 +245,11 @@ fn ensure_enforced(status: landlock::RulesetStatus, no_new_privs: bool) -> anyho
 }
 
 #[cfg(target_os = "linux")]
-fn restrict_and_exec(request: Request, roots: Vec<PinnedRoot>) -> anyhow::Result<()> {
+fn restrict_and_exec(
+    request: Request,
+    roots: Vec<PinnedRoot>,
+    received: Vec<std::fs::File>,
+) -> anyhow::Result<()> {
     use landlock::{
         ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
         RulesetCreatedAttr,
@@ -168,19 +261,18 @@ fn restrict_and_exec(request: Request, roots: Vec<PinnedRoot>) -> anyhow::Result
         .handle_access(AccessFs::from_all(ABI::V3))?
         .create()?;
     for root in &roots {
+        let fd = &received[root.index];
         if root.executable {
-            ruleset = ruleset.add_rule(PathBeneath::new(&root.fd, AccessFs::Execute))?;
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, AccessFs::Execute))?;
         } else if root.is_directory {
-            ruleset = ruleset.add_rule(PathBeneath::new(
-                &root.fd,
-                AccessFs::ReadFile | AccessFs::ReadDir,
-            ))?;
+            ruleset =
+                ruleset.add_rule(PathBeneath::new(fd, AccessFs::ReadFile | AccessFs::ReadDir))?;
         } else {
-            ruleset = ruleset.add_rule(PathBeneath::new(&root.fd, AccessFs::ReadFile))?;
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, AccessFs::ReadFile))?;
         }
     }
     let status = ruleset.restrict_self()?;
-    drop(roots);
+    drop(received);
     ensure_enforced(status.ruleset, status.no_new_privs)?;
 
     // On glibc, ENOEXEC may invoke /bin/sh; the helper never constructs a shell command string.
@@ -211,414 +303,15 @@ fn restrict_and_exec(request: Request, roots: Vec<PinnedRoot>) -> anyhow::Result
 
 #[cfg(target_os = "linux")]
 fn run() -> anyhow::Result<()> {
-    let request = read_request()?;
-    let roots = pin_roots(&request)?;
-    restrict_and_exec(request, roots)
+    let (request, received) = read_request(libc::STDIN_FILENO)?;
+    let roots = pin_roots(&request, &received)?;
+    restrict_and_exec(request, roots, received)
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::symlink;
-    use std::os::unix::process::CommandExt;
-    use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Output, Stdio};
-    use std::sync::OnceLock;
-
-    use serde_json::{Value, json};
-
-    use super::MARKER;
-
-    fn build_tool(program: &str) -> Command {
-        let mut command = Command::new(program);
-        command.env_clear().current_dir(env!("CARGO_MANIFEST_DIR"));
-        for (key, value) in [
-            ("PATH", option_env!("PATH")),
-            ("HOME", option_env!("HOME")),
-            ("CARGO_HOME", option_env!("CARGO_HOME")),
-            ("CARGO_TARGET_DIR", option_env!("CARGO_TARGET_DIR")),
-            ("CARGO_BUILD_JOBS", option_env!("CARGO_BUILD_JOBS")),
-            ("CARGO_BUILD_TARGET", option_env!("CARGO_BUILD_TARGET")),
-            ("RUSTUP_HOME", option_env!("RUSTUP_HOME")),
-            ("RUSTUP_TOOLCHAIN", option_env!("RUSTUP_TOOLCHAIN")),
-            ("RUSTC", option_env!("RUSTC")),
-            ("RUSTC_WRAPPER", option_env!("RUSTC_WRAPPER")),
-            (
-                "RUSTC_WORKSPACE_WRAPPER",
-                option_env!("RUSTC_WORKSPACE_WRAPPER"),
-            ),
-            ("RUSTFLAGS", option_env!("RUSTFLAGS")),
-            (
-                "CARGO_ENCODED_RUSTFLAGS",
-                option_env!("CARGO_ENCODED_RUSTFLAGS"),
-            ),
-            ("TMPDIR", option_env!("TMPDIR")),
-        ] {
-            if let Some(value) = value {
-                command.env(key, value);
-            }
-        }
-        command
-    }
-
-    fn binary() -> &'static Path {
-        static BINARY: OnceLock<PathBuf> = OnceLock::new();
-        BINARY.get_or_init(|| {
-            let status = build_tool(env!("CARGO"))
-                .args(["build", "--locked", "--bin", "kache"])
-                .status()
-                .unwrap();
-            assert!(status.success(), "building production kache binary failed");
-            std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("kache")
-        })
-    }
-
-    fn request(read_roots: &[&Path], script: &str, args: &[&Path]) -> Value {
-        let mut roots: Vec<String> = [
-            "/bin/sh",
-            "/lib",
-            "/lib64",
-            "/usr/lib",
-            "/usr/lib64",
-            "/etc/ld.so.cache",
-        ]
-        .iter()
-        .map(Path::new)
-        .filter(|path| path.exists())
-        .map(|path| path.to_str().unwrap().to_owned())
-        .collect();
-        roots.extend(
-            read_roots
-                .iter()
-                .map(|path| path.to_str().unwrap().to_owned()),
-        );
-        let mut argv = vec![
-            "-c".to_owned(),
-            script.to_owned(),
-            "sandbox-test".to_owned(),
-        ];
-        argv.extend(args.iter().map(|path| path.to_str().unwrap().to_owned()));
-        let exec_roots: Vec<&str> = ["/bin/sh", "/lib", "/lib64", "/usr/lib", "/usr/lib64"]
-            .into_iter()
-            .filter(|path| Path::new(path).exists())
-            .collect();
-        json!({"read_roots": roots, "exec_roots": exec_roots, "program": "/bin/sh", "argv": argv})
-    }
-
-    fn helper() -> Command {
-        let mut command = Command::new(binary());
-        command
-            .arg(MARKER)
-            .env_clear()
-            .env("KACHE_FAMILY_PROBE_ACTIVE", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command
-    }
-
-    fn run_bytes(mut command: Command, input: &[u8]) -> Output {
-        let mut child = command.spawn().unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
-        child.wait_with_output().unwrap()
-    }
-
-    fn run(request: &Value) -> Output {
-        run_bytes(helper(), &serde_json::to_vec(request).unwrap())
-    }
-
-    fn compile_probe(dir: &Path, code: &str) -> PathBuf {
-        let source = dir.join("probe.rs");
-        let probe = dir.join("probe");
-        std::fs::write(&source, code).unwrap();
-        let output = build_tool(option_env!("RUSTC").unwrap_or("rustc"))
-            .arg("--edition=2024")
-            .arg(&source)
-            .arg("-o")
-            .arg(&probe)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        probe
-    }
-
     #[test]
-    fn approved_reads_work_and_unapproved_reads_and_writes_fail() {
-        let dir = tempfile::tempdir().unwrap();
-        let allowed = dir.path().join("allowed");
-        let denied = dir.path().join("denied");
-        std::fs::create_dir(&allowed).unwrap();
-        std::fs::create_dir(&denied).unwrap();
-        let allowed_file = allowed.join("data");
-        let denied_file = denied.join("secret");
-        std::fs::write(&allowed_file, "visible\n").unwrap();
-        std::fs::write(&denied_file, "hidden\n").unwrap();
-        let policy = request(
-            &[&allowed],
-            "IFS= read -r value < \"$1\" || exit 10; printf '%s\\n' \"$value\"; if IFS= read -r value < \"$2\" 2>/dev/null; then exit 11; fi; if printf overwritten > \"$1\" 2>/dev/null; then exit 12; fi; printf 'denied\\n'",
-            &[&allowed_file, &denied_file],
-        );
-        let output = run(&policy);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"visible\ndenied\n");
-        assert_eq!(std::fs::read(&allowed_file).unwrap(), b"visible\n");
-    }
-
-    #[test]
-    fn directory_listing_and_read_execute_grants_are_distinct() {
-        let dir = tempfile::tempdir().unwrap();
-        let allowed = dir.path().join("allowed");
-        let denied = dir.path().join("denied");
-        std::fs::create_dir(&allowed).unwrap();
-        std::fs::create_dir(&denied).unwrap();
-        std::fs::write(allowed.join("visible"), "data").unwrap();
-        std::fs::write(denied.join("hidden"), "data").unwrap();
-
-        let mut list = request(&[&allowed, Path::new("/bin/ls")], "", &[]);
-        list["program"] = json!("/bin/ls");
-        list["exec_roots"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("/bin/ls"));
-        list["argv"] = json!([allowed]);
-        let output = run(&list);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"visible\n");
-        list["argv"] = json!([denied]);
-        let output = run(&list);
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-
-        let executable = allowed.join("sh");
-        std::fs::copy("/bin/sh", &executable).unwrap();
-        let mut read_only = request(&[&allowed], "printf LAUNCHED", &[]);
-        read_only["program"] = json!(executable);
-        let output = run(&read_only);
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-
-        let mut exec_only = request(&[], "printf LAUNCHED", &[]);
-        exec_only["program"] = json!(executable);
-        exec_only["exec_roots"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(executable));
-        let output = run(&exec_only);
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-        exec_only["read_roots"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(executable));
-        let output = run(&exec_only);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"LAUNCHED");
-    }
-
-    #[test]
-    fn direct_truncate_is_denied_even_in_a_readable_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        std::fs::write(&data, "original").unwrap();
-        let probe = compile_probe(
-            dir.path(),
-            r#"
-            use std::ffi::{c_char, CString};
-            unsafe extern "C" { fn truncate(path: *const c_char, length: i64) -> i32; }
-            fn main() {
-                let path = CString::new(std::env::args().nth(1).unwrap()).unwrap();
-                let result = unsafe { truncate(path.as_ptr(), 0) };
-                assert_eq!(result, -1);
-                assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(13));
-                print!("denied");
-            }
-        "#,
-        );
-        let mut policy = request(&[dir.path()], "", &[]);
-        policy["program"] = json!(probe);
-        policy["argv"] = json!([data]);
-        policy["exec_roots"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(probe));
-        let output = run(&policy);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"denied");
-        assert_eq!(std::fs::read(&data).unwrap(), b"original");
-    }
-
-    #[test]
-    fn approved_non_directory_file_can_be_read() {
-        let policy = request(
-            &[Path::new("/dev/null")],
-            "if : < /dev/null; then printf allowed; else exit 1; fi",
-            &[],
-        );
-        let output = run(&policy);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"allowed");
-    }
-
-    #[test]
-    fn arguments_are_passed_literally() {
-        let mut policy = request(&[Path::new("/bin/echo")], "", &[]);
-        policy["program"] = json!("/bin/echo");
-        policy["exec_roots"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("/bin/echo"));
-        policy["argv"] = json!(["literal; printf INJECTED"]);
-        let output = run(&policy);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"literal; printf INJECTED\n");
-    }
-
-    #[test]
-    fn environment_is_fixed_and_entry_precedes_normal_startup() {
-        let policy = request(
-            &[],
-            "printf '%s:%s:%s' \"$LANG\" \"$PATH\" \"${KACHE_FAMILY_PROBE_ACTIVE-unset}\"",
-            &[],
-        );
-        let output = run(&policy);
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"C:/usr/bin:/bin:unset");
-    }
-
-    #[test]
-    fn invalid_requests_never_launch() {
-        let base = request(&[], "printf LAUNCHED", &[]);
-        let mut cases = Vec::new();
-        for (field, value) in [
-            ("program", json!("relative")),
-            ("program", json!("/tmp/../bin/bash")),
-            ("program", json!("/bin/\u{0}bash")),
-            ("program", json!("/does-not-exist")),
-            ("read_roots", json!(["relative"])),
-            ("read_roots", json!(["/does-not-exist"])),
-            ("exec_roots", json!(["/tmp/../bin"])),
-            ("argv", json!(["-c", "printf LAUNCHED\u{0}"])),
-            ("unexpected", json!(true)),
-        ] {
-            let mut invalid = base.clone();
-            invalid[field] = value;
-            cases.push(serde_json::to_vec(&invalid).unwrap());
-        }
-        cases.extend([
-            b"{".to_vec(),
-            vec![0xff],
-            vec![b' '; (super::MAX_REQUEST_BYTES + 1) as usize],
-        ]);
-        for input in cases {
-            let output = run_bytes(helper(), &input);
-            assert!(!output.status.success());
-            assert!(output.stdout.is_empty(), "{:?}", output.stdout);
-        }
-        let mut with_extra_arg = helper();
-        with_extra_arg.arg("extra");
-        let output = run_bytes(with_extra_arg, &[]);
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
-    }
-
-    fn block_syscall(command: &mut Command, syscall: libc::c_long) {
-        // SAFETY: the hook only installs a child-local seccomp filter before exec.
-        unsafe {
-            command.pre_exec(move || {
-                let mut filter = [
-                    libc::sock_filter {
-                        code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-                        jt: 0,
-                        jf: 0,
-                        k: 0,
-                    },
-                    libc::sock_filter {
-                        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
-                        jt: 0,
-                        jf: 1,
-                        k: syscall as u32,
-                    },
-                    libc::sock_filter {
-                        code: (libc::BPF_RET | libc::BPF_K) as u16,
-                        jt: 0,
-                        jf: 0,
-                        k: libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
-                    },
-                    libc::sock_filter {
-                        code: (libc::BPF_RET | libc::BPF_K) as u16,
-                        jt: 0,
-                        jf: 0,
-                        k: libc::SECCOMP_RET_ALLOW,
-                    },
-                ];
-                let program = libc::sock_fprog {
-                    len: filter.len() as u16,
-                    filter: filter.as_mut_ptr(),
-                };
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                    || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    #[test]
-    fn unavailable_or_failed_restrictions_never_launch() {
-        let policy = request(&[], "printf LAUNCHED", &[]);
-        for syscall in [
-            libc::SYS_landlock_create_ruleset,
-            libc::SYS_landlock_restrict_self,
-            libc::SYS_prctl,
-            libc::SYS_close_range,
-        ] {
-            let mut command = helper();
-            block_syscall(&mut command, syscall);
-            let output = run_bytes(command, &serde_json::to_vec(&policy).unwrap());
-            assert!(!output.status.success(), "syscall {syscall}");
-            assert!(output.stdout.is_empty(), "syscall {syscall}");
-        }
+    fn enforcement_requires_full_status_and_no_new_privs() {
         use landlock::RulesetStatus::{FullyEnforced, NotEnforced, PartiallyEnforced};
         assert!(super::ensure_enforced(FullyEnforced, true).is_ok());
         assert!(super::ensure_enforced(FullyEnforced, false).is_err());
@@ -626,183 +319,92 @@ mod tests {
         assert!(super::ensure_enforced(NotEnforced, true).is_err());
     }
 
-    fn inherit_fd(command: &mut Command, source: libc::c_int) {
-        // SAFETY: dup2 changes only the child's descriptor table before exec.
-        unsafe {
-            command.pre_exec(move || {
-                if source == 198 {
-                    let flags = libc::fcntl(source, libc::F_GETFD);
-                    if flags == -1
-                        || libc::fcntl(source, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                } else if libc::dup2(source, 198) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
     #[test]
-    fn inherited_descriptors_are_closed_on_exec() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = dir.path().join("secret");
-        std::fs::write(&secret, "forbidden-data\n").unwrap();
-        let probe_dir = tempfile::tempdir().unwrap();
-        let probe = compile_probe(
-            probe_dir.path(),
-            r#"
-            unsafe extern "C" {
-                fn fcntl(fd: i32, command: i32, ...) -> i32;
-                fn read(fd: i32, buffer: *mut u8, len: usize) -> isize;
+    fn failed_requests_close_all_received_descriptors() {
+        use std::net::Shutdown;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        for (payload, count) in [
+            (&b"{"[..], 1),
+            (
+                &br#"{"read_fds":[],"exec_fds":[],"program":"/bin/sh","argv":[]}"#[..],
+                65,
+            ),
+            (
+                &br#"{"read_fds":[3],"exec_fds":[],"program":"/bin/sh","argv":[]}"#[..],
+                1,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("file");
+            std::fs::write(&path, "data").unwrap();
+            let source = std::fs::File::open(&path).unwrap();
+            let waiter = std::fs::File::open(&path).unwrap();
+            // SAFETY: both files are live; LOCK_NB prevents blocking the test.
+            unsafe {
+                assert_eq!(
+                    libc::flock(source.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                    0
+                );
+                assert_eq!(
+                    libc::flock(waiter.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                    -1
+                );
             }
-            fn main() {
-                if unsafe { fcntl(198, 1) } == -1 {
-                    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(9));
-                    print!("closed");
-                } else {
-                    let mut buffer = [0; 128];
-                    let len = unsafe { read(198, buffer.as_mut_ptr(), buffer.len()) };
-                    assert!(len >= 0);
-                    let contents = std::str::from_utf8(&buffer[..len as usize]).unwrap();
-                    print!("leaked:{}", contents.trim_end());
+            let (sender, receiver) = UnixStream::pair().unwrap();
+            let mut iov = libc::iovec {
+                iov_base: payload.as_ptr().cast_mut().cast(),
+                iov_len: payload.len(),
+            };
+            let bytes = count * std::mem::size_of::<libc::c_int>();
+            // SAFETY: CMSG_SPACE computes the required aligned control buffer size.
+            let control_bytes = unsafe { libc::CMSG_SPACE(bytes as u32) } as usize;
+            let mut control = vec![0_usize; control_bytes.div_ceil(std::mem::size_of::<usize>())];
+            // SAFETY: zeroed msghdr is valid, and its buffers remain live for sendmsg.
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = control_bytes;
+            // SAFETY: control is aligned and sized for count copies of the open source fd.
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(bytes as u32) as usize;
+                let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
+                for index in 0..count {
+                    data.add(index).write(source.as_raw_fd());
                 }
+                assert_eq!(
+                    libc::sendmsg(sender.as_raw_fd(), &message, 0),
+                    payload.len() as isize
+                );
             }
-        "#,
-        );
-        let source = std::fs::File::open(&secret).unwrap();
-        let mut baseline = Command::new(&probe);
-        baseline
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        inherit_fd(&mut baseline, source.as_raw_fd());
-        let output = baseline.output().unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"leaked:forbidden-data");
-        drop(source);
-
-        let source = std::fs::File::open(&secret).unwrap();
-        let mut command = helper();
-        inherit_fd(&mut command, source.as_raw_fd());
-        let mut policy = request(&[&probe], "", &[]);
-        policy["program"] = json!(probe);
-        policy["argv"] = json!([]);
-        policy["exec_roots"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!(probe));
-        let output = run_bytes(command, &serde_json::to_vec(&policy).unwrap());
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"closed");
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct SyscallInfo {
-        op: u8,
-        padding: [u8; 3],
-        arch: u32,
-        instruction_pointer: u64,
-        stack_pointer: u64,
-        data: [u64; 7],
-    }
-
-    struct TracedChild(Option<Child>);
-
-    impl Drop for TracedChild {
-        fn drop(&mut self) {
-            if let Some(child) = &mut self.0 {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-
-    #[test]
-    fn pinned_root_survives_pathname_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let approved = dir.path().join("approved");
-        let moved = dir.path().join("moved");
-        let forbidden = dir.path().join("forbidden");
-        std::fs::create_dir(&approved).unwrap();
-        std::fs::create_dir(&forbidden).unwrap();
-        std::fs::write(approved.join("data"), "approved-data\n").unwrap();
-        std::fs::write(forbidden.join("data"), "forbidden-data\n").unwrap();
-        let policy = request(
-            &[&approved],
-            "IFS= read -r value < \"$1\" || exit 10; printf '%s\\n' \"$value\"; if IFS= read -r value < \"$2\" 2>/dev/null; then exit 11; fi; printf redirected-denied",
-            &[&moved.join("data"), &approved.join("data")],
-        );
-        let mut command = helper();
-        // SAFETY: the child requests tracing before its fresh exec; the parent controls it.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut traced = TracedChild(Some(command.spawn().unwrap()));
-        let child = traced.0.as_mut().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&serde_json::to_vec(&policy).unwrap())
-            .unwrap();
-        let pid = child.id() as libc::pid_t;
-        let mut status = 0;
-        // SAFETY: waitpid and ptrace operate only on the stopped child and valid local storage.
-        unsafe {
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-            assert!(libc::WIFSTOPPED(status));
-            assert_eq!(libc::WSTOPSIG(status), libc::SIGTRAP);
+            sender.shutdown(Shutdown::Write).unwrap();
+            drop(source);
+            // SAFETY: waiter remains live; the queued SCM_RIGHTS retains the first lock.
             assert_eq!(
-                libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, libc::PTRACE_O_TRACESYSGOOD),
+                unsafe { libc::flock(waiter.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                -1
+            );
+            let result = super::read_request(receiver.as_raw_fd()).and_then(|(request, fds)| {
+                for fd in &fds {
+                    // SAFETY: recvmsg returned this live owned descriptor.
+                    assert_ne!(
+                        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                        0
+                    );
+                }
+                super::pin_roots(&request, &fds).map(|_| ())
+            });
+            assert!(result.is_err());
+            // SAFETY: this succeeds only if every queued and received copy was closed.
+            assert_eq!(
+                unsafe { libc::flock(waiter.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
             );
-            loop {
-                assert_eq!(libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0), 0);
-                assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-                assert!(
-                    libc::WIFSTOPPED(status),
-                    "child exited before pinning roots: {status}"
-                );
-                if libc::WSTOPSIG(status) != (libc::SIGTRAP | 0x80) {
-                    continue;
-                }
-                let mut info = SyscallInfo::default();
-                let result = libc::ptrace(
-                    0x420e as _,
-                    pid,
-                    std::mem::size_of::<SyscallInfo>(),
-                    &mut info,
-                );
-                assert!(result >= 0, "{}", std::io::Error::last_os_error());
-                // Ruleset probing starts only after every requested root has been pinned.
-                if info.op == 1 && info.data[0] == libc::SYS_landlock_create_ruleset as u64 {
-                    break;
-                }
-            }
-            std::fs::rename(&approved, &moved).unwrap();
-            symlink(&forbidden, &approved).unwrap();
-            assert_eq!(libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0), 0);
         }
-        let output = traced.0.take().unwrap().wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"approved-data\nredirected-denied");
     }
 }

@@ -8242,6 +8242,7 @@ fn external_target_observations_are_visible_but_not_cleanable() {
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(dir.path())
         .unwrap();
+    fs::set_permissions(cache.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let config = crate::test_support::test_config(cache.path().to_path_buf());
     let store = Store::open(&config).unwrap();
     let snapshot =

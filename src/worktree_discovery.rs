@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INVENTORY_BYTES: u64 = 1 << 20;
+#[cfg(unix)]
+const MAX_GIT_METADATA_BYTES: u64 = 1 << 16;
 /// How long Git may take to list one worktree's ignored directories.
 const LISTING_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LISTING_BYTES: u64 = 4 << 20;
@@ -457,6 +459,37 @@ fn configured_repositories(
     repositories
 }
 
+#[cfg(unix)]
+fn read_git_metadata(path: &Path) -> std::io::Result<Option<String>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    let mut text = String::new();
+    file.take(MAX_GIT_METADATA_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_GIT_METADATA_BYTES {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(Some(text))
+}
+
+#[cfg(not(unix))]
+fn read_git_metadata(_path: &Path) -> std::io::Result<Option<String>> {
+    // Portable file opening cannot exclude blocking special files.
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// The Git directory every worktree of the repository holding `path`
 /// shares, read from the filesystem without running Git: the nearest
 /// `.git` directory, or the one a worktree's `.git` file points to through
@@ -468,24 +501,39 @@ fn repository_of(
 ) -> Option<PathBuf> {
     let safe =
         |path: &Path| !shielded(path, homes) && local_only.is_none_or(|is_local| is_local(path));
-    let dot_git = path
-        .ancestors()
-        .map(|dir| dir.join(".git"))
-        .find(|dot_git| std::fs::symlink_metadata(dot_git).is_ok())?;
+    let mut dot_git = None;
+    for dir in path.ancestors() {
+        let candidate = dir.join(".git");
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                dot_git = Some(candidate);
+                break;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    let dot_git = dot_git?;
     if dot_git.is_dir() {
         let common = dot_git.canonicalize().ok()?;
         return safe(&common).then_some(common);
     }
-    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let text = read_git_metadata(&dot_git).ok()??;
     let git_dir = Path::new(text.strip_prefix("gitdir:")?.trim());
     let git_dir = dot_git.parent()?.join(git_dir).canonicalize().ok()?;
     if !safe(&git_dir) {
         return None;
     }
-    let common = std::fs::read_to_string(git_dir.join("commondir"))
-        .map_or_else(|_| git_dir.clone(), |common| git_dir.join(common.trim()))
-        .canonicalize()
-        .ok()?;
+    let common = match read_git_metadata(&git_dir.join("commondir")).ok()? {
+        Some(common) => git_dir.join(common.trim()),
+        None => git_dir,
+    }
+    .canonicalize()
+    .ok()?;
     safe(&common).then_some(common)
 }
 
@@ -1338,6 +1386,275 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn assert_repository_rejects_fifo(common: bool) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let git_dir = dir.path().join("git-dir");
+        let common_dir = dir.path().join("common-dir");
+        for path in [&repo, &git_dir, &common_dir] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let (fifo, contents) = if common {
+            std::fs::write(
+                repo.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+            (
+                git_dir.join("commondir"),
+                format!("{}\n", common_dir.display()),
+            )
+        } else {
+            (
+                repo.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+        };
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        writer.write_all(contents.as_bytes()).unwrap();
+        drop(writer);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_discovery::tests::repository_fifo_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_FIFO_REPOSITORY", &repo)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !timed_out && output.status.success() && stdout.contains("1 passed"),
+            "FIFO at {} timed out: {timed_out}; stdout: {stdout}; stderr: {}",
+            fifo.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_rejects_dot_git_fifo_without_blocking() {
+        assert_repository_rejects_fifo(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_rejects_commondir_fifo_without_blocking() {
+        assert_repository_rejects_fifo(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture for FIFO metadata"]
+    fn repository_fifo_child() {
+        let repo = PathBuf::from(std::env::var_os("KACHE_TEST_FIFO_REPOSITORY").unwrap());
+        assert_eq!(repository_of(&repo, &[], None), None);
+    }
+
+    #[cfg(unix)]
+    fn git_metadata_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("repo");
+        let git_dir = base.join("git-dir");
+        let common = base.join("common");
+        for path in [&repo, &git_dir, &common] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(
+            repo.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        (dir, repo, git_dir, common)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_accepts_bounded_git_metadata_and_rejects_oversized_files() {
+        let (_dir, repo, git_dir, common) = git_metadata_fixture();
+        let padded = |text: String| {
+            let mut text = text;
+            text.push_str(&" ".repeat((1 << 16) - text.len()));
+            text
+        };
+        let mut dot_git = padded(format!("gitdir: {}", git_dir.display()));
+        std::fs::write(repo.join(".git"), &dot_git).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), Some(git_dir.clone()));
+        dot_git.push(' ');
+        std::fs::write(repo.join(".git"), &dot_git).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+
+        std::fs::write(repo.join(".git"), format!("gitdir: {}", git_dir.display())).unwrap();
+        let mut commondir = padded(common.display().to_string());
+        std::fs::write(git_dir.join("commondir"), &commondir).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), Some(common));
+        commondir.push(' ');
+        std::fs::write(git_dir.join("commondir"), &commondir).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_rejects_invalid_or_symlinked_dot_git_files() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, repo, git_dir, _) = git_metadata_fixture();
+        let dot_git = repo.join(".git");
+        std::fs::write(&dot_git, b"gitdir: \xff").unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+        let target = dir.path().join("git-file");
+        std::fs::write(&target, format!("gitdir: {}", git_dir.display())).unwrap();
+        std::fs::remove_file(&dot_git).unwrap();
+        symlink(target, &dot_git).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_rejects_invalid_or_special_commondir_instead_of_falling_back() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let (dir, repo, git_dir, common) = git_metadata_fixture();
+        let commondir = git_dir.join("commondir");
+        assert_eq!(repository_of(&repo, &[], None), Some(git_dir));
+        std::fs::write(&commondir, b"\xff").unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+        std::fs::remove_file(&commondir).unwrap();
+        let target = dir.path().join("common-file");
+        std::fs::write(&target, common.display().to_string()).unwrap();
+        symlink(&target, &commondir).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+        std::fs::remove_file(&commondir).unwrap();
+        symlink(dir.path().join("missing"), &commondir).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+        std::fs::remove_file(&commondir).unwrap();
+        std::fs::create_dir(&commondir).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+        std::fs::remove_dir(&commondir).unwrap();
+        let _socket = UnixListener::bind(&commondir).unwrap();
+        assert_eq!(repository_of(&repo, &[], None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_checks_git_and_common_directories_before_resolving_them() {
+        use std::cell::RefCell;
+
+        let (_dir, repo, git_dir, common) = git_metadata_fixture();
+        std::fs::write(git_dir.join("commondir"), common.display().to_string()).unwrap();
+        let visited = RefCell::new(Vec::new());
+        let local = |path: &Path| {
+            visited.borrow_mut().push(path.to_path_buf());
+            path != common
+        };
+        assert_eq!(repository_of(&repo, &[], Some(&local)), None);
+        assert_eq!(*visited.borrow(), [git_dir.clone(), common.clone()]);
+        visited.borrow_mut().clear();
+        assert_eq!(
+            repository_of(&repo, std::slice::from_ref(&git_dir), Some(&local)),
+            None
+        );
+        assert!(visited.borrow().is_empty());
+        assert_eq!(
+            repository_of(&repo, std::slice::from_ref(&common), Some(&local)),
+            None
+        );
+        assert_eq!(visited.borrow().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_does_not_skip_metadata_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let blocked = repo.join("blocked");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = std::fs::symlink_metadata(blocked.join(".git")).unwrap_err();
+        let repository = repository_of(&blocked, &[], None);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            assert_eq!(repository, None);
+        }
+        let file = repo.join("file");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            repository_of(&file, &[], None),
+            Some(repo.join(".git").canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_accepts_a_separate_git_directory_without_commondir() {
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let git_dir = dir.path().join("git-dir");
+        let output = Command::new("git")
+            .args(["init", "-q", "--separate-git-dir"])
+            .arg(&git_dir)
+            .arg(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!git_dir.join("commondir").exists());
+        assert_eq!(
+            repository_of(&repo, &[], None),
+            Some(git_dir.canonicalize().unwrap())
+        );
+    }
+
     #[test]
     fn a_repository_and_its_worktrees_share_one_key() {
         if Command::new("git")
@@ -1358,7 +1675,10 @@ mod tests {
             repository_of(&repo.join("deep/inside"), &[], None),
             Some(key.clone())
         );
+        #[cfg(unix)]
         assert_eq!(repository_of(&worktree, &[], None), Some(key));
+        #[cfg(not(unix))]
+        assert_eq!(repository_of(&worktree, &[], None), None);
         assert_eq!(repository_of(Path::new("/"), &[], None), None);
     }
 

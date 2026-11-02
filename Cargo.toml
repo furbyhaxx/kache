@@ -133,9 +133,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
 ] }
 
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { version = "1.1.4", features = ["fs"] }
-
 [dev-dependencies]
 kache-store = { version = "1.2.2", path = "crates/kache-store", features = ["test-support"] }
 kache-fs = { version = "1.2.2", path = "crates/kache-fs", features = ["testing"] }

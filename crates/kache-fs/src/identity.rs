@@ -434,7 +434,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn export_handle_follows_the_pinned_directory_through_replacement() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{OpenOptionsExt, symlink};
 
         let dir = ExportTestDir::new();
         let path = dir.0.join("target");
@@ -444,7 +444,11 @@ mod tests {
         fs::create_dir(&workspace).unwrap();
         let link = workspace.join("target");
         symlink("../target", &link).unwrap();
-        let pinned = fs::File::open(&link).unwrap();
+        let pinned = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(&link)
+            .unwrap();
         let original = match export_file_handle(&pinned) {
             Ok(handle) => handle,
             Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
@@ -468,13 +472,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn unique_mount_id_follows_the_pinned_directory_through_replacement() {
-        use std::os::fd::AsRawFd;
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 
         let dir = ExportTestDir::new();
         let path = dir.0.join("target");
         let moved = dir.0.join("moved");
         fs::create_dir(&path).unwrap();
-        let pinned = fs::File::open(&path).unwrap();
+        let pinned = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+            .open(&path)
+            .unwrap();
 
         let mut stat = StatxBuffer::new();
         // SAFETY: pinned owns a live FD, AT_EMPTY_PATH uses the NUL-terminated

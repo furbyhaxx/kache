@@ -8229,7 +8229,7 @@ fn the_targets_table_says_nothing_about_unit_cleanup_unless_it_is_on() {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn external_target_observations_are_visible_but_not_cleanable() {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -8238,7 +8238,11 @@ fn external_target_observations_are_visible_but_not_cleanable() {
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&backing).unwrap();
     symlink(&backing, workspace.join("target")).unwrap();
-    let config = crate::test_support::test_config(dir.path().join("cache"));
+    let cache = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(dir.path())
+        .unwrap();
+    let config = crate::test_support::test_config(cache.path().to_path_buf());
     let store = Store::open(&config).unwrap();
     let snapshot =
         kache_store::filesystem::snapshot_workspace_target(&workspace, &storage, &[]).unwrap();

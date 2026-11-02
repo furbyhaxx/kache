@@ -534,11 +534,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn unique_mount_id_rejects_legacy_masks_and_preserves_other_errors() {
-        for mask in [
-            0,
-            libc::STATX_MNT_ID,
-            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
-        ] {
+        const STATX_MNT_ID: u32 = 0x0000_1000;
+        const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+        for mask in [0, STATX_MNT_ID, STATX_BASIC_STATS | STATX_MNT_ID] {
             assert_eq!(
                 checked_unique_mount_id(Ok((mask, 123))).unwrap_err().kind(),
                 io::ErrorKind::Unsupported
@@ -549,7 +547,7 @@ mod tests {
             123
         );
         assert_eq!(
-            checked_unique_mount_id(Ok((0x0000_4000 | libc::STATX_MNT_ID, 0))).unwrap(),
+            checked_unique_mount_id(Ok((0x0000_4000 | STATX_MNT_ID, 0))).unwrap(),
             0
         );
         for code in [libc::ENOSYS, libc::EOPNOTSUPP] {

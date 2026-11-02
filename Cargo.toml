@@ -133,6 +133,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+
 [dev-dependencies]
 kache-store = { version = "1.2.2", path = "crates/kache-store", features = ["test-support"] }
 kache-fs = { version = "1.2.2", path = "crates/kache-fs", features = ["testing"] }

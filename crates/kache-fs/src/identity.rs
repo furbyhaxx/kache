@@ -1,6 +1,118 @@
 use crate::InodeId;
 use std::{fs, io, path::Path};
 
+/// A filesystem-specific opaque export handle.
+///
+/// Handles can be reused or replayed and do not establish a trusted volume
+/// incarnation. A handle alone must not authorize adoption, reads, or deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpaqueFileHandle {
+    /// The filesystem-defined handle type returned by the kernel.
+    pub handle_type: i32,
+    /// The filesystem-defined opaque handle bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// An opaque handle and the mount identifier observed when exporting it.
+///
+/// Compare `handle` independently of `mount_id`: bind aliases can have
+/// different mount IDs. Mount IDs are not persistent and can be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedFileHandle {
+    /// The filesystem-specific handle, which is not an authorization.
+    pub handle: OpaqueFileHandle,
+    /// The nonpersistent mount identifier returned by the kernel.
+    pub mount_id: i32,
+}
+
+/// Export a handle for the object pinned by an already-open file descriptor.
+///
+/// On Linux this uses `name_to_handle_at` with `AT_EMPTY_PATH`; it does not
+/// reopen a pathname. The returned handle alone must not authorize adoption,
+/// reads, or deletion. See [`OpaqueFileHandle`] for its identity limitations.
+///
+/// # Errors
+///
+/// On Linux, propagates syscall errors, including unsupported filesystems, and
+/// rejects a returned length exceeding the buffer. On other platforms, returns
+/// [`io::ErrorKind::Unsupported`].
+pub fn export_file_handle(file: &fs::File) -> io::Result<ExportedFileHandle> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mut buffer = ExportHandleBuffer::new();
+        let mut mount_id: libc::c_int = 0;
+        // SAFETY: file stays open, c"" is NUL-terminated, and buffer is aligned
+        // with MAX_HANDLE_SZ writable bytes immediately following its C header.
+        // mount_id points to a writable int and no 64-bit mount-ID flag is used.
+        let result = unsafe {
+            libc::name_to_handle_at(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                (&raw mut buffer).cast(),
+                &raw mut mount_id,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buffer.exported(mount_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "file handle export is only supported on Linux",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct ExportHandleBuffer {
+    header: libc::file_handle,
+    bytes: [u8; libc::MAX_HANDLE_SZ as usize],
+}
+
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    std::mem::offset_of!(ExportHandleBuffer, bytes)
+        == std::mem::offset_of!(libc::file_handle, f_handle)
+);
+
+#[cfg(target_os = "linux")]
+impl ExportHandleBuffer {
+    fn new() -> Self {
+        Self {
+            header: libc::file_handle {
+                handle_bytes: libc::MAX_HANDLE_SZ as libc::c_uint,
+                handle_type: 0,
+                f_handle: [],
+            },
+            bytes: [0; libc::MAX_HANDLE_SZ as usize],
+        }
+    }
+
+    fn exported(&self, mount_id: i32) -> io::Result<ExportedFileHandle> {
+        let Some(bytes) = self.bytes.get(..self.header.handle_bytes as usize) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "export handle length exceeds buffer capacity",
+            ));
+        };
+        Ok(ExportedFileHandle {
+            handle: OpaqueFileHandle {
+                handle_type: self.header.handle_type,
+                bytes: bytes.to_vec(),
+            },
+            mount_id,
+        })
+    }
+}
+
 /// Identity of the object at `path`, following symlinks. Valid for comparing
 /// live objects on this host; an inode can be reused after deletion.
 pub fn file_identity(path: &Path) -> io::Result<InodeId> {
@@ -192,6 +304,120 @@ mod tests {
         assert_ne!(
             handle_identity(&handle).unwrap(),
             file_identity(&path).unwrap()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ExportTestDir(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl ExportTestDir {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+
+            for attempt in 0..1000 {
+                let path = std::env::temp_dir().join(format!(
+                    "kache-fs-export-handle-{}-{attempt}",
+                    std::process::id()
+                ));
+                match fs::DirBuilder::new().mode(0o700).create(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("failed to create private test directory: {error}"),
+                }
+            }
+            panic!("could not allocate a private test directory");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ExportTestDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn export_handle_follows_the_pinned_directory_through_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let dir = ExportTestDir::new();
+        let path = dir.0.join("target");
+        let moved = dir.0.join("moved");
+        let workspace = dir.0.join("workspace");
+        fs::create_dir(&path).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let link = workspace.join("target");
+        symlink("../target", &link).unwrap();
+        let pinned = fs::File::open(&link).unwrap();
+        let original = match export_file_handle(&pinned) {
+            Ok(handle) => handle,
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                eprintln!("filesystem does not support export handles: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to export the pinned directory: {error}"),
+        };
+
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let pinned_after = export_file_handle(&pinned).unwrap();
+        let renamed = export_file_handle(&fs::File::open(&moved).unwrap()).unwrap();
+        let replacement = export_file_handle(&fs::File::open(&link).unwrap()).unwrap();
+        assert_eq!(original.handle, pinned_after.handle);
+        assert_eq!(original.handle, renamed.handle);
+        assert_ne!(original.handle, replacement.handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn export_handle_rejects_an_unexportable_socket() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let socket = fs::File::from(fd);
+        let error = export_file_handle(&socket).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn export_handle_preserves_type_and_rejects_invalid_lengths() {
+        let mut buffer = ExportHandleBuffer::new();
+        buffer.header.handle_type = 129;
+        buffer.header.handle_bytes = 3;
+        buffer.bytes[..3].copy_from_slice(&[1, 2, 3]);
+        let exported = buffer.exported(42).unwrap();
+        assert_eq!(exported.handle.handle_type, 129);
+        assert_eq!(exported.handle.bytes, [1, 2, 3]);
+        assert_eq!(exported.mount_id, 42);
+
+        for length in [0, libc::MAX_HANDLE_SZ as u32] {
+            buffer.header.handle_bytes = length;
+            assert_eq!(
+                buffer.exported(42).unwrap().handle.bytes.len(),
+                length as usize
+            );
+        }
+        buffer.header.handle_bytes = libc::MAX_HANDLE_SZ as u32 + 1;
+        assert_eq!(
+            buffer.exported(42).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn export_handle_is_unsupported_off_linux() {
+        let dir = TempDir::new("export-handle-unsupported");
+        let file = fs::File::open(dir.write("file", 1)).unwrap();
+        assert_eq!(
+            export_file_handle(&file).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
         );
     }
 

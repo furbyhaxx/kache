@@ -511,8 +511,11 @@ pub(crate) struct VerifiedWatchLimits {
 /// the returned guard. A probe cannot detect unobserved temporary remounts, so
 /// mount read-observation options must remain unchanged throughout the window.
 /// Uncooperative processes and split build-directory aliases are not protected;
-/// the caller must prevent concurrent mount events and new profiles. Both stages
-/// fail closed on budget exhaustion, but cannot interrupt a stuck filesystem syscall.
+/// the caller must prevent concurrent mount events and new profiles. Watch records
+/// are keyed by path, so the caller must deduplicate all paths and bind aliases of
+/// each backing directory for the entire watch; the lock only serializes passes.
+/// Both stages fail closed on budget exhaustion, but cannot interrupt a stuck
+/// filesystem syscall.
 #[allow(dead_code)]
 pub(crate) fn verified_watch(
     cache_dir: &Path,
@@ -1317,7 +1320,7 @@ fn verified_watch_with(
 
     let mut final_budget = VerifiedBudget::new(ops.limits.final_check);
     final_budget.check()?;
-    let reservation = crate::target_use::try_exclusive(cache_dir).ok()??;
+    let reservation = crate::target_use::try_exclusive_unrecorded(cache_dir).ok()??;
     let final_valid = evidence.revalidate(&mut final_budget, ops).is_some()
         && (ops.uptime)()
             .and_then(|uptime| uptime.checked_sub(started))
@@ -1904,6 +1907,97 @@ mod tests {
         });
         assert!(verified_test_watch(&other_cache, &alias, now, Some("boot-a")).is_none());
         assert!(verified_record(&other_cache, &alias).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_watch_and_waiting_cargo_do_not_block_on_holder_fifo() {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let Some(fixture) = std::env::var_os("KACHE_TEST_WATCH_FIFO_DIR") else {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("unit_prune::tests::verified_watch_and_waiting_cargo_do_not_block_on_holder_fifo")
+                .arg("--nocapture")
+                .env("KACHE_TEST_WATCH_FIFO_DIR", dir.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "watch or waiting Cargo blocked on the holder FIFO: {} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let cache = Path::new(&fixture).join("cache");
+        let target = Path::new(&fixture).join("target");
+        per_unit_profile(&target.join("debug"));
+        set_times(&target, ago(40));
+        let start = SystemTime::now() - Duration::from_secs(2 * DAY);
+        let window = Duration::from_secs(12 * 3600);
+        assert!(verified_test_watch(&cache, &target, start, Some("boot-a")).is_none());
+        let fifo = cache.join("target-use.holder");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a NUL-terminated name inside the isolated test directory.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let guard = verified_test_watch(&cache, &target, start + window, Some("boot-a"))
+            .expect("an idle target should produce a guard");
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let cache_for_thread = cache.clone();
+        let cargo = std::thread::spawn(move || {
+            crate::target_use::shared(&cache_for_thread, "cargo build", &mut writer).unwrap()
+        });
+        let expected = b"kache: waiting for target cleanup to finish\n";
+        let mut notice = vec![0; expected.len()];
+        reader
+            .read_exact(&mut notice)
+            .expect("Cargo notice blocked on the FIFO");
+        assert_eq!(&notice, expected);
+        assert!(!cargo.is_finished());
+        drop(guard);
+        let lease = cargo.join().unwrap();
+        assert!(crate::target_use::try_exclusive(&cache).unwrap().is_none());
+        drop(lease);
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -2,8 +2,10 @@
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+const MAX_HOLDER_BYTES: usize = 64;
 
 /// Unlock explicitly before closing: a concurrent fork can briefly inherit
 /// the descriptor, even though it closes on exec. A shared lease also leaves
@@ -38,17 +40,18 @@ pub(crate) struct Holder {
     pub(crate) since: u64,
 }
 
-/// The exclusive lease cleanup holds. While it is held, a file in the cache
-/// directory names this process to the commands waiting for it. The file goes
-/// before the lock does, so it never takes the next holder's with it.
+/// The exclusive lease cleanup holds. Recorded reservations remove their
+/// diagnostic before the lock goes, so they never take the next holder's.
 pub(crate) struct Reservation {
-    holder: PathBuf,
+    holder: Option<PathBuf>,
     _lease: Lease,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.holder);
+        if let Some(holder) = &self.holder {
+            let _ = std::fs::remove_file(holder);
+        }
     }
 }
 
@@ -177,28 +180,57 @@ fn quiet<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> bool {
 /// What a command waiting for cleanup says, with the cleanup's process when
 /// it left a record.
 fn waiting(cache_dir: &Path) -> String {
-    let pid = std::fs::read_to_string(holder_record(cache_dir))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok());
+    let pid = (|| {
+        let path = holder_record(cache_dir);
+        if !std::fs::metadata(&path).ok()?.is_file() {
+            return None;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The path can become a FIFO after the type check.
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut text = String::new();
+        file.take((MAX_HOLDER_BYTES + 1) as u64)
+            .read_to_string(&mut text)
+            .ok()?;
+        if text.len() > MAX_HOLDER_BYTES {
+            return None;
+        }
+        text.trim().parse::<u32>().ok()
+    })();
     match pid {
         Some(pid) => format!("kache: waiting for target cleanup (pid {pid}) to finish\n"),
         None => "kache: waiting for target cleanup to finish\n".to_owned(),
     }
 }
 
-/// Reserve deletion without waiting for a running command.
+/// Reserve deletion without waiting for a running command, recording its holder.
 pub(crate) fn try_exclusive(cache_dir: &Path) -> io::Result<Option<Reservation>> {
+    let Some(mut reservation) = try_exclusive_unrecorded(cache_dir)? else {
+        return Ok(None);
+    };
+    let holder = holder_record(cache_dir);
+    let _ = std::fs::write(&holder, std::process::id().to_string());
+    reservation.holder = Some(holder);
+    Ok(Some(reservation))
+}
+
+/// Reserve without creating or removing a holder diagnostic; an old one may remain.
+pub(crate) fn try_exclusive_unrecorded(cache_dir: &Path) -> io::Result<Option<Reservation>> {
     let file = open(cache_dir)?;
     match file.try_lock() {
-        Ok(()) => {
-            let lease = Lease::new(file);
-            let holder = holder_record(cache_dir);
-            let _ = std::fs::write(&holder, std::process::id().to_string());
-            Ok(Some(Reservation {
-                holder,
-                _lease: lease,
-            }))
-        }
+        Ok(()) => Ok(Some(Reservation {
+            holder: None,
+            _lease: Lease::new(file),
+        })),
         Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(error)) => Err(error),
     }
@@ -244,6 +276,34 @@ mod tests {
         assert_eq!(blockers(dir.path()), None);
         // The probe leaves no record of its own behind.
         assert!(try_exclusive(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unrecorded_reservation_leaves_the_holder_path_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = holder_record(dir.path());
+        let reservation = try_exclusive_unrecorded(dir.path()).unwrap().unwrap();
+        assert!(!holder.exists());
+        assert!(try_exclusive(dir.path()).unwrap().is_none());
+        drop(reservation);
+        assert!(!holder.exists());
+
+        std::fs::write(&holder, "existing diagnostic").unwrap();
+        let reservation = try_exclusive_unrecorded(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&holder).unwrap(),
+            "existing diagnostic"
+        );
+        drop(reservation);
+        assert_eq!(
+            std::fs::read_to_string(&holder).unwrap(),
+            "existing diagnostic"
+        );
+
+        let reservation = try_exclusive(dir.path()).unwrap().unwrap();
+        assert_eq!(waiting(dir.path()), naming(std::process::id()));
+        drop(reservation);
+        assert!(!holder.exists());
     }
 
     #[test]
@@ -326,6 +386,13 @@ mod tests {
         drop(cleanup);
         assert_eq!(waiting(dir.path()), anonymous);
         std::fs::write(holder_record(dir.path()), "not a pid").unwrap();
+        assert_eq!(waiting(dir.path()), anonymous);
+        std::fs::write(holder_record(dir.path()), "  123\n").unwrap();
+        assert_eq!(waiting(dir.path()), naming(123));
+        std::fs::write(holder_record(dir.path()), "0".repeat(65)).unwrap();
+        assert_eq!(waiting(dir.path()), anonymous);
+        std::fs::remove_file(holder_record(dir.path())).unwrap();
+        std::fs::create_dir(holder_record(dir.path())).unwrap();
         assert_eq!(waiting(dir.path()), anonymous);
     }
 

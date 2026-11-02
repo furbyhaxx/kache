@@ -1,6 +1,10 @@
 use crate::InodeId;
 use std::{fs, io, path::Path};
 
+// Linux UAPI value absent from the locked libc 0.2.189.
+#[cfg(target_os = "linux")]
+const STATX_MNT_ID_UNIQUE: libc::c_uint = 0x0000_4000;
+
 /// A filesystem-specific opaque export handle.
 ///
 /// Handles can be reused or replayed and do not establish a trusted volume
@@ -110,6 +114,66 @@ impl ExportHandleBuffer {
             },
             mount_id,
         })
+    }
+}
+
+/// Return the unique mount ID of the object pinned by an open file.
+///
+/// IDs are guaranteed unique only until reboot, and bind aliases can have
+/// different IDs. An ID does not prove volume or snapshot incarnation,
+/// establish consent, or authorize adoption, reads, or deletion.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::Unsupported`] when unique mount IDs are unavailable
+/// or on non-Linux platforms. Other syscall errors are preserved.
+pub fn unique_mount_id(file: &fs::File) -> io::Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: statx consists only of integer fields and padding.
+        let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: file owns a live FD, AT_EMPTY_PATH uses it with a valid
+        // NUL-terminated empty path, and stat is a writable statx buffer.
+        let result = unsafe {
+            libc::statx(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                STATX_MNT_ID_UNIQUE,
+                &raw mut stat,
+            )
+        };
+        let result = if result == 0 {
+            Ok((stat.stx_mask, stat.stx_mnt_id))
+        } else {
+            Err(io::Error::last_os_error())
+        };
+        checked_unique_mount_id(result)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unique mount IDs are only supported on Linux",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn checked_unique_mount_id(result: io::Result<(u32, u64)>) -> io::Result<u64> {
+    match result {
+        Ok((mask, id)) if mask & STATX_MNT_ID_UNIQUE != 0 => Ok(id),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel did not return a unique mount ID",
+        )),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EOPNOTSUPP)) => {
+            Err(io::Error::new(io::ErrorKind::Unsupported, error))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -369,6 +433,122 @@ mod tests {
         assert_eq!(original.handle, pinned_after.handle);
         assert_eq!(original.handle, renamed.handle);
         assert_ne!(original.handle, replacement.handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unique_mount_id_follows_the_pinned_directory_through_replacement() {
+        use std::os::fd::AsRawFd;
+
+        let dir = ExportTestDir::new();
+        let path = dir.0.join("target");
+        let moved = dir.0.join("moved");
+        fs::create_dir(&path).unwrap();
+        let pinned = fs::File::open(&path).unwrap();
+
+        // SAFETY: statx consists only of integer fields and padding.
+        let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+        // SAFETY: pinned owns a live FD, the empty path is NUL-terminated,
+        // and stat is a correctly typed writable output buffer.
+        let result = unsafe {
+            libc::statx(
+                pinned.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                0x0000_4000,
+                &raw mut stat,
+            )
+        };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EOPNOTSUPP)
+            ));
+            assert_eq!(
+                unique_mount_id(&pinned).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+            eprintln!("unique mount ID is unsupported: {error}");
+            return;
+        }
+        if stat.stx_mask & 0x0000_4000 == 0 {
+            assert_eq!(
+                unique_mount_id(&pinned).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+            eprintln!("kernel did not return the unique mount ID bit");
+            return;
+        }
+        let original = unique_mount_id(&pinned).unwrap();
+        assert_eq!(original, stat.stx_mnt_id);
+        eprintln!("kernel returned the unique mount ID bit");
+
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        let renamed = fs::File::open(&moved).unwrap();
+        let replacement = fs::File::open(&path).unwrap();
+        assert_eq!(
+            handle_identity(&pinned).unwrap(),
+            handle_identity(&renamed).unwrap()
+        );
+        assert_ne!(
+            handle_identity(&pinned).unwrap(),
+            handle_identity(&replacement).unwrap()
+        );
+        assert_eq!(unique_mount_id(&pinned).unwrap(), original);
+        assert_eq!(unique_mount_id(&renamed).unwrap(), original);
+        assert_eq!(unique_mount_id(&replacement).unwrap(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unique_mount_id_rejects_legacy_masks_and_preserves_other_errors() {
+        for mask in [
+            0,
+            libc::STATX_MNT_ID,
+            libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
+        ] {
+            assert_eq!(
+                checked_unique_mount_id(Ok((mask, 123))).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        assert_eq!(
+            checked_unique_mount_id(Ok((0x0000_4000, 123))).unwrap(),
+            123
+        );
+        assert_eq!(
+            checked_unique_mount_id(Ok((0x0000_4000 | libc::STATX_MNT_ID, 0))).unwrap(),
+            0
+        );
+        for code in [libc::ENOSYS, libc::EOPNOTSUPP] {
+            assert_eq!(
+                checked_unique_mount_id(Err(io::Error::from_raw_os_error(code)))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+        for code in [libc::EBADF, libc::EACCES, libc::EINVAL, libc::EIO] {
+            assert_eq!(
+                checked_unique_mount_id(Err(io::Error::from_raw_os_error(code)))
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(code)
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unique_mount_id_is_unsupported_off_linux() {
+        let dir = TempDir::new("unique-mount-id-unsupported");
+        let file = fs::File::open(dir.write("file", 1)).unwrap();
+        assert_eq!(
+            unique_mount_id(&file).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 
     #[cfg(target_os = "linux")]

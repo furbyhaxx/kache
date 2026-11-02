@@ -592,32 +592,45 @@ fn unavailable_or_failed_restrictions_never_launch() {
 
 #[test]
 fn inherited_descriptors_are_closed_on_exec() {
+    use std::io::Seek;
+
+    fn inherit_at_nine(command: &mut Command, source: RawFd) {
+        if source == 9 {
+            inherit_fds(command, vec![source]);
+        } else {
+            // SAFETY: source stays open through spawn; dup2 changes only the child.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(source, 9) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let secret = dir.path().join("secret");
     std::fs::write(&secret, "forbidden-data\n").unwrap();
-    let source = std::fs::File::open(&secret).unwrap();
-    let script = "if [ -e /proc/self/fd/\"$1\" ]; then printf leaked; else printf closed; fi";
+    let mut source = std::fs::File::open(&secret).unwrap();
+    let script = "if IFS= read -r value 2>/dev/null <&9; then printf 'leaked:%s' \"$value\"; else printf closed; fi";
     let mut baseline = Command::new("/bin/sh");
     baseline
         .env_clear()
-        .args([
-            "-c",
-            script,
-            "sandbox-test",
-            &source.as_raw_fd().to_string(),
-        ])
+        .args(["-c", script, "sandbox-test"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    inherit_fds(&mut baseline, vec![source.as_raw_fd()]);
+    inherit_at_nine(&mut baseline, source.as_raw_fd());
     let output = baseline.output().unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"leaked");
+    assert_eq!(output.stdout, b"leaked:forbidden-data");
+    source.rewind().unwrap();
 
-    let mut policy = request(&[], script, &[]);
-    policy.request["argv"] = json!(["-c", script, "sandbox-test", source.as_raw_fd().to_string()]);
+    let policy = request(&[], script, &[]);
     let mut command = helper();
-    inherit_fds(&mut command, vec![source.as_raw_fd()]);
+    inherit_at_nine(&mut command, source.as_raw_fd());
     let output = run_bytes(
         command,
         &serde_json::to_vec(&policy.request).unwrap(),

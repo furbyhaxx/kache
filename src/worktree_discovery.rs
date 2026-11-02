@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_INVENTORY_BYTES: u64 = 1 << 20;
-#[cfg(unix)]
 const MAX_GIT_METADATA_BYTES: u64 = 1 << 16;
 /// How long Git may take to list one worktree's ignored directories.
 const LISTING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -459,15 +458,15 @@ fn configured_repositories(
     repositories
 }
 
-#[cfg(unix)]
 fn read_git_metadata(path: &Path) -> std::io::Result<Option<String>> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -482,12 +481,6 @@ fn read_git_metadata(path: &Path) -> std::io::Result<Option<String>> {
         return Err(std::io::ErrorKind::InvalidData.into());
     }
     Ok(Some(text))
-}
-
-#[cfg(not(unix))]
-fn read_git_metadata(_path: &Path) -> std::io::Result<Option<String>> {
-    // Portable file opening cannot exclude blocking special files.
-    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// The Git directory every worktree of the repository holding `path`
@@ -1675,10 +1668,7 @@ mod tests {
             repository_of(&repo.join("deep/inside"), &[], None),
             Some(key.clone())
         );
-        #[cfg(unix)]
         assert_eq!(repository_of(&worktree, &[], None), Some(key));
-        #[cfg(not(unix))]
-        assert_eq!(repository_of(&worktree, &[], None), None);
         assert_eq!(repository_of(Path::new("/"), &[], None), None);
     }
 

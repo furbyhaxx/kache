@@ -5,9 +5,10 @@
 //! leads to its repository, and from there to the other repositories in the
 //! same folders. Git lists each repository's worktrees and, in each, the
 //! directories it ignores; every ignored `target/` Cargo has tagged is
-//! recorded. Ignored target symlinks under configured external roots are
-//! recorded separately as untrusted observations. Discovery does not claim
-//! completeness of source roots or aliases, or authorize cleanup.
+//! recorded. Explicit repository roots also supply worktrees for external
+//! inventory without tracking their targets. Ignored target symlinks under
+//! configured external roots are recorded separately as untrusted observations.
+//! Discovery does not claim completeness of source roots or aliases, or authorize cleanup.
 
 use crate::config::Config;
 use crate::maintenance::{Trigger, is_quiet, unix_now_secs};
@@ -28,6 +29,9 @@ const MAX_LISTING_BYTES: u64 = 4 << 20;
 const MAX_EXTERNAL_RECORDS: usize = 8;
 /// Source roots one discovery pass may probe for external inventory.
 const MAX_EXTERNAL_SOURCES: usize = 16;
+/// Configured repository roots and directory entries inspected per pass.
+const MAX_REPOSITORY_ROOTS: usize = 16;
+const MAX_REPOSITORY_ENTRIES_PER_ROOT: usize = 32;
 /// Repositories one discovery pass may ask Git about.
 const DISCOVERY_STEPS: usize = 2_000;
 /// How long one discovery pass may spend.
@@ -42,6 +46,13 @@ const LAST_RUN_FILE: &str = "target-discovery.last";
 /// When this process last ran discovery, for a volume too full to keep
 /// [`LAST_RUN_FILE`]: `0` before the first run.
 static LAST_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REPOSITORY_TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct ExternalRoots<'a> {
+    targets: &'a [PathBuf],
+    repositories: &'a [PathBuf],
+}
 
 /// Whether a run last at `last` (Unix seconds, `0` for never) is stale at
 /// `now`. A clock set back behind it does not stop discovery.
@@ -80,9 +91,11 @@ pub(crate) fn run(config: &Config, trigger: Trigger<'_>) -> bool {
     if let Err(error) = crate::atomic::atomic_replace(&record, now.to_string().as_bytes()) {
         tracing::warn!("cannot record the target discovery time: {error:#}");
     }
-    match Store::open(config)
-        .and_then(|store| discover(&store, &config.external_target_roots, DISCOVERY_TIME, now))
-    {
+    let roots = ExternalRoots {
+        targets: &config.external_target_roots,
+        repositories: &config.external_repository_roots,
+    };
+    match Store::open(config).and_then(|store| discover(&store, roots, DISCOVERY_TIME, now)) {
         Ok(0) => {}
         Ok(found) => tracing::info!("found {found} target directories in Git worktrees"),
         Err(error) => tracing::warn!("target discovery failed: {error:#}"),
@@ -384,24 +397,96 @@ fn repositories_in(dir: PathBuf, deadline: Instant) -> impl Iterator<Item = Path
         .filter(|child| std::fs::symlink_metadata(child.join(".git")).is_ok())
 }
 
+fn configured_repositories(
+    roots: &[PathBuf],
+    deadline: Instant,
+    homes: &[PathBuf],
+    turn: u64,
+    is_local: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let offset = (turn % roots.len() as u64) as usize;
+    let mut repositories = Vec::new();
+    for root in roots[offset..]
+        .iter()
+        .chain(&roots[..offset])
+        .take(MAX_REPOSITORY_ROOTS)
+    {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if shielded(root, homes) {
+            continue;
+        }
+        let Ok(root) = root.canonicalize() else {
+            continue;
+        };
+        if shielded(&root, homes) || !root.is_dir() || !is_local(&root) {
+            continue;
+        }
+        let mut add_repository = |path: PathBuf| {
+            if !shielded(&path, homes)
+                && is_local(&path)
+                && std::fs::symlink_metadata(path.join(".git"))
+                    .is_ok_and(|meta| meta.is_dir() || meta.is_file())
+            {
+                repositories.push(path);
+            }
+        };
+        add_repository(root.clone());
+        for entry in std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .take(MAX_REPOSITORY_ENTRIES_PER_ROOT)
+        {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Ok(child) = entry.path().canonicalize() else {
+                continue;
+            };
+            add_repository(child);
+        }
+    }
+    repositories
+}
+
 /// The Git directory every worktree of the repository holding `path`
 /// shares, read from the filesystem without running Git: the nearest
 /// `.git` directory, or the one a worktree's `.git` file points to through
 /// its `commondir`. Two paths in one repository give the same answer.
-fn repository_of(path: &Path) -> Option<PathBuf> {
+fn repository_of(
+    path: &Path,
+    homes: &[PathBuf],
+    local_only: Option<&dyn Fn(&Path) -> bool>,
+) -> Option<PathBuf> {
+    let safe =
+        |path: &Path| !shielded(path, homes) && local_only.is_none_or(|is_local| is_local(path));
     let dot_git = path
         .ancestors()
         .map(|dir| dir.join(".git"))
         .find(|dot_git| std::fs::symlink_metadata(dot_git).is_ok())?;
     if dot_git.is_dir() {
-        return dot_git.canonicalize().ok();
+        let common = dot_git.canonicalize().ok()?;
+        return safe(&common).then_some(common);
     }
     let text = std::fs::read_to_string(&dot_git).ok()?;
     let git_dir = Path::new(text.strip_prefix("gitdir:")?.trim());
-    let git_dir = dot_git.parent()?.join(git_dir);
+    let git_dir = dot_git.parent()?.join(git_dir).canonicalize().ok()?;
+    if !safe(&git_dir) {
+        return None;
+    }
     let common = std::fs::read_to_string(git_dir.join("commondir"))
-        .map_or_else(|_| git_dir.clone(), |common| git_dir.join(common.trim()));
-    common.canonicalize().ok()
+        .map_or_else(|_| git_dir.clone(), |common| git_dir.join(common.trim()))
+        .canonicalize()
+        .ok()?;
+    safe(&common).then_some(common)
 }
 
 /// `items` turned by `turn` places: each pass starts at a different one, so
@@ -499,7 +584,11 @@ fn survey_all(
     homes: &[PathBuf],
     turn: u64,
     include_links: bool,
+    local_only: Option<&dyn Fn(&Path) -> bool>,
 ) -> Vec<Survey> {
+    let can_read = |tree: &&Worktree| {
+        readable(tree, homes) && local_only.is_none_or(|is_local| is_local(&tree.path))
+    };
     // Asked in a turned order, so a pass that runs out of time leaves out
     // different repositories each time; answers go back in the given order.
     let order = rotated((0..repositories.len()).collect(), turn);
@@ -514,7 +603,7 @@ fn survey_all(
         .iter()
         .flatten()
         .flatten()
-        .filter(|tree| readable(tree, homes))
+        .filter(can_read)
         .map(|tree| tree.path.clone())
         .collect();
     let worktrees = rotated(worktrees, turn);
@@ -528,7 +617,7 @@ fn survey_all(
         .zip(inventories)
         .filter_map(|((_, seeds), trees)| {
             let trees = trees?;
-            let available: Vec<_> = trees.iter().filter(|tree| readable(tree, homes)).collect();
+            let available: Vec<_> = trees.iter().filter(can_read).collect();
             let roots = roots_of(&trees);
             let suffixes: BTreeSet<_> = seeds
                 .iter()
@@ -566,6 +655,7 @@ fn by_repository(
     limit: usize,
     deadline: Instant,
     homes: &[PathBuf],
+    local_only: Option<&dyn Fn(&Path) -> bool>,
 ) -> Vec<(PathBuf, Vec<PathBuf>)> {
     let mut order = Vec::new();
     let mut grouped: HashMap<PathBuf, (PathBuf, Vec<PathBuf>)> = HashMap::new();
@@ -576,7 +666,7 @@ fn by_repository(
         if shielded(&start, homes) {
             continue;
         }
-        let Some(repository) = repository_of(&start) else {
+        let Some(repository) = repository_of(&start, homes, local_only) else {
             continue;
         };
         if seen.contains(&repository) {
@@ -607,36 +697,25 @@ fn by_repository(
 /// worktrees sit in: the same workspace in each sibling worktree, and every
 /// tagged `target/` Git ignores in each worktree, within `time`. A custom
 /// target path outside its worktree is known only when a wrapper recorded it.
-pub(crate) fn discover(
-    store: &Store,
-    external_roots: &[PathBuf],
-    time: Duration,
-    now: u64,
-) -> Result<usize> {
+fn discover(store: &Store, roots: ExternalRoots<'_>, time: Duration, now: u64) -> Result<usize> {
     let homes = homes_from(std::env::var_os(if cfg!(windows) {
         "USERPROFILE"
     } else {
         "HOME"
     }));
-    discover_within(
-        store,
-        external_roots,
-        Instant::now() + time,
-        &homes,
-        turn_at(now),
-    )
+    discover_within(store, roots, Instant::now() + time, &homes, turn_at(now))
 }
 
 fn discover_within(
     store: &Store,
-    external_roots: &[PathBuf],
+    roots: ExternalRoots<'_>,
     deadline: Instant,
     homes: &[PathBuf],
     turn: u64,
 ) -> Result<usize> {
     discover_within_using(
         store,
-        external_roots,
+        roots,
         deadline,
         homes,
         turn,
@@ -661,7 +740,7 @@ fn observe_external_before_deadline(
 
 fn discover_within_using(
     store: &Store,
-    external_roots: &[PathBuf],
+    roots: ExternalRoots<'_>,
     deadline: Instant,
     homes: &[PathBuf],
     turn: u64,
@@ -675,6 +754,24 @@ fn discover_within_using(
         Instant,
     ) -> Result<bool>,
 ) -> Result<usize> {
+    let configured = !roots.repositories.is_empty() && !roots.targets.is_empty();
+    let start = Instant::now();
+    let time = deadline.saturating_duration_since(start);
+    let ordinary_deadline = if configured {
+        start + time / 2
+    } else {
+        deadline
+    };
+    let configured_deadline = if configured {
+        start + time / 2 + time / 4
+    } else {
+        deadline
+    };
+    let ordinary_limit = if configured {
+        DISCOVERY_STEPS / 2
+    } else {
+        DISCOVERY_STEPS
+    };
     let tracked = store.tracked_target_roots(0)?;
     let mut known: HashSet<_> = tracked.iter().map(|root| root.identity).collect();
     // Every tracked target leads to its repository, a target found through
@@ -687,13 +784,21 @@ fn discover_within_using(
         .filter_map(|root| root.workspace_root.canonicalize().ok())
         .map(|seed| (seed.clone(), Some(seed)));
     let mut seen = HashSet::new();
-    let known_repositories = by_repository(seeds, &mut seen, DISCOVERY_STEPS, deadline, homes);
+    let known_repositories = by_repository(
+        seeds,
+        &mut seen,
+        ordinary_limit,
+        ordinary_deadline,
+        homes,
+        None,
+    );
     let mut surveys = survey_all(
         &known_repositories,
-        deadline,
+        ordinary_deadline,
         homes,
         turn,
-        !external_roots.is_empty(),
+        !roots.targets.is_empty(),
+        None,
     );
     // One hop out: the repositories beside the worktrees of the known ones.
     // The listing is lazy, so a spent limit stops it at once.
@@ -705,16 +810,17 @@ fn discover_within_using(
         .collect();
     let beside = rotated(neighbourhood.into_iter().collect(), turn)
         .into_iter()
-        .flat_map(|dir| repositories_in(dir, deadline))
+        .flat_map(|dir| repositories_in(dir, ordinary_deadline))
         .map(|repository| (repository, None));
-    let limit = DISCOVERY_STEPS.saturating_sub(seen.len());
-    let neighbours = by_repository(beside, &mut seen, limit, deadline, homes);
+    let limit = ordinary_limit.saturating_sub(seen.len());
+    let neighbours = by_repository(beside, &mut seen, limit, ordinary_deadline, homes, None);
     surveys.extend(survey_all(
         &neighbours,
-        deadline,
+        ordinary_deadline,
         homes,
         turn,
-        !external_roots.is_empty(),
+        !roots.targets.is_empty(),
+        None,
     ));
 
     let mut covered = HashSet::new();
@@ -732,7 +838,37 @@ fn discover_within_using(
         found += usize::from(store.remember_discovered_target_root(target, workspace)?);
     }
 
-    if !external_roots.is_empty() {
+    if configured {
+        let repository_turn = REPOSITORY_TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let starts = configured_repositories(
+            roots.repositories,
+            configured_deadline,
+            homes,
+            repository_turn,
+            &is_local,
+        )
+        .into_iter()
+        .map(|repository| (repository, None));
+        let limit = DISCOVERY_STEPS.saturating_sub(seen.len());
+        let repositories = by_repository(
+            starts,
+            &mut seen,
+            limit,
+            configured_deadline,
+            homes,
+            Some(&is_local),
+        );
+        surveys.extend(survey_all(
+            &repositories,
+            configured_deadline,
+            homes,
+            turn,
+            true,
+            Some(&is_local),
+        ));
+    }
+
+    if !roots.targets.is_empty() {
         let sources =
             tracked
                 .iter()
@@ -750,7 +886,7 @@ fn discover_within_using(
         let links = surveys.iter().flat_map(|survey| &survey.links);
         inventory_external(
             store,
-            external_roots,
+            roots.targets,
             deadline,
             homes,
             sources,
@@ -895,6 +1031,13 @@ fn inventory_external<'a>(
 mod tests {
     use super::*;
 
+    fn targets_only(targets: &[PathBuf]) -> ExternalRoots<'_> {
+        ExternalRoots {
+            targets,
+            repositories: &[],
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn private_inventory_cache(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -964,6 +1107,122 @@ mod tests {
             Path::new("/Volumes/Homes/dev/Documents/x"),
             homes
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_roots_never_enumerate_shielded_paths_or_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let documents = home.join("Documents");
+        let parent = base.join("parent");
+        for path in [&home, &documents, &parent] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::create_dir(home.join(".git")).unwrap();
+        std::fs::create_dir(documents.join(".git")).unwrap();
+        let home_alias = base.join("home-alias");
+        let documents_alias = base.join("documents-alias");
+        let root_alias = base.join("root-alias");
+        symlink(&home, &home_alias).unwrap();
+        symlink(&documents, &documents_alias).unwrap();
+        symlink("/", &root_alias).unwrap();
+        symlink(&documents, parent.join("protected-child")).unwrap();
+        let linked_worktree = base.join("linked-worktree");
+        std::fs::create_dir(&linked_worktree).unwrap();
+        std::fs::write(
+            linked_worktree.join(".git"),
+            format!("gitdir: {}\n", documents.display()),
+        )
+        .unwrap();
+        let homes = [home.clone()];
+        let roots = [
+            PathBuf::from("/"),
+            home,
+            documents,
+            home_alias,
+            documents_alias,
+            root_alias,
+        ];
+        let deadline = Instant::now() + DISCOVERY_TIME;
+        assert!(
+            configured_repositories(&roots, deadline, &homes, 0, &|_| {
+                panic!("shielded roots must not be probed")
+            })
+            .is_empty()
+        );
+        assert!(
+            configured_repositories(
+                std::slice::from_ref(&parent),
+                deadline,
+                &homes,
+                0,
+                &|path| {
+                    assert_eq!(path, parent);
+                    true
+                }
+            )
+            .is_empty()
+        );
+        assert!(
+            by_repository(
+                [(linked_worktree, None)],
+                &mut HashSet::new(),
+                1,
+                deadline,
+                &homes,
+                Some(&|_| panic!("protected Git directory must not be probed")),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_root_and_entry_limits_rotate_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let roots: Vec<_> = (0..MAX_REPOSITORY_ROOTS + 5)
+            .map(|index| {
+                let root = base.join(format!("root-{index}"));
+                std::fs::create_dir_all(root.join(".git")).unwrap();
+                root
+            })
+            .collect();
+        let mut visited = HashSet::new();
+        for turn in 0..roots.len() {
+            let found = configured_repositories(
+                &roots,
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                turn as u64,
+                &|_| true,
+            );
+            assert_eq!(found.len(), MAX_REPOSITORY_ROOTS);
+            visited.extend(found);
+        }
+        assert_eq!(visited, roots.into_iter().collect());
+
+        let crowded = base.join("crowded");
+        for index in 0..MAX_REPOSITORY_ENTRIES_PER_ROOT * 2 {
+            std::fs::create_dir_all(crowded.join(format!("repo-{index}")).join(".git")).unwrap();
+        }
+        let found = configured_repositories(
+            std::slice::from_ref(&crowded),
+            Instant::now() + DISCOVERY_TIME,
+            &[],
+            0,
+            &|_| true,
+        );
+        assert_eq!(found.len(), MAX_REPOSITORY_ENTRIES_PER_ROOT);
+        assert!(
+            configured_repositories(&[crowded], Instant::now(), &[], 0, &|_| {
+                panic!("expired pass must not probe roots")
+            })
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1093,11 +1352,14 @@ mod tests {
         let worktree = dir.path().join("worktree");
         std::fs::create_dir_all(repo.join("deep/inside")).unwrap();
         commit_and_add_worktree(&repo, &worktree);
-        let key = repository_of(&repo).unwrap();
+        let key = repository_of(&repo, &[], None).unwrap();
         assert_eq!(key, repo.join(".git").canonicalize().unwrap());
-        assert_eq!(repository_of(&repo.join("deep/inside")), Some(key.clone()));
-        assert_eq!(repository_of(&worktree), Some(key));
-        assert_eq!(repository_of(Path::new("/")), None);
+        assert_eq!(
+            repository_of(&repo.join("deep/inside"), &[], None),
+            Some(key.clone())
+        );
+        assert_eq!(repository_of(&worktree, &[], None), Some(key));
+        assert_eq!(repository_of(Path::new("/"), &[], None), None);
     }
 
     #[test]
@@ -1561,7 +1823,8 @@ mod tests {
             .remember_target_root(&built, &home.join("tools/rust"))
             .unwrap();
 
-        let pass = |deadline| discover_within(&store, &[], deadline, &homes, 0).unwrap();
+        let pass =
+            |deadline| discover_within(&store, targets_only(&[]), deadline, &homes, 0).unwrap();
         assert_eq!(pass(Instant::now() + DISCOVERY_TIME), 0);
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
@@ -1579,11 +1842,12 @@ mod tests {
                 &mut seen,
                 0,
                 Instant::now() + LISTING_TIMEOUT,
-                &[]
+                &[],
+                None
             )
             .is_empty()
         );
-        assert!(by_repository(starts(), &mut seen, 5, Instant::now(), &[]).is_empty());
+        assert!(by_repository(starts(), &mut seen, 5, Instant::now(), &[], None).is_empty());
         assert!(seen.is_empty());
         assert_eq!(
             by_repository(
@@ -1591,7 +1855,8 @@ mod tests {
                 &mut seen,
                 5,
                 Instant::now() + LISTING_TIMEOUT,
-                &[]
+                &[],
+                None
             )
             .len(),
             1
@@ -1636,7 +1901,15 @@ mod tests {
         store
             .remember_target_root(&built, &repo.join("rust"))
             .unwrap();
-        let pass = || discover_within(&store, &[], Instant::now() + DISCOVERY_TIME, &[], 0);
+        let pass = || {
+            discover_within(
+                &store,
+                targets_only(&[]),
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                0,
+            )
+        };
         assert_eq!(pass().unwrap(), 3);
         assert_eq!(pass().unwrap(), 0, "already known");
         let mut discovered: Vec<_> = store
@@ -1654,6 +1927,178 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(discovered, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unusable_configured_roots_do_not_stop_ordinary_discovery() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("ordinary/repo");
+        let sibling = base.join("ordinary/sibling");
+        std::fs::create_dir_all(&repo).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        let built = cargo_target(&repo.join("built"));
+        let ordinary = cargo_target(&sibling.join("other"));
+        let nonlocal = base.join("nonlocal");
+        std::fs::create_dir_all(nonlocal.join("child/.git")).unwrap();
+        let file = base.join("not-a-directory");
+        std::fs::write(&file, "not a directory").unwrap();
+        let dangling = base.join("dangling");
+        symlink(base.join("missing"), &dangling).unwrap();
+        let repository_roots = [base.join("missing"), file, dangling, nonlocal.clone()];
+        let target_roots = [base.join("storage")];
+        let config = crate::test_support::test_config(base.join("cache"));
+        std::fs::create_dir_all(&config.cache_dir).unwrap();
+        std::fs::set_permissions(&config.cache_dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let store = Store::open(&config).unwrap();
+        store
+            .remember_target_root(&built, &repo.join("built"))
+            .unwrap();
+        let roots = ExternalRoots {
+            targets: &target_roots,
+            repositories: &repository_roots,
+        };
+        assert_eq!(
+            discover_within_using(
+                &store,
+                roots,
+                Instant::now() + DISCOVERY_TIME,
+                &[],
+                0,
+                |path| {
+                    assert!(path == nonlocal || !path.starts_with(&nonlocal));
+                    path != nonlocal
+                },
+                |_, _, _, _, _, _| panic!("no external links"),
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .tracked_target_roots(0)
+                .unwrap()
+                .iter()
+                .any(|row| row.path == ordinary && row.discovered)
+        );
+        assert!(store.external_target_observations().unwrap().is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn configured_roots_find_unseeded_external_links_as_inventory_only() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_discovery::tests::configured_roots_unseeded_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout[stdout.find('{').unwrap()..=stdout.rfind('}').unwrap()])
+                .unwrap();
+        assert_eq!(json["targets"], serde_json::json!([]));
+        let external = json["external_targets"].as_array().unwrap();
+        assert_eq!(external.len(), 2);
+        assert!(external.iter().all(|row| row["status"] == "inventory_only"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[ignore = "isolated discovery and targets command fixture"]
+    fn configured_roots_unseeded_child() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("source/repo");
+        let sibling = base.join("source/sibling");
+        let storage = base.join("storage");
+        let backing = storage.join("shared");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        commit_and_add_worktree(&repo, &sibling);
+        for worktree in [&repo, &sibling] {
+            std::fs::write(worktree.join(".gitignore"), "target\n").unwrap();
+        }
+        for workspace in [repo.join("app"), sibling.join("tool")] {
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            symlink(&backing, workspace.join("target")).unwrap();
+        }
+        for (worktree, workspace) in [(&repo, repo.join("app")), (&sibling, sibling.join("tool"))] {
+            assert!(
+                targets_in_worktree(worktree, Instant::now() + DISCOVERY_TIME, true)
+                    .links
+                    .contains(&workspace)
+            );
+        }
+        let tagged = cargo_target(&sibling.join("unused"));
+        let nested = base.join("source/nested/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q"]);
+        std::fs::write(nested.join(".gitignore"), "target\n").unwrap();
+        symlink(&backing, nested.join("target")).unwrap();
+        assert!(!backing.join("CACHEDIR.TAG").exists());
+        assert_eq!(crate::cache_fs::probe(&base).is_local, Some(true));
+
+        let idle = crate::maintenance::RequestClock::idle();
+        for (name, repository_roots, target_roots, expected) in [
+            ("off", vec![], vec![storage.clone()], false),
+            ("no-storage", vec![repo.clone()], vec![], false),
+            (
+                "repository",
+                vec![repo.clone()],
+                vec![storage.clone()],
+                true,
+            ),
+            (
+                "parent",
+                vec![base.join("source")],
+                vec![storage.clone()],
+                true,
+            ),
+        ] {
+            let mut config = crate::test_support::test_config(base.join(format!("cache-{name}")));
+            config.external_repository_roots = repository_roots;
+            config.external_target_roots = target_roots;
+            private_inventory_cache(&config.cache_dir);
+            let store = Store::open(&config).unwrap();
+            assert!(store.tracked_target_roots(0).unwrap().is_empty());
+            LAST_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
+            assert!(run(&config, Trigger::Periodic(&idle)));
+            assert!(store.tracked_target_roots(0).unwrap().is_empty());
+            let observations = store.external_target_observations().unwrap();
+            let workspaces: HashSet<_> = observations
+                .iter()
+                .map(|row| row.workspace_path.clone())
+                .collect();
+            assert_eq!(
+                workspaces,
+                if expected {
+                    HashSet::from([repo.join("app"), sibling.join("tool")])
+                } else {
+                    HashSet::new()
+                },
+                "{name}"
+            );
+            assert!(tagged.exists());
+            if name == "parent" {
+                crate::cli::targets(&config, true).unwrap();
+            }
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1743,7 +2188,10 @@ mod tests {
         let tracked = store.tracked_target_roots(0).unwrap();
         assert_eq!(tracked.len(), 1);
 
-        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 0);
+        assert_eq!(
+            discover(&store, targets_only(&[]), DISCOVERY_TIME, 0).unwrap(),
+            0
+        );
         assert!(
             !config
                 .cache_dir
@@ -1755,7 +2203,7 @@ mod tests {
         assert_eq!(
             discover_within(
                 &store,
-                &config.external_target_roots,
+                targets_only(&config.external_target_roots),
                 Instant::now(),
                 &[],
                 0
@@ -1774,7 +2222,7 @@ mod tests {
         let local = |path: &Path| crate::cache_fs::probe(path).is_local == Some(true);
         discover_within_using(
             &isolated,
-            &config.external_target_roots,
+            targets_only(&config.external_target_roots),
             Instant::now() + DISCOVERY_TIME,
             &[],
             0,
@@ -1785,7 +2233,7 @@ mod tests {
         assert!(isolated.external_target_observations().unwrap().is_empty());
         discover_within_using(
             &isolated,
-            &config.external_target_roots,
+            targets_only(&config.external_target_roots),
             Instant::now() + DISCOVERY_TIME,
             &[],
             0,
@@ -1795,7 +2243,13 @@ mod tests {
         .unwrap();
         assert!(isolated.external_target_observations().unwrap().is_empty());
 
-        let found = discover(&store, &config.external_target_roots, DISCOVERY_TIME, 0).unwrap();
+        let found = discover(
+            &store,
+            targets_only(&config.external_target_roots),
+            DISCOVERY_TIME,
+            0,
+        )
+        .unwrap();
         let observations = store.external_target_observations().unwrap();
         let workspaces: Vec<_> = observations
             .iter()
@@ -1841,7 +2295,7 @@ mod tests {
         assert_eq!(
             discover(
                 &store,
-                &config.external_target_roots,
+                targets_only(&config.external_target_roots),
                 DISCOVERY_TIME,
                 FRESH_FOR.as_secs()
             )
@@ -1930,7 +2384,7 @@ mod tests {
             let result = tracing::subscriber::with_default(subscriber, || {
                 discover_within_using(
                     &store,
-                    std::slice::from_ref(&storage),
+                    targets_only(std::slice::from_ref(&storage)),
                     Instant::now() + DISCOVERY_TIME,
                     &[],
                     turn,
@@ -1982,7 +2436,7 @@ mod tests {
             assert_eq!(
                 discover_within_using(
                     &store,
-                    std::slice::from_ref(&storage),
+                    targets_only(std::slice::from_ref(&storage)),
                     Instant::now() + DISCOVERY_TIME,
                     &[],
                     0,
@@ -2003,7 +2457,7 @@ mod tests {
             assert_eq!(
                 discover_within_using(
                     &store,
-                    &[],
+                    targets_only(&[]),
                     Instant::now() + DISCOVERY_TIME,
                     &[],
                     0,
@@ -2100,7 +2554,7 @@ mod tests {
         let result = tracing::subscriber::with_default(subscriber, || {
             discover_within_using(
                 &store,
-                std::slice::from_ref(&storage),
+                targets_only(std::slice::from_ref(&storage)),
                 Instant::now() + DISCOVERY_TIME,
                 &[],
                 0,
@@ -2140,7 +2594,7 @@ mod tests {
         let result = tracing::subscriber::with_default(subscriber, || {
             discover_within_using(
                 &store,
-                std::slice::from_ref(&storage),
+                targets_only(std::slice::from_ref(&storage)),
                 Instant::now() + DISCOVERY_TIME,
                 &[],
                 0,
@@ -2310,7 +2764,7 @@ mod tests {
             assert_eq!(
                 discover(
                     &store,
-                    std::slice::from_ref(&storage),
+                    targets_only(std::slice::from_ref(&storage)),
                     DISCOVERY_TIME,
                     day * 24 * 3600
                 )
@@ -2403,7 +2857,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            discover(&store, &config.external_target_roots, DISCOVERY_TIME, 0).unwrap(),
+            discover(
+                &store,
+                targets_only(&config.external_target_roots),
+                DISCOVERY_TIME,
+                0
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
@@ -2414,7 +2874,7 @@ mod tests {
         assert_eq!(
             discover(
                 &store,
-                &config.external_target_roots,
+                targets_only(&config.external_target_roots),
                 DISCOVERY_TIME,
                 FRESH_FOR.as_secs()
             )
@@ -2429,7 +2889,7 @@ mod tests {
         assert_eq!(
             discover(
                 &store,
-                &config.external_target_roots,
+                targets_only(&config.external_target_roots),
                 DISCOVERY_TIME,
                 2 * FRESH_FOR.as_secs()
             )
@@ -2492,8 +2952,14 @@ mod tests {
             .remember_target_root(&original, &repo.join("rust"))
             .unwrap();
 
-        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 1);
-        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 0);
+        assert_eq!(
+            discover(&store, targets_only(&[]), DISCOVERY_TIME, 0).unwrap(),
+            1
+        );
+        assert_eq!(
+            discover(&store, targets_only(&[]), DISCOVERY_TIME, 0).unwrap(),
+            0
+        );
         let roots = store.tracked_target_roots(0).unwrap();
         assert_eq!(roots.len(), 2);
         let sibling_row = roots
@@ -2510,7 +2976,10 @@ mod tests {
         let old_identity = sibling_row.identity;
         std::fs::rename(&found, sibling.join("old-target")).unwrap();
         cargo_target(&sibling.join("rust"));
-        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 1);
+        assert_eq!(
+            discover(&store, targets_only(&[]), DISCOVERY_TIME, 0).unwrap(),
+            1
+        );
         let replaced = store
             .tracked_target_roots(0)
             .unwrap()
@@ -2538,7 +3007,10 @@ mod tests {
         store.forget_target_root(&found).unwrap();
         std::fs::remove_dir_all(&found).unwrap();
         std::fs::create_dir_all(found.join("debug")).unwrap();
-        assert_eq!(discover(&store, &[], DISCOVERY_TIME, 0).unwrap(), 0);
+        assert_eq!(
+            discover(&store, targets_only(&[]), DISCOVERY_TIME, 0).unwrap(),
+            0
+        );
         assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     }
 }

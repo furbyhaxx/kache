@@ -87,7 +87,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_RECOVER_MIN_FREE_BYTES` | `cache.auto_recover_min_free_bytes` | `10737418240` (10 GiB); `0` in CI | Below this many free bytes, builds evict eligible cache entries; `0` disables recovery. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
 | none | `cache.external_target_roots` | `[]` | Absolute external target storage roots allowlisted for inventory only. Paths need not exist when the config loads; listing them neither adopts nor deletes anything. |
-| none | `cache.external_repository_roots` | `[]` | Explicit repository or parent directories for external inventory discovery. The setting is accepted but not yet used by discovery. See [Repository search scope](#repository-search-scope). |
+| none | `cache.external_repository_roots` | `[]` | Explicit repository or parent directories for external inventory discovery. See [Repository search scope](#repository-search-scope). |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
@@ -121,7 +121,9 @@ On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CAC
 external_repository_roots = ["/mnt/source/project", "/mnt/other-projects"]
 ```
 
-An entry identifies a Git repository directory or a parent whose immediate children may be Git repositories; it does not request an arbitrary recursive search. This version reads and preserves the setting, but discovery does not yet use it. When discovery is wired, the existing safeguards for the filesystem root, the home directory itself, and protected home folders still apply. Listing a root does not adopt or delete targets; other target-management settings remain separate.
+Each entry identifies a Git repository or a parent whose immediate children may be repositories. Discovery surveys those repositories and their Git worktrees for ignored `target` symlinks; it does not recursively search directories. It requires at least one `external_target_roots` entry and does not require an already tracked target. Explicit root symlinks are resolved, but symlinked children are not followed. The filesystem root, the home directory itself, protected home folders and aliases to them are excluded. Missing, inaccessible, nonlocal and uninspectable roots are skipped.
+
+The pass is best effort. It checks at most 16 configured roots and 32 directory entries per root, with time reserved for ordinary discovery and external inventory. The starting root advances when a pass reaches configured-root discovery in the same daemon, but resets on restart. Directory entries have filesystem-dependent ordering: entries beyond the per-root limit may never be visited, and deadline exhaustion can also leave roots or worktrees out. Discovered links remain historical `inventory_only` observations. Listing a root does not track or adopt targets or authorize deletion; other target-management settings remain separate.
 
 ## Test runner
 

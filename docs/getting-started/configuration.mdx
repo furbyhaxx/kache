@@ -110,6 +110,8 @@ external_target_roots = ["/mnt/cache/targets"]
 
 Each path must be absolute. Roots need not exist when the config loads; snapshot checks resolve and verify them when used. During quiet discovery, Kache records up to eight ignored worktree target symlinks per pass as historical observations. Discovery is incremental and does not claim to find every alias. Listing a root or observing a link neither adopts nor deletes anything.
 
+On Unix, inventory requires a cache directory owned by the effective user, with no group or other permissions and no special mode bits (for example, mode `0700`). Kache does not change permissions on an existing cache. If this requirement is not met, inventory cannot record observations; an empty inventory does not mean that no external targets exist. External target snapshots are supported on Linux and Android.
+
 On macOS the default store is `~/Library/Caches/kache`; on Linux it is `$XDG_CACHE_HOME/kache` or `~/.cache/kache`; on Windows it is under `%LOCALAPPDATA%`.
 
 ### Repository search scope

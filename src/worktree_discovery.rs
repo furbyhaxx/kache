@@ -398,6 +398,68 @@ fn repositories_in(dir: PathBuf, deadline: Instant) -> impl Iterator<Item = Path
         .filter(|child| std::fs::symlink_metadata(child.join(".git")).is_ok())
 }
 
+fn bare_repository(
+    path: &Path,
+    deadline: Instant,
+    homes: &[PathBuf],
+    is_local: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if Instant::now() >= deadline
+        || shielded(path, homes)
+        || !is_local(path)
+        || !path.join("HEAD").is_file()
+    {
+        return None;
+    }
+    let common_file = path.join("commondir");
+    let (common, has_common_file) = match std::fs::symlink_metadata(&common_file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (path.to_path_buf(), false),
+        Ok(_) => {
+            let resolved = common_file.canonicalize().ok()?;
+            if shielded(&resolved, homes) || !is_local(&resolved) || !resolved.is_file() {
+                return None;
+            }
+            let mut text = String::new();
+            std::fs::File::open(resolved)
+                .ok()?
+                .take(MAX_INVENTORY_BYTES)
+                .read_to_string(&mut text)
+                .ok()?;
+            if text.len() as u64 == MAX_INVENTORY_BYTES || text.trim().is_empty() {
+                return None;
+            }
+            (path.join(text.trim()).canonicalize().ok()?, true)
+        }
+        Err(_) => return None,
+    };
+    if shielded(&common, homes) || !is_local(&common) {
+        return None;
+    }
+    let output = git_output(
+        path,
+        &["--git-dir=.", "rev-parse", "--is-bare-repository"],
+        GIT_TIMEOUT,
+        deadline,
+        MAX_INVENTORY_BYTES,
+    )?;
+    let bare = match std::str::from_utf8(&output).ok()?.trim() {
+        "true" => true,
+        // An explicit Git directory reports split bare repositories as worktrees.
+        "false" if has_common_file => {
+            let output = git_output(
+                path,
+                &["rev-parse", "--is-bare-repository"],
+                GIT_TIMEOUT,
+                deadline,
+                MAX_INVENTORY_BYTES,
+            )?;
+            std::str::from_utf8(&output).ok()?.trim() == "true"
+        }
+        _ => false,
+    };
+    bare.then_some(common)
+}
+
 fn configured_repositories(
     roots: &[PathBuf],
     deadline: Instant,
@@ -428,11 +490,17 @@ fn configured_repositories(
             continue;
         }
         let mut add_repository = |path: PathBuf| {
-            if !shielded(&path, homes)
-                && is_local(&path)
-                && std::fs::symlink_metadata(path.join(".git"))
-                    .is_ok_and(|meta| meta.is_dir() || meta.is_file())
-            {
+            if shielded(&path, homes) || !is_local(&path) {
+                return;
+            }
+            let repository = match std::fs::symlink_metadata(path.join(".git")) {
+                Ok(meta) => meta.is_dir() || meta.is_file(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    bare_repository(&path, deadline, homes, is_local).is_some()
+                }
+                Err(_) => false,
+            };
+            if repository {
                 repositories.push(path);
             }
         };
@@ -698,6 +766,9 @@ fn by_repository(
     homes: &[PathBuf],
     local_only: Option<&dyn Fn(&Path) -> bool>,
 ) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut order = Vec::new();
     let mut grouped: HashMap<PathBuf, (PathBuf, Vec<PathBuf>)> = HashMap::new();
     for (start, seed) in starts {
@@ -707,7 +778,16 @@ fn by_repository(
         if shielded(&start, homes) {
             continue;
         }
-        let Some(repository) = repository_of(&start, homes, local_only) else {
+        let repository = match local_only {
+            Some(is_local)
+                if std::fs::symlink_metadata(start.join(".git"))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                bare_repository(&start, deadline, homes, is_local)
+            }
+            _ => repository_of(&start, homes, local_only),
+        };
+        let Some(repository) = repository else {
             continue;
         };
         if seen.contains(&repository) {
@@ -2402,6 +2482,183 @@ mod tests {
                 } else {
                     HashSet::new()
                 },
+                "{name}"
+            );
+            assert!(tagged.exists());
+            if name == "parent" {
+                crate::cli::targets(&config, true).unwrap();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn configured_bare_roots_find_unseeded_external_links_as_inventory_only() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree_discovery::tests::configured_bare_roots_unseeded_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&stdout[stdout.find('{').unwrap()..=stdout.rfind('}').unwrap()])
+                .unwrap();
+        assert_eq!(json["targets"], serde_json::json!([]));
+        let external = json["external_targets"].as_array().unwrap();
+        assert_eq!(external.len(), 2);
+        assert!(external.iter().all(|row| row["status"] == "inventory_only"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    #[ignore = "isolated discovery and targets command fixture"]
+    fn configured_bare_roots_unseeded_child() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let source = base.join("source");
+        let parent = base.join("repositories");
+        let bare = parent.join("project.git");
+        let first = base.join("worktrees/first");
+        let second = base.join("worktrees/second");
+        let storage = base.join("storage");
+        let backing = storage.join("shared");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&backing).unwrap();
+        commit_and_add_worktree(&source, &base.join("original-worktree"));
+        git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                source.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        for worktree in [&first, &second] {
+            git(
+                &bare,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            std::fs::write(worktree.join(".gitignore"), "target\n").unwrap();
+            let workspace = worktree.join("app");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            symlink(&backing, workspace.join("target")).unwrap();
+        }
+        let tagged = cargo_target(&second.join("unused"));
+        assert!(!bare.join(".git").exists());
+        assert!(!backing.join("CACHEDIR.TAG").exists());
+        assert_eq!(crate::cache_fs::probe(&base).is_local, Some(true));
+
+        let split = parent.join("split");
+        std::fs::create_dir(&split).unwrap();
+        std::fs::copy(bare.join("HEAD"), split.join("HEAD")).unwrap();
+        std::fs::write(split.join("commondir"), "../project.git\n").unwrap();
+        let fake = parent.join("fake");
+        std::fs::create_dir_all(fake.join("objects")).unwrap();
+        std::fs::create_dir(fake.join("refs")).unwrap();
+        std::fs::write(fake.join("HEAD"), "not a Git reference\n").unwrap();
+        let deadline = Instant::now() + DISCOVERY_TIME;
+        assert_eq!(repository_of(&first, &[], None), Some(bare.clone()));
+        assert_eq!(
+            bare_repository(&bare, deadline, &[], &|_| true),
+            Some(bare.clone())
+        );
+        std::fs::write(bare.join("commondir"), ".\n").unwrap();
+        assert_eq!(
+            bare_repository(&bare, deadline, &[], &|_| true),
+            Some(bare.clone())
+        );
+        std::fs::remove_file(bare.join("commondir")).unwrap();
+        assert_eq!(
+            bare_repository(&split, deadline, &[], &|_| true),
+            Some(bare.clone())
+        );
+        assert!(bare_repository(&fake, deadline, &[], &|_| true).is_none());
+        assert!(bare_repository(&split, deadline, &[], &|path| path != bare).is_none());
+        assert!(bare_repository(&bare, Instant::now(), &[], &|_| panic!("expired pass")).is_none());
+        let home = base.join("home");
+        let protected = home.join("Documents/private");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(
+            split.join("commondir"),
+            format!("{}\n", protected.display()),
+        )
+        .unwrap();
+        assert!(
+            bare_repository(&split, deadline, &[home], &|path| {
+                assert!(!path.starts_with(&protected));
+                true
+            })
+            .is_none()
+        );
+        std::fs::write(split.join("commondir"), vec![b'x'; 1 << 20]).unwrap();
+        assert!(bare_repository(&split, deadline, &[], &|_| true).is_none());
+        std::fs::write(split.join("commondir"), "../project.git\n").unwrap();
+        let candidates: HashSet<_> =
+            configured_repositories(std::slice::from_ref(&parent), deadline, &[], 0, &|_| true)
+                .into_iter()
+                .collect();
+        assert_eq!(candidates, HashSet::from([bare.clone(), split.clone()]));
+        for starts in [
+            vec![
+                (bare.clone(), None),
+                (first.clone(), None),
+                (split.clone(), None),
+            ],
+            vec![
+                (first.clone(), None),
+                (bare.clone(), None),
+                (split.clone(), None),
+            ],
+        ] {
+            let mut seen = HashSet::new();
+            assert_eq!(
+                by_repository(starts, &mut seen, 3, deadline, &[], Some(&|_| true)).len(),
+                1
+            );
+            assert_eq!(seen, HashSet::from([bare.clone()]));
+        }
+
+        let idle = crate::maintenance::RequestClock::idle();
+        for (name, root) in [("bare", &bare), ("parent", &parent)] {
+            let mut config = crate::test_support::test_config(base.join(format!("cache-{name}")));
+            config.external_repository_roots = vec![root.clone()];
+            config.external_target_roots = vec![storage.clone()];
+            private_inventory_cache(&config.cache_dir);
+            let store = Store::open(&config).unwrap();
+            LAST_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
+            assert!(run(&config, Trigger::Periodic(&idle)));
+            assert!(store.tracked_target_roots(0).unwrap().is_empty());
+            let workspaces: HashSet<_> = store
+                .external_target_observations()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.workspace_path)
+                .collect();
+            assert_eq!(
+                workspaces,
+                HashSet::from([first.join("app"), second.join("app")]),
                 "{name}"
             );
             assert!(tagged.exists());

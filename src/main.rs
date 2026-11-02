@@ -19,6 +19,7 @@ mod daemon;
 mod daemon_publish;
 mod demand;
 mod disk_recovery;
+mod discovery_sandbox;
 mod events;
 mod explain;
 mod extra_inputs;
@@ -962,6 +963,9 @@ fn test_runner_args(raw_args: &[std::ffi::OsString]) -> Option<&[std::ffi::OsStr
 }
 
 fn main() -> std::process::ExitCode {
+    if let Some(status) = discovery_sandbox::dispatch() {
+        return status;
+    }
     match run_main() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => std::process::ExitCode::from(report_main_error(&error)),

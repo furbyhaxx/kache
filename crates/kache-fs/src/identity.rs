@@ -5,6 +5,36 @@ use std::{fs, io, path::Path};
 #[cfg(target_os = "linux")]
 const STATX_MNT_ID_UNIQUE: libc::c_uint = 0x0000_4000;
 
+// The Linux UAPI fixes the result at 256 bytes; unused fields stay opaque.
+#[cfg(target_os = "linux")]
+#[repr(C, align(8))]
+struct StatxBuffer {
+    stx_mask: u32,
+    _before_mount_id: [u8; 0x8c],
+    stx_mnt_id: u64,
+    _trailing: [u8; 0x68],
+}
+
+#[cfg(target_os = "linux")]
+const _: () = {
+    assert!(std::mem::size_of::<StatxBuffer>() == 0x100);
+    assert!(std::mem::align_of::<StatxBuffer>() >= 8);
+    assert!(std::mem::offset_of!(StatxBuffer, stx_mask) == 0);
+    assert!(std::mem::offset_of!(StatxBuffer, stx_mnt_id) == 0x90);
+};
+
+#[cfg(target_os = "linux")]
+impl StatxBuffer {
+    fn new() -> Self {
+        Self {
+            stx_mask: 0,
+            _before_mount_id: [0; 0x8c],
+            stx_mnt_id: 0,
+            _trailing: [0; 0x68],
+        }
+    }
+}
+
 /// A filesystem-specific opaque export handle.
 ///
 /// Handles can be reused or replayed and do not establish a trusted volume
@@ -132,12 +162,12 @@ pub fn unique_mount_id(file: &fs::File) -> io::Result<u64> {
     {
         use std::os::fd::AsRawFd;
 
-        // SAFETY: statx consists only of integer fields and padding.
-        let mut stat: libc::statx = unsafe { std::mem::zeroed() };
-        // SAFETY: file owns a live FD, AT_EMPTY_PATH uses it with a valid
-        // NUL-terminated empty path, and stat is a writable statx buffer.
+        let mut stat = StatxBuffer::new();
+        // SAFETY: file owns a live FD, AT_EMPTY_PATH uses the NUL-terminated
+        // empty path, and stat is an aligned writable 256-byte UAPI buffer.
         let result = unsafe {
-            libc::statx(
+            libc::syscall(
+                libc::SYS_statx as libc::c_long,
                 file.as_raw_fd(),
                 c"".as_ptr(),
                 libc::AT_EMPTY_PATH,
@@ -446,16 +476,16 @@ mod tests {
         fs::create_dir(&path).unwrap();
         let pinned = fs::File::open(&path).unwrap();
 
-        // SAFETY: statx consists only of integer fields and padding.
-        let mut stat: libc::statx = unsafe { std::mem::zeroed() };
-        // SAFETY: pinned owns a live FD, the empty path is NUL-terminated,
-        // and stat is a correctly typed writable output buffer.
+        let mut stat = StatxBuffer::new();
+        // SAFETY: pinned owns a live FD, AT_EMPTY_PATH uses the NUL-terminated
+        // empty path, and stat is an aligned writable 256-byte UAPI buffer.
         let result = unsafe {
-            libc::statx(
+            libc::syscall(
+                libc::SYS_statx as libc::c_long,
                 pinned.as_raw_fd(),
                 c"".as_ptr(),
                 libc::AT_EMPTY_PATH,
-                0x0000_4000,
+                0x0000_4000_u32,
                 &raw mut stat,
             )
         };

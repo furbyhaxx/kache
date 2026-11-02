@@ -414,23 +414,17 @@ fn bare_repository(
     let common_file = path.join("commondir");
     let (common, has_common_file) = match std::fs::symlink_metadata(&common_file) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (path.to_path_buf(), false),
-        Ok(_) => {
-            let resolved = common_file.canonicalize().ok()?;
-            if shielded(&resolved, homes) || !is_local(&resolved) || !resolved.is_file() {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if shielded(&common_file, homes) || !is_local(&common_file) {
                 return None;
             }
-            let mut text = String::new();
-            std::fs::File::open(resolved)
-                .ok()?
-                .take(MAX_INVENTORY_BYTES)
-                .read_to_string(&mut text)
-                .ok()?;
-            if text.len() as u64 == MAX_INVENTORY_BYTES || text.trim().is_empty() {
+            let text = read_git_metadata(&common_file).ok()??;
+            if text.trim().is_empty() {
                 return None;
             }
             (path.join(text.trim()).canonicalize().ok()?, true)
         }
-        Err(_) => return None,
+        _ => return None,
     };
     if shielded(&common, homes) || !is_local(&common) {
         return None;
@@ -1460,7 +1454,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_repository_rejects_fifo(common: bool) {
+    fn assert_repository_rejects_fifo(common: bool, bare: bool) {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -1471,7 +1465,12 @@ mod tests {
         for path in [&repo, &git_dir, &common_dir] {
             std::fs::create_dir(path).unwrap();
         }
-        let (fifo, contents) = if common {
+        let (fifo, contents) = if bare {
+            std::fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+            let contents = format!("{}\n", common_dir.display());
+            std::fs::write(repo.join("commondir"), &contents).unwrap();
+            (repo.join("fifo-replacement"), contents)
+        } else if common {
             std::fs::write(
                 repo.join(".git"),
                 format!("gitdir: {}\n", git_dir.display()),
@@ -1514,6 +1513,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("KACHE_TEST_FIFO_REPOSITORY", &repo)
+            .env("KACHE_TEST_FIFO_BARE", if bare { "1" } else { "0" })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1541,14 +1541,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bare_repository_rejects_symlinked_commondir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("bare");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        git(&repo, &["init", "--bare", "-q"]);
+        let deadline = Instant::now() + DISCOVERY_TIME;
+        assert_eq!(
+            bare_repository(&repo, deadline, &[], &|_| true),
+            Some(repo.clone())
+        );
+        let metadata = dir.path().join("commondir");
+        std::fs::write(&metadata, ".\n").unwrap();
+        symlink(&metadata, repo.join("commondir")).unwrap();
+        assert_eq!(bare_repository(&repo, deadline, &[], &|_| true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn repository_rejects_dot_git_fifo_without_blocking() {
-        assert_repository_rejects_fifo(false);
+        assert_repository_rejects_fifo(false, false);
     }
 
     #[cfg(unix)]
     #[test]
     fn repository_rejects_commondir_fifo_without_blocking() {
-        assert_repository_rejects_fifo(true);
+        assert_repository_rejects_fifo(true, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_repository_rejects_commondir_fifo_without_blocking() {
+        assert_repository_rejects_fifo(true, true);
     }
 
     #[cfg(unix)]
@@ -1556,7 +1583,23 @@ mod tests {
     #[ignore = "subprocess fixture for FIFO metadata"]
     fn repository_fifo_child() {
         let repo = PathBuf::from(std::env::var_os("KACHE_TEST_FIFO_REPOSITORY").unwrap());
-        assert_eq!(repository_of(&repo, &[], None), None);
+        if std::env::var_os("KACHE_TEST_FIFO_BARE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let common_file = repo.join("commondir");
+            let replacement = repo.join("fifo-replacement");
+            let is_local = |path: &Path| {
+                if path == common_file {
+                    std::fs::rename(&replacement, &common_file).unwrap();
+                }
+                true
+            };
+            assert_eq!(
+                bare_repository(&repo, Instant::now() + DISCOVERY_TIME, &[], &is_local),
+                None
+            );
+            assert!(!replacement.exists());
+        } else {
+            assert_eq!(repository_of(&repo, &[], None), None);
+        }
     }
 
     #[cfg(unix)]

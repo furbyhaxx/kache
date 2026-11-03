@@ -93,7 +93,22 @@ Without `--dry-run` or `--yes`, a selector opens in a terminal. Without a termin
 
 Given a directory, `clean` looks under it for `target/` directories that sit next to a `Cargo.toml`, including worktrees under `.worktrees/` and `.claude/`. Other hidden directories and `node_modules` are skipped. Sizes cover every profile, custom profiles and `<triple>/<profile>` directories included. A directory selects every target under it, so it cannot be combined with `--stale` or `--orphans`.
 
-`kache targets` also lists historical observations of external target symlinks. These links are inventory only: they have not been adopted and are not eligible for cleanup. JSON output includes them in `external_targets`, separately from tracked-target sizes and reclamation estimates; `last_observed` is Unix seconds and is not a last-use time. If the external inventory is unavailable, regular targets still appear: human output warns on stderr, while JSON sets `external_targets` to `null` and provides `external_inventory_error`.
+`kache targets` also lists historical observations of external target symlinks. It marks an observation adopted only while its recorded backing still matches a consent record; a replacement at the old path is `inventory_only`. Neither kind is currently eligible for cleanup. JSON output includes these observations in `external_targets`, separately from tracked-target sizes and reclamation estimates. Each has `status`, `adopted`, and `adoption_id` (`null` when not verified); `last_observed` is Unix seconds and is not a last-use time. If the external inventory is unavailable, regular targets still appear: human output warns on stderr, while JSON sets `external_targets` to `null` and provides `external_inventory_error`.
+
+### External target consent
+
+```bash
+kache targets adopt ~/src/my-worktree
+kache targets adopt /mnt/targets/my-build --yes
+kache targets adoptions
+kache targets adoptions --json
+kache targets release ~/src/my-worktree/target
+kache targets release 1
+```
+
+Adoption is explicit consent that the **entire contents** of one backing directory may be deleted in a future cleanup after the configured Cargo-idle threshold (`cache.target_idle_hours`, 12 hours by default). Changing that setting later also changes the threshold for previously adopted targets. The workspace's `target` symlink is kept. These commands only record or withdraw consent; they do not delete files, and no automatic external-target deletion is enabled by adoption today. The backing must be owned by the effective user and on a filesystem containing a configured `cache.external_target_roots` entry. Overlapping adoptions are refused.
+
+Name a workspace containing a `Cargo.toml` or `.git` and a `target` symlink, the `target` symlink itself, or the backing directory. If a directory could be either a workspace or a backing, the command refuses it and points to the explicit `target` link. Adoption shows the consent statement and asks for confirmation; use `--yes` for unattended use. `adoptions` lists recorded paths as hints, not current identity. `release` accepts a path or the numeric adoption ID, so a stale or missing backing can still be released. If a numeric argument is both an ID and a path, use `./NAME` for the path or change directory to release the ID.
 
 Removal rechecks each directory's identity and skips one that changed since the scan. For tracked targets it also skips paths that are missing, moved or no longer a derived target directory, and targets of the current workspace. A directory you name gets no such filter, so `kache clean . --yes` at a workspace root removes that workspace's `target/`. A target is skipped in every mode while a running build holds its `.cargo-lock`. While any Cargo command started through Kache (`kache cargo` or the `cargo` shim) or any `kache test-runner` test is running, the clean skips every target. A target that cannot be removed is reported and makes the command exit 1.
 

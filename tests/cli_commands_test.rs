@@ -2093,6 +2093,7 @@ fn targets_adoption_commands_handle_paths_and_stale_ids() {
     assert!(String::from_utf8_lossy(&no_consent.stderr).contains("--yes"));
     let adopt = e
         .cmd()
+        .env_remove("KACHE_TARGET_IDLE_HOURS")
         .args(["targets", "adopt", "--yes"])
         .arg(&workspace)
         .arg("--json")
@@ -2105,6 +2106,9 @@ fn targets_adoption_commands_handle_paths_and_stale_ids() {
     );
     let adopt: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
     assert_eq!(adopt["command"], "targets-adopt");
+    let consent = adopt["consent"].as_str().unwrap();
+    assert!(consent.contains("currently 12 hours"));
+    assert!(consent.contains("Changing the configuration later"));
     let first_id = adopt["adoption"]["id"].as_i64().unwrap();
     assert_eq!(adopt["adoption"]["backing_path"], backing.to_str().unwrap());
     let list = e
@@ -2128,7 +2132,7 @@ fn targets_adoption_commands_handle_paths_and_stale_ids() {
     let release = e
         .cmd()
         .args(["targets", "release"])
-        .arg(workspace.join("target"))
+        .arg(&workspace)
         .arg("--json")
         .output()
         .unwrap();
@@ -2137,8 +2141,12 @@ fn targets_adoption_commands_handle_paths_and_stale_ids() {
         "{}",
         String::from_utf8_lossy(&release.stderr)
     );
+    let config_path = e.cache.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!("{config}target_idle_hours = 3\n")).unwrap();
     let adopt = e
         .cmd()
+        .env_remove("KACHE_TARGET_IDLE_HOURS")
         .args(["targets", "adopt", "--yes"])
         .arg(&backing)
         .arg("--json")
@@ -2149,10 +2157,14 @@ fn targets_adoption_commands_handle_paths_and_stale_ids() {
         "{}",
         String::from_utf8_lossy(&adopt.stderr)
     );
-    let second_id = serde_json::from_slice::<serde_json::Value>(&adopt.stdout).unwrap()["adoption"]
-        ["id"]
-        .as_i64()
-        .unwrap();
+    let adopt: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
+    assert!(
+        adopt["consent"]
+            .as_str()
+            .unwrap()
+            .contains("currently 3 hours")
+    );
+    let second_id = adopt["adoption"]["id"].as_i64().unwrap();
     assert!(second_id > first_id);
     let moved = storage.join("moved");
     std::fs::rename(&backing, &moved).unwrap();
@@ -2234,6 +2246,123 @@ fn targets_adoption_commands_refuse_ambiguous_paths_and_escape_errors() {
         .assert()
         .failure()
         .code(2);
+}
+
+#[cfg(target_os = "linux")]
+struct ExternalTargetTestPolicy;
+
+#[cfg(target_os = "linux")]
+impl kache_store::ArtifactPolicy for ExternalTargetTestPolicy {
+    fn allow_hardlink(_: &str) -> bool {
+        false
+    }
+    fn allow_empty(_: &str, _: &[String]) -> bool {
+        false
+    }
+    fn emit_kind(_: &str) -> Option<&'static str> {
+        None
+    }
+    fn stable_after_store(_: &str) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn targets_adoption_status_reports_verified_identity_in_human_and_json() {
+    use std::os::unix::fs::symlink;
+    let e = env();
+    let workspace = e.home.join("workspace");
+    let storage = e.home.join("storage");
+    let backing = storage.join("build");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&backing).unwrap();
+    std::fs::write(backing.join("keep"), b"preserve").unwrap();
+    symlink(&backing, workspace.join("target")).unwrap();
+    configure_external_target_fixture(&e, &storage);
+    let store =
+        kache_store::ArtifactStore::<ExternalTargetTestPolicy>::open(kache_store::config::Config {
+            cache_dir: e.cache.clone(),
+            max_size: 1024 * 1024,
+            gc_evict_shared: false,
+            upload_spool_max_jobs: 65_536,
+            deferred_durability: false,
+        })
+        .unwrap();
+    let snapshot =
+        kache_store::filesystem::snapshot_workspace_target(&workspace, &storage, &[]).unwrap();
+    assert!(
+        store
+            .observe_external_target(&workspace, &storage, &[], &snapshot)
+            .unwrap()
+    );
+    drop(store);
+    let targets = || {
+        let output = e.cmd().args(["targets", "--json"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    assert_eq!(targets()["external_targets"][0]["status"], "inventory_only");
+    let adopt = e
+        .cmd()
+        .args(["targets", "adopt", "--yes"])
+        .arg(workspace.join("target"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        adopt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    let id = serde_json::from_slice::<serde_json::Value>(&adopt.stdout).unwrap()["adoption"]["id"]
+        .as_i64()
+        .unwrap();
+    let adopted = targets();
+    assert_eq!(adopted["external_targets"][0]["status"], "adopted");
+    assert_eq!(adopted["external_targets"][0]["adopted"], true);
+    assert_eq!(adopted["external_targets"][0]["adoption_id"], id);
+    let human = e.cmd().arg("targets").output().unwrap();
+    assert!(String::from_utf8_lossy(&human.stdout).contains(&format!("adopted #{id}")));
+    let moved = storage.join("moved");
+    std::fs::rename(&backing, &moved).unwrap();
+    std::fs::create_dir(&backing).unwrap();
+    let replaced = targets();
+    assert_eq!(replaced["external_targets"][0]["status"], "inventory_only");
+    assert_eq!(replaced["external_targets"][0]["adopted"], false);
+    assert!(replaced["external_targets"][0]["adoption_id"].is_null());
+    assert_eq!(std::fs::read(moved.join("keep")).unwrap(), b"preserve");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn targets_adoption_release_rejects_ambiguous_numeric_path() {
+    let e = env();
+    let storage = e.home.join("storage");
+    let backing = e.home.join("1");
+    std::fs::create_dir(&storage).unwrap();
+    std::fs::create_dir(&backing).unwrap();
+    configure_external_target_fixture(&e, &storage);
+    e.cmd()
+        .args(["targets", "adopt", "--yes"])
+        .arg(&backing)
+        .assert()
+        .success();
+    e.cmd()
+        .current_dir(&e.home)
+        .args(["targets", "release", "1"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("ambiguous"));
+    e.cmd()
+        .current_dir(&e.home)
+        .args(["targets", "release", "./1"])
+        .assert()
+        .success();
 }
 
 #[test]

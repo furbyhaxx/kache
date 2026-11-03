@@ -8277,6 +8277,8 @@ fn external_target_observations_are_visible_but_not_cleanable() {
         backing_path: "/storage/\nname".into(),
         last_observed: 0,
         status: "inventory_only",
+        adopted: false,
+        adoption_id: None,
     };
     let safe = render_external_target_rows(&[unsafe_row]).join("\n");
     assert!(!safe.contains('\u{1b}'), "{safe:?}");
@@ -8340,7 +8342,7 @@ fn external_target_adoption_status_checks_observed_backing_identity() {
     assert!(json[0]["adoption_id"].is_null());
 
     let adoption = store
-        .adopt_external_target(&backing, &[storage.clone()])
+        .adopt_external_target(&backing, std::slice::from_ref(&storage))
         .unwrap();
     let rows = external_target_rows(&config).unwrap();
     let json = serde_json::to_value(&rows).unwrap();
@@ -8362,6 +8364,96 @@ fn external_target_adoption_status_checks_observed_backing_identity() {
     assert_eq!(json[0]["adopted"], false);
     assert!(json[0]["adoption_id"].is_null());
     assert_eq!(fs::read(moved.join("keep")).unwrap(), b"preserve");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_target_classification_pins_backing_before_adoption() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    for input_kind in ["workspace", "link", "backing"] {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let storage = dir.path().join("storage");
+        let backing = storage.join("build");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&backing).unwrap();
+        fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        symlink(&backing, workspace.join("target")).unwrap();
+        let cache = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(dir.path())
+            .unwrap();
+        let mut config = crate::test_support::test_config(cache.path().to_path_buf());
+        config.external_target_roots.push(storage.clone());
+        let store = Store::open(&config).unwrap();
+        let input = match input_kind {
+            "workspace" => workspace.clone(),
+            "link" => workspace.join("target"),
+            _ => backing.clone(),
+        };
+        let pinned = pin_external_target(&config, &store, &input).unwrap();
+        fs::rename(&backing, storage.join("moved")).unwrap();
+        fs::create_dir(&backing).unwrap();
+        let error = store
+            .adopt_external_target_pinned(
+                &pinned.store_path,
+                &config.external_target_roots,
+                &pinned.backing,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                kache_store::ExternalTargetAdoptionError::Changed { .. }
+            ),
+            "{input_kind}: {error}"
+        );
+        assert!(store.list_adoptions().unwrap().is_empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_target_classification_detects_workspace_and_adopted_backing_ambiguity() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("storage");
+    let backing = dir.path().join("backing");
+    let other = storage.join("other");
+    let workspace = dir.path().join("workspace");
+    fs::create_dir_all(&other).unwrap();
+    fs::create_dir(&backing).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(workspace.join(".git")).unwrap();
+    let cache = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(dir.path())
+        .unwrap();
+    let mut config = crate::test_support::test_config(cache.path().to_path_buf());
+    config.external_target_roots.push(storage.clone());
+    let store = Store::open(&config).unwrap();
+    let error = pin_external_target(&config, &store, &workspace)
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("target symlink"));
+    symlink(&other, workspace.join("target")).unwrap();
+    let pinned = pin_external_target(&config, &store, &workspace).unwrap();
+    assert_eq!(pinned.backing_path, fs::canonicalize(&other).unwrap());
+    drop(pinned);
+
+    store
+        .adopt_external_target(&backing, std::slice::from_ref(&storage))
+        .unwrap();
+    fs::write(backing.join("Cargo.toml"), "[workspace]\n").unwrap();
+    symlink(&other, backing.join("target")).unwrap();
+    let error = pin_external_target(&config, &store, &backing)
+        .err()
+        .unwrap();
+    assert!(format!("{error:#}").contains("ambiguous"));
+    let pinned = pin_external_target(&config, &store, &backing.join("target")).unwrap();
+    assert_eq!(pinned.backing_path, fs::canonicalize(&other).unwrap());
 }
 
 #[test]

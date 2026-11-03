@@ -604,6 +604,23 @@ impl BenchPhase {
 
 #[derive(Subcommand)]
 enum TargetCommands {
+    /// Consent to future cleanup of an external target's entire backing directory
+    Adopt {
+        /// Workspace, target symlink, or backing directory
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// Accept the full-directory cleanup consent without a prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Withdraw an external target adoption by path or ID
+    Release {
+        /// Workspace, target symlink, backing directory, or adoption ID
+        #[arg(value_name = "PATH|ID")]
+        path_or_id: PathBuf,
+    },
+    /// List external target consent records
+    Adoptions,
     /// Share target files with blobs the store already holds
     Share {
         /// Clone each match from the stored blob. Without this, only report.
@@ -1245,6 +1262,15 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             cli::clean(&config, dry_run, yes, json, scope)
         }
         Some(Commands::Targets { command: None }) => cli::targets(&config, json),
+        Some(Commands::Targets {
+            command: Some(TargetCommands::Adopt { path, yes }),
+        }) => cli::target_adopt(&config, &path, yes, json),
+        Some(Commands::Targets {
+            command: Some(TargetCommands::Release { path_or_id }),
+        }) => cli::target_release(&config, &path_or_id, json),
+        Some(Commands::Targets {
+            command: Some(TargetCommands::Adoptions),
+        }) => cli::target_adoptions(&config, json),
         Some(Commands::Targets {
             command: Some(TargetCommands::Share { apply, paths }),
         }) => target_dedup::run(&config, &paths, apply, json),

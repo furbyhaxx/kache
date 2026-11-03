@@ -173,7 +173,7 @@ pub struct Config {
     /// file only, not libraries it loads at run time.
     /// `KACHE_TRUST_CODEGEN_BACKENDS` or `[cache] trust_codegen_backends`.
     pub trust_codegen_backends: bool,
-    /// Absolute external target roots allowlisted for inventory, not adoption or deletion.
+    /// External target roots for inventory and adoption filesystem checks; no consent or deletion.
     pub external_target_roots: Vec<PathBuf>,
     /// Explicit repository or immediate-parent search roots; empty when unconfigured.
     pub external_repository_roots: Vec<PathBuf>,

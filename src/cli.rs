@@ -6702,23 +6702,70 @@ struct ExternalTargetRow {
     backing_path: String,
     last_observed: i64,
     status: &'static str,
+    adopted: bool,
+    adoption_id: Option<i64>,
 }
 
 fn external_target_rows(config: &Config) -> Result<Vec<ExternalTargetRow>> {
-    Ok(Store::open(config)?
+    let store = Store::open(config)?;
+    store
         .external_target_observations()?
         .into_iter()
-        .map(|observation| ExternalTargetRow {
-            path: observation
-                .workspace_path
-                .join("target")
-                .display()
-                .to_string(),
-            backing_path: observation.snapshot.backing_path.display().to_string(),
-            last_observed: observation.last_observed,
-            status: "inventory_only",
+        .map(|observation| {
+            #[cfg(target_os = "linux")]
+            let adoption_id = match pin_target_directory(&observation.snapshot.backing_path) {
+                Ok(file) => {
+                    let id = kache_fs::handle_identity(&file).with_context(|| {
+                        format!(
+                            "identifying observed backing {}",
+                            observation.snapshot.backing_path.display()
+                        )
+                    })?;
+                    if id.dev == observation.snapshot.backing_identity.device
+                        && id.ino == observation.snapshot.backing_identity.inode
+                    {
+                        store.verify_adoption(&file)?.map(|adoption| adoption.id)
+                    } else {
+                        None
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+                    ) =>
+                {
+                    None
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "opening observed backing {}",
+                            observation.snapshot.backing_path.display()
+                        )
+                    });
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let adoption_id = None;
+            Ok(ExternalTargetRow {
+                path: observation
+                    .workspace_path
+                    .join("target")
+                    .display()
+                    .to_string(),
+                backing_path: observation.snapshot.backing_path.display().to_string(),
+                last_observed: observation.last_observed,
+                status: if adoption_id.is_some() {
+                    "adopted"
+                } else {
+                    "inventory_only"
+                },
+                adopted: adoption_id.is_some(),
+                adoption_id,
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn terminal_safe_text(text: &str) -> String {
@@ -6733,6 +6780,389 @@ fn terminal_safe_text(text: &str) -> String {
     output
 }
 
+#[derive(serde::Serialize)]
+struct AdoptionRow {
+    id: i64,
+    backing_path: String,
+    adopted_at: i64,
+    consent_revision: i64,
+}
+
+impl From<&kache_store::ExternalTargetAdoption> for AdoptionRow {
+    fn from(adoption: &kache_store::ExternalTargetAdoption) -> Self {
+        Self {
+            id: adoption.id,
+            backing_path: adoption.backing_path.display().to_string(),
+            adopted_at: adoption.adopted_at,
+            consent_revision: adoption.consent_revision,
+        }
+    }
+}
+
+fn target_command_error(error: anyhow::Error) -> anyhow::Error {
+    if crate::machine::failure_exit(&error).is_none() {
+        error
+    } else {
+        anyhow::anyhow!(terminal_safe_text(&format!("{error:#}")))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pin_target_directory(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path: std::path::PathBuf = path.components().collect();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(target_os = "linux")]
+struct PinnedExternalTarget {
+    store_path: std::path::PathBuf,
+    backing_path: std::path::PathBuf,
+    backing: std::fs::File,
+    workspace: Option<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+fn adoption_for_pinned_file(
+    store: &Store,
+    file: &std::fs::File,
+) -> Result<Option<kache_store::ExternalTargetAdoption>> {
+    let identity = kache_fs::handle_identity(file)?;
+    let candidates: Vec<_> = store
+        .list_adoptions()?
+        .into_iter()
+        .filter(|adoption| {
+            adoption.identity.device == identity.dev && adoption.identity.inode == identity.ino
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let handle = kache_fs::export_file_handle(file)?.handle;
+    let matches: Vec<_> = candidates
+        .into_iter()
+        .filter(|adoption| adoption.handle == handle)
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [adoption] => Ok(Some(adoption.clone())),
+        _ => anyhow::bail!("multiple adoption records match the pinned directory"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn target_path_is_present(path: &std::path::Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pin_external_target(
+    config: &Config,
+    store: &Store,
+    input: &std::path::Path,
+) -> Result<PinnedExternalTarget> {
+    use std::os::fd::AsRawFd;
+    use std::path::{Path, PathBuf};
+
+    let input: PathBuf = input.components().collect();
+    let metadata = std::fs::symlink_metadata(&input)
+        .with_context(|| format!("inspecting {}", input.display()))?;
+    let (store_path, workspace, direct_backing) = if metadata.file_type().is_symlink() {
+        if input.file_name() != Some(std::ffi::OsStr::new("target")) {
+            anyhow::bail!("{} is a symlink, not a target link", input.display());
+        }
+        (input.clone(), None, None)
+    } else if metadata.is_dir() {
+        let directory =
+            pin_target_directory(&input).with_context(|| format!("pinning {}", input.display()))?;
+        let canonical = std::fs::canonicalize(&input)?;
+        if kache_fs::directory_identity(&canonical)? != kache_fs::handle_identity(&directory)? {
+            anyhow::bail!("{} changed while inspecting it", input.display());
+        }
+        let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        let target = pinned_path.join("target");
+        let has_link = match std::fs::symlink_metadata(&target) {
+            Ok(metadata) => metadata.file_type().is_symlink(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspecting {}/target", input.display()));
+            }
+        };
+        let workspace_marker = target_path_is_present(&pinned_path.join("Cargo.toml"))?
+            || target_path_is_present(&pinned_path.join(".git"))?;
+        if has_link {
+            let adopted_backing = adoption_for_pinned_file(store, &directory)?.is_some();
+            let mut inside_storage = false;
+            for root in &config.external_target_roots {
+                let root = std::fs::canonicalize(root).with_context(|| {
+                    format!("inspecting configured external root {}", root.display())
+                })?;
+                inside_storage |= canonical.starts_with(root);
+            }
+            if !workspace_marker || inside_storage || adopted_backing {
+                anyhow::bail!(
+                    "ambiguous directory {}; use its explicit target link {} or an unambiguous backing path",
+                    input.display(),
+                    input.join("target").display()
+                );
+            }
+            (target, Some(directory), None)
+        } else if workspace_marker {
+            anyhow::bail!(
+                "ambiguous directory {}; a workspace needs a target symlink; use an explicit backing path",
+                input.display()
+            );
+        } else {
+            (input.clone(), None, Some(directory))
+        }
+    } else {
+        anyhow::bail!("{} is not a directory or target symlink", input.display());
+    };
+
+    let (source, backing) = match direct_backing {
+        Some(file) => (store_path.clone(), file),
+        None => {
+            let link = std::fs::read_link(&store_path)
+                .with_context(|| format!("reading target link {}", input.display()))?;
+            let source = if link.is_absolute() {
+                link
+            } else {
+                store_path.parent().unwrap_or(Path::new(".")).join(link)
+            };
+            let source: PathBuf = source.components().collect();
+            let backing = pin_target_directory(&source)
+                .with_context(|| format!("pinning backing for {}", input.display()))?;
+            (source, backing)
+        }
+    };
+    let backing_path = std::fs::canonicalize(&source)
+        .with_context(|| format!("resolving backing for {}", input.display()))?;
+    if kache_fs::directory_identity(&backing_path)? != kache_fs::handle_identity(&backing)? {
+        anyhow::bail!(
+            "backing for {} changed while inspecting it",
+            input.display()
+        );
+    }
+    Ok(PinnedExternalTarget {
+        store_path,
+        backing_path,
+        backing,
+        workspace,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_target_adoption(statement: &str, yes: bool) -> Result<()> {
+    use std::io::Write;
+
+    eprintln!("{statement}");
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("adoption needs confirmation; pass --yes in non-interactive use");
+    }
+    eprint!("Adopt this entire backing directory? [y/N] ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        anyhow::bail!("adoption was not confirmed");
+    }
+    Ok(())
+}
+
+/// Record explicit consent for an external target's entire backing directory.
+pub fn target_adopt(config: &Config, input: &std::path::Path, yes: bool, json: bool) -> Result<()> {
+    target_adopt_impl(config, input, yes, json)
+        .with_context(|| format!("adopting {}", input.display()))
+        .map_err(target_command_error)
+}
+
+#[cfg(target_os = "linux")]
+fn target_adopt_impl(
+    config: &Config,
+    input: &std::path::Path,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    let store = Store::open(config)?;
+    let pinned = pin_external_target(config, &store, input)?;
+    let statement = format!(
+        "Consent: the entire contents of {} may be deleted after the configured Cargo-idle threshold (currently {} hours). Changing the configuration later also changes the threshold for previously adopted targets. The target symlink is kept. Nothing is deleted now.",
+        terminal_safe_text(&pinned.backing_path.display().to_string()),
+        config.target_idle_hours,
+    );
+    confirm_target_adoption(&statement, yes)?;
+    let adoption = store.adopt_external_target_pinned(
+        &pinned.store_path,
+        &config.external_target_roots,
+        &pinned.backing,
+    )?;
+    drop(pinned.workspace);
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            adoption: AdoptionRow,
+            consent: String,
+        }
+        crate::machine::emit(
+            "targets-adopt",
+            Body {
+                adoption: (&adoption).into(),
+                consent: statement,
+            },
+            Vec::new(),
+        )
+    } else {
+        println!(
+            "Adopted {} as #{}.",
+            terminal_safe_text(&adoption.backing_path.display().to_string()),
+            adoption.id
+        );
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn target_adopt_impl(
+    _config: &Config,
+    _input: &std::path::Path,
+    _yes: bool,
+    _json: bool,
+) -> Result<()> {
+    anyhow::bail!("external target adoption requires Linux file handles")
+}
+
+/// Withdraw consent by path or inventory ID without changing target contents.
+pub fn target_release(config: &Config, input: &std::path::Path, json: bool) -> Result<()> {
+    target_release_impl(config, input, json)
+        .with_context(|| format!("releasing {}", input.display()))
+        .map_err(target_command_error)
+}
+
+fn target_release_impl(config: &Config, input: &std::path::Path, json: bool) -> Result<()> {
+    let store = Store::open(config)?;
+    let numeric = input
+        .to_str()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()));
+    let adoption = if let Some(value) = numeric {
+        let id: i64 = value
+            .parse()
+            .with_context(|| format!("invalid adoption ID {value}"))?;
+        let matches_id = store
+            .list_adoptions()?
+            .into_iter()
+            .find(|adoption| adoption.id == id);
+        let path_exists = match std::fs::symlink_metadata(input) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting {}", input.display()));
+            }
+        };
+        if matches_id.is_some() && path_exists {
+            anyhow::bail!(
+                "ambiguous {}: both an adoption ID and a path; use ./{} for the path or change directory to release the ID",
+                input.display(),
+                input.display()
+            );
+        }
+        if let Some(adoption) = matches_id {
+            adoption
+        } else if !path_exists {
+            anyhow::bail!("no adoption has ID {id}");
+        } else {
+            adoption_for_target_path(config, &store, input)?
+        }
+    } else {
+        adoption_for_target_path(config, &store, input)?
+    };
+    store.release_adoption(adoption.id)?;
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            released_id: i64,
+        }
+        crate::machine::emit(
+            "targets-release",
+            Body {
+                released_id: adoption.id,
+            },
+            Vec::new(),
+        )
+    } else {
+        println!("Released adoption #{}; no files were deleted.", adoption.id);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn adoption_for_target_path(
+    config: &Config,
+    store: &Store,
+    input: &std::path::Path,
+) -> Result<kache_store::ExternalTargetAdoption> {
+    let pinned = pin_external_target(config, store, input)?;
+    let adoption = adoption_for_pinned_file(store, &pinned.backing)?
+        .with_context(|| format!("no adoption matches {}", input.display()))?;
+    drop(pinned.workspace);
+    Ok(adoption)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn adoption_for_target_path(
+    _config: &Config,
+    _store: &Store,
+    input: &std::path::Path,
+) -> Result<kache_store::ExternalTargetAdoption> {
+    anyhow::bail!(
+        "cannot inspect adoption path {} without Linux file handles",
+        input.display()
+    )
+}
+
+/// List external target consent records, whose recorded paths are only hints.
+pub fn target_adoptions(config: &Config, json: bool) -> Result<()> {
+    let adoptions = Store::open(config)
+        .and_then(|store| store.list_adoptions().map_err(Into::into))
+        .map_err(target_command_error)?;
+    if json {
+        #[derive(serde::Serialize)]
+        struct Body {
+            adoptions: Vec<AdoptionRow>,
+        }
+        crate::machine::emit(
+            "targets-adoptions",
+            Body {
+                adoptions: adoptions.iter().map(AdoptionRow::from).collect(),
+            },
+            Vec::new(),
+        )
+    } else {
+        if adoptions.is_empty() {
+            println!("No external target adoptions.");
+        }
+        for adoption in adoptions {
+            println!(
+                "  #{}  {} (recorded path; not revalidated)",
+                adoption.id,
+                terminal_safe_text(&adoption.backing_path.display().to_string())
+            );
+        }
+        Ok(())
+    }
+}
+
 fn render_external_target_rows(rows: &[ExternalTargetRow]) -> Vec<String> {
     if rows.is_empty() {
         return Vec::new();
@@ -6740,8 +7170,12 @@ fn render_external_target_rows(rows: &[ExternalTargetRow]) -> Vec<String> {
     let mut lines =
         vec!["External target observations (historical; not eligible for cleanup):".to_string()];
     lines.extend(rows.iter().map(|row| {
+        let status = match row.adoption_id {
+            Some(id) => format!("adopted #{id}; consent only"),
+            None => "inventory only".to_string(),
+        };
         format!(
-            "  {} -> {}",
+            "  {} -> {} ({status})",
             terminal_safe_text(&row.path),
             terminal_safe_text(&row.backing_path)
         )

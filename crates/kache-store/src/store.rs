@@ -5326,19 +5326,59 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         path: &Path,
         external_target_roots: &[PathBuf],
     ) -> ExternalTargetAdoptionResult<ExternalTargetAdoption> {
-        self.adopt_external_target_with(path, external_target_roots, || {})
+        self.adopt_external_target_with(path, external_target_roots, None, || {})
+    }
+
+    /// Record consent only if `path` still names the caller's pinned backing.
+    ///
+    /// The descriptor is checked against the directory reopened from `path`
+    /// before and inside the inventory transaction. It must remain open until
+    /// this call returns. The consent and deletion-safety limits of
+    /// [`Self::adopt_external_target`] also apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExternalTargetAdoptionError::Changed`] if the path identifies
+    /// a different backing, or the same failures as `adopt_external_target`.
+    pub fn adopt_external_target_pinned(
+        &self,
+        path: &Path,
+        external_target_roots: &[PathBuf],
+        expected: &fs::File,
+    ) -> ExternalTargetAdoptionResult<ExternalTargetAdoption> {
+        self.adopt_external_target_with(path, external_target_roots, Some(expected), || {})
     }
 
     fn adopt_external_target_with(
         &self,
         path: &Path,
         external_target_roots: &[PathBuf],
+        expected: Option<&fs::File>,
         after_write: impl FnOnce(),
     ) -> ExternalTargetAdoptionResult<ExternalTargetAdoption> {
         self.refuse_write("adopt an external target")?;
         #[cfg(target_os = "linux")]
         {
             let backing = AdoptionBacking::open(path)?;
+            let expected_matches = || -> Result<bool> {
+                let Some(expected) = expected else {
+                    return Ok(true);
+                };
+                if !expected.metadata()?.is_dir() {
+                    return Ok(false);
+                }
+                let identity = kache_fs::handle_identity(expected)?;
+                if identity.dev != backing.identity.device || identity.ino != backing.identity.inode
+                {
+                    return Ok(false);
+                }
+                Ok(kache_fs::export_file_handle(expected)?.handle == backing.handle)
+            };
+            if !expected_matches()? {
+                return Err(ExternalTargetAdoptionError::Changed {
+                    path: path.to_path_buf(),
+                });
+            }
             let root = AdoptionRoot::matching(external_target_roots, backing.identity.device)
                 .ok_or_else(|| ExternalTargetAdoptionError::DifferentFilesystem {
                     path: path.to_path_buf(),
@@ -5391,7 +5431,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
                 pinned.push((adoption, file));
             }
-            if !backing.unchanged() || !root.unchanged() {
+            if !backing.unchanged() || !root.unchanged() || !expected_matches()? {
                 return Err(ExternalTargetAdoptionError::Changed {
                     path: path.to_path_buf(),
                 });
@@ -5413,7 +5453,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .find(|adoption| adoption.id == id)
                 .context("new adoption was not stored")?;
             after_write();
-            if !backing.unchanged() || !root.unchanged() {
+            if !backing.unchanged() || !root.unchanged() || !expected_matches()? {
                 return Err(ExternalTargetAdoptionError::Changed {
                     path: path.to_path_buf(),
                 });
@@ -5434,7 +5474,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (path, external_target_roots, after_write);
+            let _ = (path, external_target_roots, expected, after_write);
             Err(ExternalTargetAdoptionError::Storage(anyhow::anyhow!(
                 "external target adoption requires Linux file handles"
             )))

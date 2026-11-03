@@ -4733,6 +4733,49 @@ mod external_target_inventory {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn external_target_adoption_rejects_replacement_after_classification() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let pinned = open_inventory_directory(&f.backing, false).unwrap();
+        let moved = f.allowed.join("moved");
+        fs::rename(&f.backing, &moved).unwrap();
+        fs::create_dir(&f.backing).unwrap();
+        assert!(matches!(
+            f.store.adopt_external_target_pinned(
+                &f.backing,
+                std::slice::from_ref(&f.allowed),
+                &pinned
+            ),
+            Err(ExternalTargetAdoptionError::Changed { .. })
+        ));
+        assert!(f.store.list_adoptions().unwrap().is_empty());
+        let adoption = f
+            .store
+            .adopt_external_target_pinned(&moved, std::slice::from_ref(&f.allowed), &pinned)
+            .unwrap();
+        assert_eq!(
+            f.store.verify_adoption(&pinned).unwrap(),
+            Some(adoption.clone())
+        );
+        f.store.release_adoption(adoption.id).unwrap();
+        let error = f
+            .store
+            .adopt_external_target_with(
+                &moved,
+                std::slice::from_ref(&f.allowed),
+                Some(&pinned),
+                || {
+                    fs::rename(&moved, f.allowed.join("moved-again")).unwrap();
+                    fs::create_dir(&moved).unwrap();
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, ExternalTargetAdoptionError::Changed { .. }));
+        assert!(f.store.list_adoptions().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn external_target_adoption_rejects_symlink_backings_even_with_trailing_slash() {
         let _serial = serialize_inventory_tests();
         let f = Fixture::new();
@@ -4943,10 +4986,8 @@ mod external_target_inventory {
             let path = f.workspace.join("target");
             let error = f
                 .store
-                .adopt_external_target_with(
-                    &path,
-                    std::slice::from_ref(&f.allowed),
-                    || match change {
+                .adopt_external_target_with(&path, std::slice::from_ref(&f.allowed), None, || {
+                    match change {
                         "root" => fs::rename(&f.allowed, f.temp.path().join("moved-root")).unwrap(),
                         "link" => {
                             fs::remove_file(&path).unwrap();
@@ -4956,8 +4997,8 @@ mod external_target_inventory {
                             fs::rename(&f.backing, f.allowed.join("moved")).unwrap();
                             fs::create_dir(&f.backing).unwrap();
                         }
-                    },
-                )
+                    }
+                })
                 .unwrap_err();
             assert!(matches!(error, ExternalTargetAdoptionError::Changed { .. }));
             assert!(f.store.list_adoptions().unwrap().is_empty());
@@ -4977,7 +5018,7 @@ mod external_target_inventory {
         fs::create_dir(&other).unwrap();
         let error = f
             .store
-            .adopt_external_target_with(&other, std::slice::from_ref(&f.allowed), || {
+            .adopt_external_target_with(&other, std::slice::from_ref(&f.allowed), None, || {
                 fs::rename(&f.backing, f.allowed.join("moved")).unwrap();
                 fs::create_dir(&f.backing).unwrap();
             })

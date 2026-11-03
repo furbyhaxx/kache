@@ -1951,24 +1951,30 @@ const EXTERNAL_TARGET_CONSENT_REVISION: i64 = 1;
 const EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 // A close on any fd for the DB can release another SQLite connection's POSIX locks.
+// None holds the entire registry when mount isolation cannot be verified.
 static EXTERNAL_TARGET_INVENTORY_GATE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<kache_fs::InodeId>>,
+    std::sync::Mutex<std::collections::HashSet<Option<kache_fs::InodeId>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 struct InventoryGate {
-    identity: kache_fs::InodeId,
+    identity: Option<kache_fs::InodeId>,
 }
 
 impl InventoryGate {
     fn acquire(
-        identity: kache_fs::InodeId,
+        identity: Option<kache_fs::InodeId>,
         deadline: std::time::Instant,
         path: &Path,
     ) -> Result<Self> {
         loop {
             match EXTERNAL_TARGET_INVENTORY_GATE.try_lock() {
                 Ok(mut active) => {
-                    if active.insert(identity) {
+                    let available = match identity {
+                        None => active.is_empty(),
+                        Some(_) => !active.contains(&None) && !active.contains(&identity),
+                    };
+                    if available {
+                        active.insert(identity);
                         return Ok(Self { identity });
                     }
                 }
@@ -2123,8 +2129,12 @@ fn validate_inventory_leaf_metadata(
     anyhow::bail!("cannot verify inventory file metadata: {}", path.display())
 }
 
-fn validate_inventory_family(directory: &fs::File, directory_path: &Path) -> Result<()> {
-    let parent_mount = kache_fs::unique_mount_id(directory)
+fn validate_inventory_family(
+    directory: &fs::File,
+    directory_path: &Path,
+    mount_id: &impl Fn(&fs::File) -> std::io::Result<u64>,
+) -> Result<()> {
+    let parent_mount = mount_id(directory)
         .with_context(|| format!("identifying inventory mount {}", directory_path.display()))?;
     for name in EXTERNAL_TARGET_INVENTORY_FILES {
         let path = directory_path.join(name);
@@ -2239,6 +2249,22 @@ fn open_external_target_inventory_mode(
     create_db: bool,
     before_sqlite_open: impl FnOnce(),
 ) -> Result<Option<InventoryConnection>> {
+    open_external_target_inventory_mode_with_mount_query(
+        cache_dir,
+        write,
+        create_db,
+        before_sqlite_open,
+        kache_fs::unique_mount_id,
+    )
+}
+
+fn open_external_target_inventory_mode_with_mount_query(
+    cache_dir: &Path,
+    write: bool,
+    create_db: bool,
+    before_sqlite_open: impl FnOnce(),
+    mount_id: impl Fn(&fs::File) -> std::io::Result<u64>,
+) -> Result<Option<InventoryConnection>> {
     use std::io::Read;
 
     let requested_path = cache_dir.join(EXTERNAL_TARGET_INVENTORY_DB);
@@ -2269,13 +2295,21 @@ fn open_external_target_inventory_mode(
     }
     let directory = options.open(&directory_path)?;
     validate_inventory_directory(cache_dir, &directory_path, &directory)?;
-    let gate = InventoryGate::acquire(
-        kache_fs::handle_identity(&directory)?,
-        deadline,
-        &requested_path,
-    )?;
+    let identity = match mount_id(&directory) {
+        Ok(_) => Some(kache_fs::handle_identity(&directory)?),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => None,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("identifying inventory mount {}", directory_path.display())
+            });
+        }
+    };
+    let gate = InventoryGate::acquire(identity, deadline, &requested_path)?;
     validate_inventory_directory(cache_dir, &directory_path, &directory)?;
-    let validate_family = || validate_inventory_family(&directory, &directory_path);
+    let validate_family = || match identity {
+        Some(_) => validate_inventory_family(&directory, &directory_path, &mount_id),
+        None => Ok(()),
+    };
 
     let lock_path = directory_path.join(EXTERNAL_TARGET_INVENTORY_LOCK);
     let lock = StoreLock {

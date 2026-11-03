@@ -4701,6 +4701,22 @@ mod external_target_inventory {
         }
     }
 
+    fn inventory_mount_ids_supported(cache_dir: &Path) -> bool {
+        let directory = fs::File::open(cache_dir).unwrap();
+        match kache_fs::unique_mount_id(&directory) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                eprintln!("unique mount IDs unavailable; supported-mode test skipped");
+                false
+            }
+            Err(error) => panic!("querying inventory mount capability: {error}"),
+        }
+    }
+
+    fn unsupported_inventory_mount(_: &fs::File) -> std::io::Result<u64> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn external_target_adoption_tracks_identity_across_rename_and_replacement() {
@@ -5182,7 +5198,9 @@ mod external_target_inventory {
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
             let gate_held = loop {
                 match EXTERNAL_TARGET_INVENTORY_GATE.try_lock() {
-                    Ok(active) if active.contains(&identity) => break true,
+                    Ok(active) if active.contains(&Some(identity)) || active.contains(&None) => {
+                        break true;
+                    }
                     Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
                     Err(std::sync::TryLockError::Poisoned(_)) => panic!("inventory gate poisoned"),
                 }
@@ -5710,6 +5728,9 @@ mod external_target_inventory {
 
     fn assert_file_bind_inventory_leaf_is_refused(name: &str) {
         let first = Fixture::new();
+        if !inventory_mount_ids_supported(&first.store.config.cache_dir) {
+            return;
+        }
         let second = Fixture::new();
         let first_snapshot = first.snapshot(&first.workspace);
         let second_snapshot = second.snapshot(&second.workspace);
@@ -5802,11 +5823,99 @@ mod external_target_inventory {
     }
 
     #[test]
+    #[ignore = "requires a private user and mount namespace"]
+    fn external_target_inventory_unsupported_mount_serializes_bind_files() {
+        let _serial = serialize_inventory_tests();
+        for name in [
+            EXTERNAL_TARGET_INVENTORY_DB,
+            "external-target-inventory.db-journal",
+        ] {
+            let first = Fixture::new();
+            let second = Fixture::new();
+            drop(first.inventory_db());
+            drop(second.inventory_db());
+            let leaf = second.store.config.cache_dir.join(name);
+            if !leaf.exists() {
+                use std::os::unix::fs::OpenOptionsExt;
+                drop(
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&leaf)
+                        .unwrap(),
+                );
+            }
+            assert!(
+                std::process::Command::new("mount")
+                    .arg("--bind")
+                    .arg(first.inventory_path())
+                    .arg(&leaf)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let global = open_external_target_inventory_mode_with_mount_query(
+                &first.store.config.cache_dir,
+                true,
+                true,
+                || {},
+                unsupported_inventory_mount,
+            )
+            .unwrap()
+            .unwrap();
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &global.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            let result = open_external_target_inventory_mode_with_mount_query(
+                &second.store.config.cache_dir,
+                true,
+                true,
+                || {},
+                unsupported_inventory_mount,
+            );
+            let error = result.err().unwrap();
+            let probe = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::tests::external_target_inventory::external_target_inventory_lock_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("KACHE_TEST_INVENTORY_DB", first.inventory_path())
+                .output()
+                .unwrap();
+            drop(transaction);
+            drop(global);
+            assert!(
+                std::process::Command::new("umount")
+                    .arg(&leaf)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(error.to_string().contains("inventory database is busy"));
+            assert!(
+                probe.status.success(),
+                "{name} released the fallback SQLite lock: {}\n{}",
+                String::from_utf8_lossy(&probe.stdout),
+                String::from_utf8_lossy(&probe.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn external_target_inventory_refuses_unsafe_auxiliary_files() {
         let _serial = serialize_inventory_tests();
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
+        let probe = Fixture::new();
+        if !inventory_mount_ids_supported(&probe.store.config.cache_dir) {
+            return;
+        }
         for suffix in ["-journal", "-wal", "-shm"] {
             for kind in ["symlink", "hardlink", "directory", "socket", "public"] {
                 let first = Fixture::new();
@@ -5890,6 +5999,9 @@ mod external_target_inventory {
     fn external_target_inventory_rechecks_auxiliaries_before_sqlite_open() {
         let _serial = serialize_inventory_tests();
         let f = Fixture::new();
+        if !inventory_mount_ids_supported(&f.store.config.cache_dir) {
+            return;
+        }
         let snapshot = f.snapshot(&f.workspace);
         assert!(f.observe(&f.workspace, &snapshot));
         let journal = f
@@ -6029,9 +6141,203 @@ mod external_target_inventory {
     }
 
     #[test]
+    fn external_target_inventory_unsupported_mount_query_uses_legacy_path() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let db = open_external_target_inventory_mode_with_mount_query(
+            &f.store.config.cache_dir,
+            true,
+            true,
+            || {},
+            unsupported_inventory_mount,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(db._gate.identity, None);
+        db.execute(
+            "UPDATE external_target_inventory_cursor SET next_turn = 7",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let db = open_external_target_inventory_mode_with_mount_query(
+            &f.store.config.cache_dir,
+            false,
+            false,
+            || {},
+            unsupported_inventory_mount,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(db._gate.identity, None);
+        let turn: i64 = db
+            .query_row(
+                "SELECT next_turn FROM external_target_inventory_cursor",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(turn, 7);
+    }
+
+    #[test]
+    fn external_target_inventory_mount_query_errors_fail_closed() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let error = open_external_target_inventory_mode_with_mount_query(
+            &f.store.config.cache_dir,
+            true,
+            true,
+            || {},
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!f.inventory_lock_path().exists());
+        assert!(!f.inventory_path().exists());
+
+        if !inventory_mount_ids_supported(&f.store.config.cache_dir) {
+            return;
+        }
+        let reached_sqlite = std::cell::Cell::new(false);
+        let error = open_external_target_inventory_mode_with_mount_query(
+            &f.store.config.cache_dir,
+            true,
+            true,
+            || reached_sqlite.set(true),
+            |directory| {
+                if reached_sqlite.get() {
+                    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+                } else {
+                    kache_fs::unique_mount_id(directory)
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(reached_sqlite.get());
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(f.inventory_lock_path().exists());
+        assert!(f.inventory_path().exists());
+        assert!(
+            open_external_target_inventory(&f.store.config.cache_dir, true)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn external_target_inventory_global_holder_excludes_per_cache() {
+        let _serial = serialize_inventory_tests();
+        let first = Fixture::new();
+        if !inventory_mount_ids_supported(&first.store.config.cache_dir) {
+            return;
+        }
+        let second = Fixture::new();
+        let global = open_external_target_inventory_mode_with_mount_query(
+            &first.store.config.cache_dir,
+            true,
+            true,
+            || {},
+            unsupported_inventory_mount,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(global._gate.identity, None);
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &global.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let error = open_external_target_inventory(&second.store.config.cache_dir, true)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("inventory database is busy"));
+        assert!(!second.inventory_lock_path().exists());
+        assert!(!second.inventory_path().exists());
+        let probe = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::external_target_inventory::external_target_inventory_lock_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_INVENTORY_DB", first.inventory_path())
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "fallback transaction lost its lock: {}\n{}",
+            String::from_utf8_lossy(&probe.stdout),
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        drop(transaction);
+        drop(global);
+        let per_cache = open_external_target_inventory(&second.store.config.cache_dir, true)
+            .unwrap()
+            .unwrap();
+        assert!(per_cache._gate.identity.is_some());
+    }
+
+    #[test]
+    fn external_target_inventory_global_waiter_excludes_all_per_cache_holders() {
+        let _serial = serialize_inventory_tests();
+        let first = Fixture::new();
+        if !inventory_mount_ids_supported(&first.store.config.cache_dir) {
+            return;
+        }
+        let second = Fixture::new();
+        let waiting = Fixture::new();
+        let mut first_guard = Some(first.inventory_db());
+        let second_guard = second.inventory_db();
+        assert!(first_guard.as_ref().unwrap()._gate.identity.is_some());
+        assert!(second_guard._gate.identity.is_some());
+        assert_ne!(
+            first_guard.as_ref().unwrap()._gate.identity,
+            second_guard._gate.identity
+        );
+        for _ in 0..2 {
+            let error = open_external_target_inventory_mode_with_mount_query(
+                &waiting.store.config.cache_dir,
+                true,
+                true,
+                || {},
+                unsupported_inventory_mount,
+            )
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains("inventory database is busy"));
+            assert!(!waiting.inventory_lock_path().exists());
+            assert!(!waiting.inventory_path().exists());
+            drop(first_guard.take());
+        }
+        drop(second_guard);
+        let global = open_external_target_inventory_mode_with_mount_query(
+            &waiting.store.config.cache_dir,
+            true,
+            true,
+            || {},
+            unsupported_inventory_mount,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(global._gate.identity, None);
+    }
+
+    #[test]
     fn external_target_inventory_distinct_caches_progress_during_transaction() {
         let _serial = serialize_inventory_tests();
         let first = Fixture::new();
+        if !inventory_mount_ids_supported(&first.store.config.cache_dir) {
+            return;
+        }
         let second = Fixture::new();
         let empty = Fixture::new();
         let snapshot = second.snapshot(&second.workspace);
@@ -6137,21 +6443,24 @@ mod external_target_inventory {
 
     #[test]
     fn external_target_inventory_poisoned_gate_fails_closed() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "store::tests::external_target_inventory::external_target_inventory_poisoned_gate_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for mode in ["native", "global"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::tests::external_target_inventory::external_target_inventory_poisoned_gate_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("KACHE_TEST_INVENTORY_GATE_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -6163,8 +6472,20 @@ mod external_target_inventory {
         let second_snapshot = second.snapshot(&second.workspace);
         assert!(first.observe(&first.workspace, &first_snapshot));
         assert!(second.observe(&second.workspace, &second_snapshot));
-        let guard = first.inventory_db();
-        let identity = kache_fs::handle_identity(&guard.directory).unwrap();
+        let guard = if std::env::var("KACHE_TEST_INVENTORY_GATE_MODE").unwrap() == "global" {
+            open_external_target_inventory_mode_with_mount_query(
+                &first.store.config.cache_dir,
+                true,
+                true,
+                || {},
+                unsupported_inventory_mount,
+            )
+            .unwrap()
+            .unwrap()
+        } else {
+            first.inventory_db()
+        };
+        let identity = guard._gate.identity;
         assert!(
             std::thread::spawn(|| {
                 let _active = EXTERNAL_TARGET_INVENTORY_GATE.lock().unwrap();
@@ -6185,6 +6506,16 @@ mod external_target_inventory {
             &second.store.config.cache_dir,
         ] {
             let error = open_external_target_inventory(cache, false).err().unwrap();
+            assert!(error.to_string().contains("coordination state is poisoned"));
+            let error = open_external_target_inventory_mode_with_mount_query(
+                cache,
+                false,
+                false,
+                || {},
+                unsupported_inventory_mount,
+            )
+            .err()
+            .unwrap();
             assert!(error.to_string().contains("coordination state is poisoned"));
         }
         drop(guard);

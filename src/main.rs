@@ -18,6 +18,7 @@ mod config_tui;
 mod daemon;
 mod daemon_publish;
 mod demand;
+mod discovery_protocol;
 mod discovery_sandbox;
 mod disk_recovery;
 mod events;

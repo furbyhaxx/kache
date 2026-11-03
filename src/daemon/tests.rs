@@ -14087,8 +14087,9 @@ async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_lim
     config.max_size = 1;
     let key = test_cache_key("denied-upload");
     seed_store_entry(&config, &key, "serde", dir.path());
-    // Only the store keeps the bytes (no source hardlink holds the blob).
-    std::fs::remove_dir_all(dir.path().join(format!("{key}-src"))).unwrap();
+    Store::open(&config)
+        .unwrap()
+        .remove_clone_for_test(&dir.path().join(format!("{key}-src/libfoo.rlib")));
     let job = persist_upload_job(
         &config,
         &UploadJob {

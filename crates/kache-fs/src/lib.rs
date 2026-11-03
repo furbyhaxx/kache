@@ -20,7 +20,7 @@ pub use exchange::exchange_entries;
 mod identity;
 pub use identity::{
     ExportedFileHandle, OpaqueFileHandle, directory_identity, export_file_handle, file_identity,
-    handle_identity, unique_mount_id,
+    handle_identity, unique_mount_id, unique_mount_id_at,
 };
 
 mod mount_observer;

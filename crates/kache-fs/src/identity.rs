@@ -162,25 +162,7 @@ pub fn unique_mount_id(file: &fs::File) -> io::Result<u64> {
     {
         use std::os::fd::AsRawFd;
 
-        let mut stat = StatxBuffer::new();
-        // SAFETY: file owns a live FD, AT_EMPTY_PATH uses the NUL-terminated
-        // empty path, and stat is an aligned writable 256-byte UAPI buffer.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_statx as libc::c_long,
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH,
-                STATX_MNT_ID_UNIQUE,
-                &raw mut stat,
-            )
-        };
-        let result = if result == 0 {
-            Ok((stat.stx_mask, stat.stx_mnt_id))
-        } else {
-            Err(io::Error::last_os_error())
-        };
-        checked_unique_mount_id(result)
+        statx_unique_mount_id(file.as_raw_fd(), c"", libc::AT_EMPTY_PATH)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -190,6 +172,66 @@ pub fn unique_mount_id(file: &fs::File) -> io::Result<u64> {
             "unique mount IDs are only supported on Linux",
         ))
     }
+}
+
+/// Query one directory entry's mount ID without opening or closing that file.
+///
+/// The name must be a single child component; symlinks are not followed.
+/// This is a point-in-time query, not protection against later replacement.
+/// IDs have the same boot-scoped limits as [`unique_mount_id`].
+///
+/// # Errors
+///
+/// Rejects invalid names and unsupported kernels/platforms; other syscall errors
+/// are preserved, including a missing entry.
+pub fn unique_mount_id_at(directory: &fs::File, name: &std::ffi::CStr) -> io::Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let bytes = name.to_bytes();
+        if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected one child name",
+            ));
+        }
+        statx_unique_mount_id(directory.as_raw_fd(), name, libc::AT_SYMLINK_NOFOLLOW)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (directory, name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unique mount IDs are only supported on Linux",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn statx_unique_mount_id(
+    fd: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> io::Result<u64> {
+    let mut stat = StatxBuffer::new();
+    // SAFETY: callers supply a live FD, a valid CStr and supported flags;
+    // stat is an aligned writable 256-byte Linux UAPI buffer.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_statx as libc::c_long,
+            fd,
+            name.as_ptr(),
+            flags,
+            STATX_MNT_ID_UNIQUE,
+            &raw mut stat,
+        )
+    };
+    checked_unique_mount_id(if result == 0 {
+        Ok((stat.stx_mask, stat.stx_mnt_id))
+    } else {
+        Err(io::Error::last_os_error())
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -537,6 +579,34 @@ mod tests {
         assert_eq!(unique_mount_id(&pinned).unwrap(), original);
         assert_eq!(unique_mount_id(&renamed).unwrap(), original);
         assert_eq!(unique_mount_id(&replacement).unwrap(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unique_mount_id_at_queries_a_child_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("mount-id-at");
+        let file = fs::File::open(dir.path()).unwrap();
+        let mount = match unique_mount_id(&file) {
+            Ok(id) => id,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => return,
+            Err(error) => panic!("unexpected mount query error: {error}"),
+        };
+        fs::write(dir.path().join("entry"), b"fixture").unwrap();
+        symlink("missing", dir.path().join("link")).unwrap();
+        assert_eq!(unique_mount_id_at(&file, c"entry").unwrap(), mount);
+        assert_eq!(unique_mount_id_at(&file, c"link").unwrap(), mount);
+        assert_eq!(
+            unique_mount_id_at(&file, c"missing").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        for name in [c"", c".", c"..", c"entry/child", c"/entry"] {
+            assert_eq!(
+                unique_mount_id_at(&file, name).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

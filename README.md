@@ -11,11 +11,32 @@ Kache is a compiler cache for Rust, C/C++, and CUDA on Linux, macOS, and Windows
 It restores matching compiler outputs across worktrees and CI runs, so you spend
 less time rebuilding and less disk space storing the same bytes.
 
-Built by [Kunobi][kunobi-brand].
+This is the [furbyhaxx development fork](https://github.com/furbyhaxx/kache),
+with **`dev` as its default branch**. External-target inventory and explicit
+adoption are implemented. Automatic external-target deletion and complete
+Git discovery confinement are still in development; adoption alone does not
+authorize cleanup. Fork-specific settings and commands are documented in
+[configuration](docs/getting-started/configuration.mdx) and
+[command reference](docs/commands/reference.mdx).
+
+The badges, benchmarks, hosted documentation, and release packages below refer
+to [upstream Kache](https://github.com/kunobi-ninja/kache), built by
+[Kunobi][kunobi-brand].
 
 [Get started][first-reuse] · [Benchmarks][nav-benchmarks] · [Kache vs sccache][nav-comparison] · [CI setup][nav-ci]
 
-## Install
+## Build this fork
+
+```bash
+git clone --branch dev https://github.com/furbyhaxx/kache.git
+cd kache
+cargo build --locked --profile release-fast
+./target/release-fast/kache --help
+```
+
+## Install upstream releases
+
+These commands install upstream, not this development fork:
 
 ```bash
 cargo install kache --locked

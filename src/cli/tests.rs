@@ -8134,8 +8134,8 @@ fn json_targets_suggest_the_orphan_clean_only_when_a_worktree_is_gone() {
     assert_eq!(next[0].argv, ["kache", "clean", "--orphans", "--yes"]);
     assert_eq!(
         next[0].why,
-        "1 target belongs to a deleted worktree; the daemon removes it a day after its last \
-         build. This removes it now"
+        "1 target belongs to a deleted worktree; the daemon may remove it a day after its last \
+         recorded compile. This removes it now"
     );
     let manual = targets_next_actions(&one, false);
     assert_eq!(
@@ -8148,8 +8148,8 @@ fn json_targets_suggest_the_orphan_clean_only_when_a_worktree_is_gone() {
 fn the_orphan_note_agrees_with_the_count_and_the_setting() {
     assert_eq!(
         orphan_note(2, true),
-        "2 targets belong to deleted worktrees; the daemon removes them a day after their \
-         last build"
+        "2 targets belong to deleted worktrees; the daemon may remove them a day after their \
+         last recorded compile"
     );
     assert_eq!(
         orphan_note(2, false),

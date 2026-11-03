@@ -1049,6 +1049,125 @@ pub struct ExternalTargetObservation {
     pub last_observed: i64,
 }
 
+/// Explicit consent for the entire contents of one external target directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalTargetAdoption {
+    /// Stable inventory record identifier, never reused after release.
+    pub id: i64,
+    /// Diagnostic path recorded at adoption; it is not an identity.
+    pub backing_path: PathBuf,
+    /// Device and inode observed through the pinned directory descriptor.
+    pub identity: crate::filesystem::PathIdentity,
+    /// Opaque filesystem handle exported from the same descriptor.
+    pub handle: kache_fs::OpaqueFileHandle,
+    /// Unix seconds when consent was recorded.
+    pub adopted_at: i64,
+    /// Revision of the consent statement accepted by the user.
+    pub consent_revision: i64,
+}
+
+/// A failure to establish, inspect, or release external-target consent.
+#[derive(Debug)]
+pub enum ExternalTargetAdoptionError {
+    /// The supplied path is not an acceptable backing directory or target link.
+    InvalidPath { path: PathBuf, reason: &'static str },
+    /// The backing directory is not owned by the effective user.
+    NotOwned { path: PathBuf },
+    /// No accessible configured root is on the backing's filesystem.
+    DifferentFilesystem { path: PathBuf },
+    /// The new backing and an existing adoption overlap.
+    Overlap { path: PathBuf, existing: PathBuf },
+    /// An existing same-device adoption can no longer be located by its hint.
+    StaleAdoption { id: i64, path: PathBuf },
+    /// Different mount aliases prevent proving that two backings do not overlap.
+    IncompatibleMount { path: PathBuf, existing: PathBuf },
+    /// A pinned path changed while consent was being recorded.
+    Changed { path: PathBuf },
+    /// No adoption has the requested identifier or identity.
+    NotFound {
+        path: Option<PathBuf>,
+        id: Option<i64>,
+    },
+    /// An inventory, filesystem, or platform operation failed.
+    Storage(anyhow::Error),
+}
+
+impl std::fmt::Display for ExternalTargetAdoptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath { path, reason } => {
+                write!(f, "invalid backing {}: {reason}", path.display())
+            }
+            Self::NotOwned { path } => write!(
+                f,
+                "backing is not owned by the effective user: {}",
+                path.display()
+            ),
+            Self::DifferentFilesystem { path } => write!(
+                f,
+                "backing is not on a configured external target filesystem: {}",
+                path.display()
+            ),
+            Self::Overlap { path, existing } => write!(
+                f,
+                "backing {} overlaps adoption {}",
+                path.display(),
+                existing.display()
+            ),
+            Self::StaleAdoption { id, path } => write!(
+                f,
+                "cannot prove overlap safety: adoption {id} at {} changed; release it by id",
+                path.display()
+            ),
+            Self::IncompatibleMount { path, existing } => write!(
+                f,
+                "cannot prove {} and {} do not overlap across mount aliases",
+                path.display(),
+                existing.display()
+            ),
+            Self::Changed { path } => {
+                write!(f, "backing changed during adoption: {}", path.display())
+            }
+            Self::NotFound {
+                path: Some(path), ..
+            } => write!(f, "no adoption matches {}", path.display()),
+            Self::NotFound { id: Some(id), .. } => write!(f, "no adoption has id {id}"),
+            Self::NotFound { .. } => write!(f, "adoption not found"),
+            Self::Storage(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ExternalTargetAdoptionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<anyhow::Error> for ExternalTargetAdoptionError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<std::io::Error> for ExternalTargetAdoptionError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+impl From<rusqlite::Error> for ExternalTargetAdoptionError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+/// Result of an external-target adoption operation.
+pub type ExternalTargetAdoptionResult<T> = std::result::Result<T, ExternalTargetAdoptionError>;
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TrackedTargetRoot {
     pub path: PathBuf,
@@ -1820,7 +1939,8 @@ const INDEX_SCHEMA_GENERATION: i64 = 9;
 
 const EXTERNAL_TARGET_INVENTORY_DB: &str = "external-target-inventory.db";
 const EXTERNAL_TARGET_INVENTORY_LOCK: &str = "external-target-inventory.lock";
-const EXTERNAL_TARGET_INVENTORY_SCHEMA: i64 = 2;
+const EXTERNAL_TARGET_INVENTORY_SCHEMA: i64 = 3;
+const EXTERNAL_TARGET_CONSENT_REVISION: i64 = 1;
 const EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 // A close on any fd for the DB can release another SQLite connection's POSIX locks.
@@ -2089,7 +2209,7 @@ fn open_external_target_inventory_mode(
             anyhow::bail!("unrecognized inventory schema 0: {}", path.display());
         }
     }
-    if write && (generation == 0 || generation == 1) {
+    if write && (0..EXTERNAL_TARGET_INVENTORY_SCHEMA).contains(&generation) {
         let transaction =
             rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         let generation: i64 =
@@ -2115,8 +2235,22 @@ fn open_external_target_inventory_mode(
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     next_turn INTEGER NOT NULL CHECK (typeof(next_turn) = 'integer' AND next_turn >= 0)
                 );
-                INSERT INTO external_target_inventory_cursor VALUES (1, 0);
-                PRAGMA user_version = 2;",
+                INSERT INTO external_target_inventory_cursor VALUES (1, 0);",
+            )?;
+        }
+        if (0..EXTERNAL_TARGET_INVENTORY_SCHEMA).contains(&generation) {
+            transaction.execute_batch(
+                "CREATE TABLE external_target_adoptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    backing_path TEXT NOT NULL,
+                    device TEXT NOT NULL,
+                    inode TEXT NOT NULL,
+                    handle_type INTEGER NOT NULL,
+                    handle_bytes BLOB NOT NULL,
+                    adopted_at INTEGER NOT NULL,
+                    consent_revision INTEGER NOT NULL
+                );
+                PRAGMA user_version = 3;",
             )?;
         } else if generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
             anyhow::bail!(
@@ -2126,7 +2260,7 @@ fn open_external_target_inventory_mode(
         }
         db.revalidate()?;
         transaction.commit()?;
-    } else if generation != 1 && generation != EXTERNAL_TARGET_INVENTORY_SCHEMA {
+    } else if !(1..=EXTERNAL_TARGET_INVENTORY_SCHEMA).contains(&generation) {
         anyhow::bail!(
             "unsupported inventory schema {generation}: {}",
             path.display()
@@ -2134,6 +2268,199 @@ fn open_external_target_inventory_mode(
     }
     db.revalidate()?;
     Ok(Some(db))
+}
+
+fn inventory_adoptions(
+    db: &Connection,
+) -> ExternalTargetAdoptionResult<Vec<ExternalTargetAdoption>> {
+    let mut stmt = db.prepare(
+        "SELECT id, backing_path, device, inode, handle_type, handle_bytes, adopted_at, consent_revision
+         FROM external_target_adoptions ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i32>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+        ))
+    })?;
+    let mut adoptions = Vec::new();
+    for row in rows {
+        let (id, path, device, inode, handle_type, bytes, adopted_at, consent_revision) = row?;
+        adoptions.push(ExternalTargetAdoption {
+            id,
+            backing_path: path.into(),
+            identity: crate::filesystem::PathIdentity {
+                device: device.parse().context("invalid adopted backing device")?,
+                inode: inode.parse().context("invalid adopted backing inode")?,
+            },
+            handle: kache_fs::OpaqueFileHandle { handle_type, bytes },
+            adopted_at,
+            consent_revision,
+        });
+    }
+    Ok(adoptions)
+}
+
+fn adoption_matches_file(adoption: &ExternalTargetAdoption, file: &fs::File) -> Result<bool> {
+    if !file.metadata()?.is_dir() {
+        return Ok(false);
+    }
+    let identity = kache_fs::handle_identity(file)?;
+    if adoption.identity.device != identity.dev || adoption.identity.inode != identity.ino {
+        return Ok(false);
+    }
+    Ok(
+        adoption.consent_revision == EXTERNAL_TARGET_CONSENT_REVISION
+            && adoption.handle == kache_fs::export_file_handle(file)?.handle,
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct AdoptionBacking {
+    input: PathBuf,
+    source: PathBuf,
+    path: PathBuf,
+    link: Option<(fs::File, PathBuf)>,
+    file: fs::File,
+    identity: crate::filesystem::PathIdentity,
+    handle: kache_fs::OpaqueFileHandle,
+}
+
+#[cfg(target_os = "linux")]
+impl AdoptionBacking {
+    fn open(input: &Path) -> ExternalTargetAdoptionResult<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let invalid = |reason| ExternalTargetAdoptionError::InvalidPath {
+            path: input.to_path_buf(),
+            reason,
+        };
+        let normalized_input: PathBuf = input.components().collect();
+        let metadata = fs::symlink_metadata(&normalized_input)
+            .with_context(|| format!("inspecting {}", input.display()))?;
+        let (source, link) = if metadata.file_type().is_symlink() {
+            if normalized_input.file_name() != Some(std::ffi::OsStr::new("target")) {
+                return Err(invalid("only a workspace target symlink may be followed"));
+            }
+            let file = open_inventory_symlink(&normalized_input)
+                .ok_or_else(|| invalid("cannot pin target link"))?;
+            let target = fs::read_link(&normalized_input)?;
+            let source = if target.is_absolute() {
+                target.clone()
+            } else {
+                normalized_input
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(&target)
+            };
+            (source, Some((file, target)))
+        } else {
+            (normalized_input.clone(), None)
+        };
+        let source: PathBuf = source.components().collect();
+        let file = open_inventory_directory(&source, false)
+            .ok_or_else(|| invalid("backing is not a directory or is a symlink"))?;
+        let metadata = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(ExternalTargetAdoptionError::NotOwned {
+                path: input.to_path_buf(),
+            });
+        }
+        let path = fs::canonicalize(&source)
+            .with_context(|| format!("resolving backing {}", input.display()))?;
+        if path.to_str().is_none() {
+            return Err(invalid("backing path is not UTF-8"));
+        }
+        let identity = crate::filesystem::PathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        let handle = kache_fs::export_file_handle(&file)
+            .with_context(|| format!("exporting backing handle for {}", input.display()))?
+            .handle;
+        let backing = Self {
+            input: normalized_input,
+            source,
+            path,
+            link,
+            file,
+            identity,
+            handle,
+        };
+        if !backing.unchanged() {
+            return Err(ExternalTargetAdoptionError::Changed {
+                path: input.to_path_buf(),
+            });
+        }
+        Ok(backing)
+    }
+
+    fn unchanged(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        let owned = self.file.metadata().is_ok_and(|metadata| {
+            // SAFETY: geteuid has no preconditions.
+            metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() }
+        });
+        let link_unchanged = match &self.link {
+            Some((file, target)) => {
+                let same_link = match (file.metadata(), fs::symlink_metadata(&self.input)) {
+                    (Ok(pinned), Ok(current)) => {
+                        current.file_type().is_symlink()
+                            && pinned.dev() == current.dev()
+                            && pinned.ino() == current.ino()
+                    }
+                    _ => false,
+                };
+                same_link
+                    && fs::read_link(&self.input).is_ok_and(|current| current == *target)
+                    && fs::canonicalize(&self.input).is_ok_and(|current| current == self.path)
+            }
+            None => true,
+        };
+        owned
+            && link_unchanged
+            && inventory_handle_matches(&self.file, self.identity)
+            && inventory_directory_matches(&self.source, &self.file)
+            && inventory_directory_matches(&self.path, &self.file)
+            && fs::canonicalize(&self.source).is_ok_and(|current| current == self.path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct AdoptionRoot {
+    input: PathBuf,
+    path: PathBuf,
+    file: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl AdoptionRoot {
+    fn matching(roots: &[PathBuf], device: u64) -> Option<Self> {
+        roots.iter().find_map(|input| {
+            let path = fs::canonicalize(input).ok()?;
+            let file = open_inventory_directory(&path, false)?;
+            let id = kache_fs::handle_identity(&file).ok()?;
+            let root = Self {
+                input: input.clone(),
+                path,
+                file,
+            };
+            (id.dev == device && root.unchanged()).then_some(root)
+        })
+    }
+
+    fn unchanged(&self) -> bool {
+        fs::canonicalize(&self.input).is_ok_and(|path| path == self.path)
+            && inventory_directory_matches(&self.path, &self.file)
+    }
 }
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
@@ -4980,6 +5307,282 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         db.revalidate()?;
         transaction.commit()?;
         Ok(true)
+    }
+
+    /// Record explicit consent for the entire contents of one backing directory.
+    ///
+    /// `path` is a backing directory or its workspace's `target` symlink; a
+    /// workspace directory must be resolved by the caller. At least one configured
+    /// root must be accessible on the backing's filesystem. Consent is not proof
+    /// of inactivity or permission to delete: any future reaper must separately
+    /// reject targets containing submounts or that are non-root mounts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsafe, overlapping, stale, changed, or uninspectable paths and
+    /// filesystems, and reports inventory access and persistence failures.
+    pub fn adopt_external_target(
+        &self,
+        path: &Path,
+        external_target_roots: &[PathBuf],
+    ) -> ExternalTargetAdoptionResult<ExternalTargetAdoption> {
+        self.adopt_external_target_with(path, external_target_roots, || {})
+    }
+
+    fn adopt_external_target_with(
+        &self,
+        path: &Path,
+        external_target_roots: &[PathBuf],
+        after_write: impl FnOnce(),
+    ) -> ExternalTargetAdoptionResult<ExternalTargetAdoption> {
+        self.refuse_write("adopt an external target")?;
+        #[cfg(target_os = "linux")]
+        {
+            let backing = AdoptionBacking::open(path)?;
+            let root = AdoptionRoot::matching(external_target_roots, backing.identity.device)
+                .ok_or_else(|| ExternalTargetAdoptionError::DifferentFilesystem {
+                    path: path.to_path_buf(),
+                })?;
+            let db = open_external_target_inventory(&self.config.cache_dir, true)?
+                .context("inventory database was not created")?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &db.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let adoptions = inventory_adoptions(&transaction)?;
+            let mut pinned = Vec::new();
+            for adoption in adoptions {
+                let overlaps = backing.path.starts_with(&adoption.backing_path)
+                    || adoption.backing_path.starts_with(&backing.path);
+                if adoption.identity.device != backing.identity.device {
+                    if overlaps {
+                        return Err(ExternalTargetAdoptionError::Overlap {
+                            path: backing.path.clone(),
+                            existing: adoption.backing_path,
+                        });
+                    }
+                    continue;
+                }
+                let stale = || ExternalTargetAdoptionError::StaleAdoption {
+                    id: adoption.id,
+                    path: adoption.backing_path.clone(),
+                };
+                let file =
+                    open_inventory_directory(&adoption.backing_path, false).ok_or_else(stale)?;
+                if !inventory_directory_matches(&adoption.backing_path, &file)
+                    || !adoption_matches_file(&adoption, &file).unwrap_or(false)
+                {
+                    return Err(stale());
+                }
+                if overlaps {
+                    return Err(ExternalTargetAdoptionError::Overlap {
+                        path: backing.path.clone(),
+                        existing: adoption.backing_path,
+                    });
+                }
+                let same_mount = kache_fs::unique_mount_id(&backing.file)
+                    .context("identifying backing mount")?
+                    == kache_fs::unique_mount_id(&file).context("identifying adopted mount")?;
+                if !same_mount {
+                    return Err(ExternalTargetAdoptionError::IncompatibleMount {
+                        path: backing.path.clone(),
+                        existing: adoption.backing_path,
+                    });
+                }
+                pinned.push((adoption, file));
+            }
+            if !backing.unchanged() || !root.unchanged() {
+                return Err(ExternalTargetAdoptionError::Changed {
+                    path: path.to_path_buf(),
+                });
+            }
+            db.revalidate()?;
+            transaction.execute(
+                "INSERT INTO external_target_adoptions
+                 (backing_path, device, inode, handle_type, handle_bytes, adopted_at, consent_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6)",
+                params![
+                    backing.path.to_str().context("invalid backing path")?,
+                    backing.identity.device.to_string(), backing.identity.inode.to_string(),
+                    backing.handle.handle_type, &backing.handle.bytes, EXTERNAL_TARGET_CONSENT_REVISION,
+                ],
+            )?;
+            let id = transaction.last_insert_rowid();
+            let adoption = inventory_adoptions(&transaction)?
+                .into_iter()
+                .find(|adoption| adoption.id == id)
+                .context("new adoption was not stored")?;
+            after_write();
+            if !backing.unchanged() || !root.unchanged() {
+                return Err(ExternalTargetAdoptionError::Changed {
+                    path: path.to_path_buf(),
+                });
+            }
+            for (existing, file) in &pinned {
+                if !inventory_directory_matches(&existing.backing_path, file)
+                    || !adoption_matches_file(existing, file).unwrap_or(false)
+                {
+                    return Err(ExternalTargetAdoptionError::StaleAdoption {
+                        id: existing.id,
+                        path: existing.backing_path.clone(),
+                    });
+                }
+            }
+            db.revalidate()?;
+            transaction.commit()?;
+            Ok(adoption)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, external_target_roots, after_write);
+            Err(ExternalTargetAdoptionError::Storage(anyhow::anyhow!(
+                "external target adoption requires Linux file handles"
+            )))
+        }
+    }
+
+    /// Release the adoption with this inventory identifier, including stale paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed not-found error or an inventory access or write failure.
+    pub fn release_adoption(&self, id: i64) -> ExternalTargetAdoptionResult<()> {
+        self.refuse_write("release an external target adoption")?;
+        let Some(db) =
+            open_external_target_inventory_mode(&self.config.cache_dir, true, false, || {})?
+        else {
+            return Err(ExternalTargetAdoptionError::NotFound {
+                path: None,
+                id: Some(id),
+            });
+        };
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&db.db, rusqlite::TransactionBehavior::Immediate)?;
+        if transaction.execute("DELETE FROM external_target_adoptions WHERE id = ?1", [id])? != 1 {
+            return Err(ExternalTargetAdoptionError::NotFound {
+                path: None,
+                id: Some(id),
+            });
+        }
+        db.revalidate()?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Release an adoption by a backing path or explicit workspace `target` link.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an uninspectable, changed, or unadopted path and inventory errors.
+    pub fn release_external_target(&self, path: &Path) -> ExternalTargetAdoptionResult<()> {
+        self.refuse_write("release an external target adoption")?;
+        #[cfg(target_os = "linux")]
+        {
+            let backing = AdoptionBacking::open(path)?;
+            let Some(db) =
+                open_external_target_inventory_mode(&self.config.cache_dir, true, false, || {})?
+            else {
+                return Err(ExternalTargetAdoptionError::NotFound {
+                    path: Some(path.to_path_buf()),
+                    id: None,
+                });
+            };
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &db.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let matches: Vec<_> = inventory_adoptions(&transaction)?
+                .into_iter()
+                .filter(|adoption| {
+                    adoption.identity == backing.identity && adoption.handle == backing.handle
+                })
+                .collect();
+            let [adoption] = matches.as_slice() else {
+                if matches.is_empty() {
+                    return Err(ExternalTargetAdoptionError::NotFound {
+                        path: Some(path.to_path_buf()),
+                        id: None,
+                    });
+                }
+                return Err(anyhow::anyhow!("multiple adoptions match {}", path.display()).into());
+            };
+            if !backing.unchanged() {
+                return Err(ExternalTargetAdoptionError::Changed {
+                    path: path.to_path_buf(),
+                });
+            }
+            transaction.execute(
+                "DELETE FROM external_target_adoptions WHERE id = ?1",
+                [adoption.id],
+            )?;
+            if !backing.unchanged() {
+                return Err(ExternalTargetAdoptionError::Changed {
+                    path: path.to_path_buf(),
+                });
+            }
+            db.revalidate()?;
+            transaction.commit()?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Err(anyhow::anyhow!("external target adoption requires Linux file handles").into())
+        }
+    }
+
+    /// List historical consent records without treating their paths as identities.
+    ///
+    /// # Errors
+    ///
+    /// Reports malformed records or inventory access failures.
+    pub fn list_adoptions(&self) -> ExternalTargetAdoptionResult<Vec<ExternalTargetAdoption>> {
+        let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
+            return Ok(Vec::new());
+        };
+        let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let adoptions = if generation < 3 {
+            Vec::new()
+        } else {
+            inventory_adoptions(&db)?
+        };
+        db.revalidate()?;
+        Ok(adoptions)
+    }
+
+    /// Verify consent against a freshly pinned directory descriptor.
+    ///
+    /// Paths and mount IDs are never used as durable identity. An identity or
+    /// consent-revision mismatch returns `None`; a match is consent only, not
+    /// deletion authorization or evidence against mounts, activity, or reuse.
+    ///
+    /// # Errors
+    ///
+    /// Reports filesystem, handle-export, malformed-record, or inventory failures.
+    pub fn verify_adoption(
+        &self,
+        file: &fs::File,
+    ) -> ExternalTargetAdoptionResult<Option<ExternalTargetAdoption>> {
+        let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
+            return Ok(None);
+        };
+        let generation: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let mut found = None;
+        if generation >= 3 {
+            for adoption in inventory_adoptions(&db)? {
+                if adoption_matches_file(&adoption, file)? {
+                    if found.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "multiple adoptions match the pinned directory"
+                        )
+                        .into());
+                    }
+                    found = Some(adoption);
+                }
+            }
+        }
+        db.revalidate()?;
+        Ok(found)
     }
 
     /// List stored inventory observations without revalidating their paths.

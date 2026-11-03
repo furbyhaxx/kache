@@ -4702,6 +4702,320 @@ mod external_target_inventory {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_tracks_identity_across_rename_and_replacement() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let roots = [f.allowed.clone()];
+        let adoption = f
+            .store
+            .adopt_external_target(&f.workspace.join("target"), &roots)
+            .unwrap();
+        assert_eq!(adoption.backing_path, fs::canonicalize(&f.backing).unwrap());
+        assert_eq!(adoption.consent_revision, 1);
+        assert_eq!(f.store.list_adoptions().unwrap(), vec![adoption.clone()]);
+
+        let moved = f.allowed.join("moved");
+        fs::rename(&f.backing, &moved).unwrap();
+        fs::create_dir(&f.backing).unwrap();
+        let replacement = open_inventory_directory(&f.backing, false).unwrap();
+        let original = open_inventory_directory(&moved, false).unwrap();
+        assert_eq!(f.store.verify_adoption(&replacement).unwrap(), None);
+        assert_eq!(
+            f.store.verify_adoption(&original).unwrap(),
+            Some(adoption.clone())
+        );
+        f.store.release_adoption(adoption.id).unwrap();
+        assert!(f.store.list_adoptions().unwrap().is_empty());
+        assert_eq!(f.store.verify_adoption(&original).unwrap(), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_rejects_symlink_backings_even_with_trailing_slash() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let alias = f.allowed.join("alias");
+        symlink(&f.backing, &alias).unwrap();
+        let alias_with_slash = PathBuf::from(format!("{}/", alias.display()));
+        for path in [&alias, &alias_with_slash] {
+            assert!(matches!(
+                f.store
+                    .adopt_external_target(path, std::slice::from_ref(&f.allowed)),
+                Err(ExternalTargetAdoptionError::InvalidPath { .. })
+            ));
+        }
+        fs::remove_file(f.workspace.join("target")).unwrap();
+        symlink(&alias_with_slash, f.workspace.join("target")).unwrap();
+        assert!(matches!(
+            f.store.adopt_external_target(
+                &f.workspace.join("target"),
+                std::slice::from_ref(&f.allowed)
+            ),
+            Err(ExternalTargetAdoptionError::InvalidPath { .. })
+        ));
+        assert!(f.store.list_adoptions().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_rejects_overlapping_and_stale_roots() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let roots = [f.allowed.clone()];
+        let child = f.backing.join("nested");
+        fs::create_dir(&child).unwrap();
+        let adoption = f.store.adopt_external_target(&child, &roots).unwrap();
+        assert!(matches!(
+            f.store.adopt_external_target(&f.backing, &roots),
+            Err(ExternalTargetAdoptionError::Overlap { .. })
+        ));
+        f.store.release_adoption(adoption.id).unwrap();
+        let adoption = f.store.adopt_external_target(&f.backing, &roots).unwrap();
+        assert!(matches!(
+            f.store.adopt_external_target(&child, &roots),
+            Err(ExternalTargetAdoptionError::Overlap { .. })
+        ));
+        let moved = f.allowed.join("moved");
+        fs::rename(&f.backing, &moved).unwrap();
+        fs::create_dir(&f.backing).unwrap();
+        assert!(matches!(
+            f.store.adopt_external_target(&f.backing, &roots),
+            Err(ExternalTargetAdoptionError::StaleAdoption { .. })
+        ));
+        f.store.release_adoption(adoption.id).unwrap();
+        assert!(f.store.adopt_external_target(&f.backing, &roots).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_validates_roots_and_releases_by_identity() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        assert!(matches!(
+            f.store.adopt_external_target(&f.backing, &[]),
+            Err(ExternalTargetAdoptionError::DifferentFilesystem { .. })
+        ));
+        assert!(matches!(
+            f.store
+                .adopt_external_target(&f.backing, &[f.temp.path().join("absent")]),
+            Err(ExternalTargetAdoptionError::DifferentFilesystem { .. })
+        ));
+        let file = f.allowed.join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert!(matches!(
+            f.store
+                .adopt_external_target(&file, std::slice::from_ref(&f.allowed)),
+            Err(ExternalTargetAdoptionError::InvalidPath { .. })
+        ));
+        assert!(!f.inventory_path().exists());
+        let roots = [f.allowed.clone()];
+        let first = f.store.adopt_external_target(&f.backing, &roots).unwrap();
+        let other = f.allowed.join("other");
+        fs::create_dir(&other).unwrap();
+        let second = f.store.adopt_external_target(&other, &roots).unwrap();
+        assert_eq!(f.store.list_adoptions().unwrap().len(), 2);
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        assert!(readonly.adopt_external_target(&other, &roots).is_err());
+        assert!(readonly.release_adoption(first.id).is_err());
+        assert!(readonly.release_external_target(&other).is_err());
+        assert_eq!(
+            readonly
+                .verify_adoption(&fs::File::open(&file).unwrap())
+                .unwrap(),
+            None
+        );
+        let moved = f.allowed.join("moved");
+        fs::rename(&f.backing, &moved).unwrap();
+        f.store.release_external_target(&moved).unwrap();
+        assert!(matches!(
+            f.store.release_external_target(&moved),
+            Err(ExternalTargetAdoptionError::NotFound { .. })
+        ));
+        f.store.release_adoption(second.id).unwrap();
+        assert!(matches!(
+            f.store.release_adoption(second.id),
+            Err(ExternalTargetAdoptionError::NotFound { .. })
+        ));
+        let third = f.store.adopt_external_target(&moved, &roots).unwrap();
+        assert!(third.id > second.id);
+        assert_eq!(readonly.list_adoptions().unwrap(), vec![third]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_allows_unrelated_device_with_stale_record() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let other_fs = tempfile::tempdir_in("/dev/shm").unwrap();
+        let other = other_fs.path().join("backing");
+        fs::create_dir(&other).unwrap();
+        assert_ne!(
+            fs::metadata(&f.backing).unwrap().dev(),
+            fs::metadata(&other).unwrap().dev()
+        );
+        assert!(matches!(
+            f.store
+                .adopt_external_target(&f.backing, &[other_fs.path().to_path_buf()]),
+            Err(ExternalTargetAdoptionError::DifferentFilesystem { .. })
+        ));
+        let first = f
+            .store
+            .adopt_external_target(&f.backing, std::slice::from_ref(&f.allowed))
+            .unwrap();
+        fs::rename(&f.backing, f.allowed.join("moved")).unwrap();
+        let second = f
+            .store
+            .adopt_external_target(&other, &[other_fs.path().to_path_buf()])
+            .unwrap();
+        assert_eq!(
+            f.store.list_adoptions().unwrap(),
+            vec![first.clone(), second]
+        );
+        f.store.release_adoption(first.id).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_checks_each_identity_component_and_revision() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let adoption = f
+            .store
+            .adopt_external_target(&f.backing, std::slice::from_ref(&f.allowed))
+            .unwrap();
+        let pinned = open_inventory_directory(&f.backing, false).unwrap();
+        assert_eq!(
+            f.store.verify_adoption(&pinned).unwrap(),
+            Some(adoption.clone())
+        );
+        let db = f.inventory_db();
+        let columns: Vec<String> = db
+            .prepare("PRAGMA table_info(external_target_adoptions)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(!columns.iter().any(|name| name.contains("mount")));
+        drop(db);
+        for (column, value) in [
+            (
+                "device",
+                rusqlite::types::Value::Text((adoption.identity.device + 1).to_string()),
+            ),
+            (
+                "inode",
+                rusqlite::types::Value::Text((adoption.identity.inode + 1).to_string()),
+            ),
+            (
+                "handle_type",
+                rusqlite::types::Value::Integer(i64::from(adoption.handle.handle_type) + 1),
+            ),
+            ("handle_bytes", rusqlite::types::Value::Blob(vec![0xff])),
+            (
+                "consent_revision",
+                rusqlite::types::Value::Integer(adoption.consent_revision + 1),
+            ),
+        ] {
+            f.inventory_db()
+                .execute(
+                    &format!("UPDATE external_target_adoptions SET {column} = ?1"),
+                    [value],
+                )
+                .unwrap();
+            assert_eq!(f.store.verify_adoption(&pinned).unwrap(), None, "{column}");
+            f.inventory_db().execute(
+                "UPDATE external_target_adoptions SET device = ?1, inode = ?2, handle_type = ?3, handle_bytes = ?4, consent_revision = ?5",
+                params![adoption.identity.device.to_string(), adoption.identity.inode.to_string(), adoption.handle.handle_type, &adoption.handle.bytes, adoption.consent_revision],
+            ).unwrap();
+        }
+        assert_eq!(f.store.verify_adoption(&pinned).unwrap(), Some(adoption));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_rolls_back_if_backing_or_root_changes() {
+        let _serial = serialize_inventory_tests();
+        for change in ["root", "link", "backing"] {
+            let f = Fixture::new();
+            let path = f.workspace.join("target");
+            let error = f
+                .store
+                .adopt_external_target_with(
+                    &path,
+                    std::slice::from_ref(&f.allowed),
+                    || match change {
+                        "root" => fs::rename(&f.allowed, f.temp.path().join("moved-root")).unwrap(),
+                        "link" => {
+                            fs::remove_file(&path).unwrap();
+                            symlink(&f.backing, &path).unwrap();
+                        }
+                        _ => {
+                            fs::rename(&f.backing, f.allowed.join("moved")).unwrap();
+                            fs::create_dir(&f.backing).unwrap();
+                        }
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(error, ExternalTargetAdoptionError::Changed { .. }));
+            assert!(f.store.list_adoptions().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_rolls_back_if_existing_adoption_changes() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let first = f
+            .store
+            .adopt_external_target(&f.backing, std::slice::from_ref(&f.allowed))
+            .unwrap();
+        let other = f.allowed.join("other");
+        fs::create_dir(&other).unwrap();
+        let error = f
+            .store
+            .adopt_external_target_with(&other, std::slice::from_ref(&f.allowed), || {
+                fs::rename(&f.backing, f.allowed.join("moved")).unwrap();
+                fs::create_dir(&f.backing).unwrap();
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalTargetAdoptionError::StaleAdoption { .. }
+        ));
+        assert_eq!(f.store.list_adoptions().unwrap(), vec![first]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn external_target_adoption_migration_preserves_v2_observations() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let before = f.store.external_target_observations().unwrap();
+        f.inventory_db()
+            .execute_batch("DROP TABLE external_target_adoptions; PRAGMA user_version = 2;")
+            .unwrap();
+        let readonly = Store::open_read_only(test_config(&f.store.config.cache_dir)).unwrap();
+        assert_eq!(readonly.external_target_observations().unwrap(), before);
+        assert!(readonly.list_adoptions().unwrap().is_empty());
+        let adoption = f
+            .store
+            .adopt_external_target(&f.backing, std::slice::from_ref(&f.allowed))
+            .unwrap();
+        assert_eq!(f.store.external_target_observations().unwrap(), before);
+        assert_eq!(readonly.list_adoptions().unwrap(), vec![adoption]);
+        let db = f.inventory_db();
+        let version: i64 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
     #[test]
     fn inventory_cursor_peek_recovers_interrupted_initialization() {
         use std::os::unix::fs::OpenOptionsExt;
@@ -4897,7 +5211,7 @@ mod external_target_inventory {
         assert!(f.observe(&f.workspace, &snapshot));
         let observations = f.store.external_target_observations().unwrap();
         f.inventory_db()
-            .execute_batch("DROP TABLE external_target_inventory_cursor; PRAGMA user_version = 1;")
+            .execute_batch("DROP TABLE external_target_inventory_cursor; DROP TABLE external_target_adoptions; PRAGMA user_version = 1;")
             .unwrap();
         let before = ro_tree_snapshot(&f.store.config.cache_dir);
         assert_eq!(
@@ -4916,7 +5230,7 @@ mod external_target_inventory {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, EXTERNAL_TARGET_INVENTORY_SCHEMA);
         assert_eq!(
             f.store
                 .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
@@ -4932,7 +5246,7 @@ mod external_target_inventory {
         let version: i64 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, EXTERNAL_TARGET_INVENTORY_SCHEMA);
     }
 
     #[test]

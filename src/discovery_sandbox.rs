@@ -256,6 +256,7 @@ fn restrict_and_exec(
     };
     use std::os::unix::process::CommandExt;
 
+    let null_input = std::fs::File::open("/dev/null")?;
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(ABI::V3))?
@@ -279,9 +280,14 @@ fn restrict_and_exec(
     let mut command = std::process::Command::new(&request.program);
     command
         .args(&request.argv)
+        .stdin(std::process::Stdio::from(null_input))
         .env_clear()
         .env("LANG", "C")
-        .env("PATH", "/usr/bin:/bin");
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("HOME", "/nonexistent");
     // CLOEXEC leaves any owned descriptors valid if exec fails, avoiding fd reuse on drop.
     // SAFETY: this fresh-exec helper remains single-threaded and the hook only makes a syscall.
     unsafe {

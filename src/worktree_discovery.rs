@@ -112,22 +112,26 @@ struct Worktree {
     prunable: bool,
 }
 
+fn push_worktree(trees: &mut Vec<Worktree>, current: Option<(Worktree, bool, bool)>) {
+    if let Some((tree, zero_head, branch)) = current
+        && (!cfg!(target_os = "linux") || !zero_head || branch)
+    {
+        trees.push(tree);
+    }
+}
+
 /// Parse Git's NUL-delimited porcelain records. An unknown attribute does not
 /// change the meaning of the attributes used for cleanup decisions.
 fn parse_worktrees(bytes: &[u8]) -> Vec<Worktree> {
     let mut trees = Vec::new();
-    let mut current: Option<Worktree> = None;
+    let mut current: Option<(Worktree, bool, bool)> = None;
     for field in bytes.split(|byte| *byte == 0) {
         if field.is_empty() {
-            if let Some(tree) = current.take() {
-                trees.push(tree);
-            }
+            push_worktree(&mut trees, current.take());
             continue;
         }
         if let Some(path) = field.strip_prefix(b"worktree ") {
-            if let Some(tree) = current.take() {
-                trees.push(tree);
-            }
+            push_worktree(&mut trees, current.take());
             #[cfg(unix)]
             let path = {
                 use std::os::unix::ffi::OsStringExt;
@@ -135,21 +139,30 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<Worktree> {
             };
             #[cfg(not(unix))]
             let path = String::from_utf8(path.to_vec()).ok().map(PathBuf::from);
-            current = path.map(|path| Worktree {
-                path,
-                bare: false,
-                locked: false,
-                prunable: false,
+            current = path.map(|path| {
+                (
+                    Worktree {
+                        path,
+                        bare: false,
+                        locked: false,
+                        prunable: false,
+                    },
+                    false,
+                    false,
+                )
             });
-        } else if let Some(tree) = current.as_mut() {
+        } else if let Some((tree, zero_head, branch)) = current.as_mut() {
             tree.bare |= field == b"bare";
             tree.locked |= field == b"locked" || field.starts_with(b"locked ");
             tree.prunable |= field == b"prunable" || field.starts_with(b"prunable ");
+            // An unreadable HEAD can be all zero even when Git exits successfully.
+            *zero_head |= field
+                .strip_prefix(b"HEAD ")
+                .is_some_and(|hash| !hash.is_empty() && hash.iter().all(|byte| *byte == b'0'));
+            *branch |= field.starts_with(b"branch ");
         }
     }
-    if let Some(tree) = current {
-        trees.push(tree);
-    }
+    push_worktree(&mut trees, current);
     trees
 }
 
@@ -1351,6 +1364,21 @@ mod tests {
         assert!(trees[1].locked);
         assert!(trees[2].prunable);
         assert!(trees[3].bare);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn porcelain_parser_drops_zero_head_without_an_unborn_branch() {
+        let trees = parse_worktrees(
+            b"worktree /unreadable\0HEAD 0000000000000000000000000000000000000000\0detached\0\0worktree /unborn\0HEAD 0000000000000000000000000000000000000000\0branch refs/heads/main\0\0worktree /known\0HEAD 1000000000000000000000000000000000000000\0detached\0\0",
+        );
+        assert_eq!(
+            trees
+                .iter()
+                .map(|tree| tree.path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("/unborn"), Path::new("/known")]
+        );
     }
 
     #[test]

@@ -314,6 +314,32 @@ fn environment_is_fixed_and_entry_precedes_normal_startup() {
 }
 
 #[test]
+fn git_environment_is_fixed_and_stdin_is_empty() {
+    let policy = request(
+        &[],
+        "printf '%s|%s|%s|%s|' \"$GIT_CONFIG_NOSYSTEM\" \"$GIT_CONFIG_GLOBAL\" \"$GIT_OPTIONAL_LOCKS\" \"$HOME\"; if IFS= read -r value; then printf unexpected; else printf eof; fi; if printf probe 2>&- >&0; then printf writable; else printf closed; fi",
+        &[],
+    );
+    let mut command = helper();
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "0")
+        .env("GIT_CONFIG_GLOBAL", "/untrusted")
+        .env("GIT_OPTIONAL_LOCKS", "1")
+        .env("HOME", "/untrusted");
+    let output = run_bytes(
+        command,
+        &serde_json::to_vec(&policy.request).unwrap(),
+        &policy.fds(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"1|/dev/null|0|/nonexistent|eofclosed");
+}
+
+#[test]
 fn invalid_requests_never_launch() {
     let base = request(&[], "printf LAUNCHED", &[]);
     let output = run(&base);

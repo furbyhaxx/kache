@@ -5805,10 +5805,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// These are historical snapshots, not proof that the paths remain valid.
     /// An existing inventory without a coordination lock cannot be listed until
     /// a writer creates the lock; read-only listing never creates it. Inventory
-    /// access requires an owner-private cache directory, Unix permissions, and
-    /// unique mount IDs. Coordination covers cooperating Kache processes in a
-    /// static namespace; arbitrary same-UID path or mount changes cannot be
-    /// excluded atomically without an fd-aware SQLite VFS.
+    /// access requires an owner-private cache directory and Unix permissions.
+    /// Unique mount IDs permit isolated per-cache gates; where unavailable,
+    /// process-wide coordination is retained. This covers cooperating processes
+    /// in a static namespace, not arbitrary same-UID path or mount changes.
     pub fn external_target_observations(&self) -> Result<Vec<ExternalTargetObservation>> {
         let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
             return Ok(Vec::new());

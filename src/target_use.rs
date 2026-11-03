@@ -177,8 +177,7 @@ fn quiet<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> bool {
         .any(|arg| arg == "-q" || arg == "--quiet")
 }
 
-/// What a command waiting for cleanup says, with the cleanup's process when
-/// it left a record.
+/// Holder diagnostics can outlive the process that recorded them.
 fn waiting(cache_dir: &Path) -> String {
     let pid = (|| {
         let path = holder_record(cache_dir);
@@ -207,7 +206,9 @@ fn waiting(cache_dir: &Path) -> String {
         text.trim().parse::<u32>().ok()
     })();
     match pid {
-        Some(pid) => format!("kache: waiting for target cleanup (pid {pid}) to finish\n"),
+        Some(pid) => format!(
+            "kache: waiting for target cleanup to finish (last recorded cleanup pid {pid})\n"
+        ),
         None => "kache: waiting for target cleanup to finish\n".to_owned(),
     }
 }
@@ -256,7 +257,7 @@ mod tests {
     }
 
     fn naming(pid: u32) -> String {
-        format!("kache: waiting for target cleanup (pid {pid}) to finish\n")
+        format!("kache: waiting for target cleanup to finish (last recorded cleanup pid {pid})\n")
     }
 
     #[test]
@@ -304,6 +305,17 @@ mod tests {
         assert_eq!(waiting(dir.path()), naming(std::process::id()));
         drop(reservation);
         assert!(!holder.exists());
+    }
+
+    #[test]
+    fn an_unrecorded_reservation_does_not_claim_a_stale_pid_is_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(holder_record(dir.path()), "42").unwrap();
+        let _reservation = try_exclusive_unrecorded(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            waiting(dir.path()),
+            "kache: waiting for target cleanup to finish (last recorded cleanup pid 42)\n"
+        );
     }
 
     #[test]

@@ -8306,6 +8306,64 @@ fn external_target_observations_are_visible_but_not_cleanable() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn external_target_adoption_status_checks_observed_backing_identity() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let storage = dir.path().join("storage");
+    let backing = storage.join("build");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&backing).unwrap();
+    fs::write(backing.join("keep"), b"preserve").unwrap();
+    symlink(&backing, workspace.join("target")).unwrap();
+    let cache = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(dir.path())
+        .unwrap();
+    let mut config = crate::test_support::test_config(cache.path().to_path_buf());
+    config.external_target_roots.push(storage.clone());
+    let store = Store::open(&config).unwrap();
+    let snapshot =
+        kache_store::filesystem::snapshot_workspace_target(&workspace, &storage, &[]).unwrap();
+    assert!(
+        store
+            .observe_external_target(&workspace, &storage, &[], &snapshot)
+            .unwrap()
+    );
+    let before = external_target_rows(&config).unwrap();
+    let json = serde_json::to_value(&before).unwrap();
+    assert_eq!(json[0]["status"], "inventory_only");
+    assert_eq!(json[0]["adopted"], false);
+    assert!(json[0]["adoption_id"].is_null());
+
+    let adoption = store
+        .adopt_external_target(&backing, &[storage.clone()])
+        .unwrap();
+    let rows = external_target_rows(&config).unwrap();
+    let json = serde_json::to_value(&rows).unwrap();
+    assert_eq!(json[0]["status"], "adopted");
+    assert_eq!(json[0]["adopted"], true);
+    assert_eq!(json[0]["adoption_id"], adoption.id);
+    assert!(
+        render_external_target_rows(&rows)
+            .join("\n")
+            .contains(&format!("adopted #{}", adoption.id))
+    );
+
+    let moved = storage.join("moved");
+    fs::rename(&backing, &moved).unwrap();
+    fs::create_dir(&backing).unwrap();
+    let rows = external_target_rows(&config).unwrap();
+    let json = serde_json::to_value(&rows).unwrap();
+    assert_eq!(json[0]["status"], "inventory_only");
+    assert_eq!(json[0]["adopted"], false);
+    assert!(json[0]["adoption_id"].is_null());
+    assert_eq!(fs::read(moved.join("keep")).unwrap(), b"preserve");
+}
+
 #[test]
 fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     let one = render_targets(&[row("/wt/a", TargetState::Live, 1024)], true).join("\n");

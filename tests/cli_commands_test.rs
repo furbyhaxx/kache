@@ -2053,6 +2053,189 @@ fn targets_reports_unavailable_external_inventory_without_hiding_regular_targets
     assert!(json["external_inventory_error"].as_str().is_some());
 }
 
+#[cfg(target_os = "linux")]
+fn configure_external_target_fixture(e: &Env, storage: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(&e.cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        e.cache.join("config.toml"),
+        format!(
+            "[cache]\nexternal_target_roots = [{}]\n",
+            serde_json::to_string(&storage.to_string_lossy()).unwrap()
+        ),
+    )
+    .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn targets_adoption_commands_handle_paths_and_stale_ids() {
+    use std::os::unix::fs::symlink;
+    let e = env();
+    let workspace = e.home.join("workspace");
+    let storage = e.home.join("storage");
+    let backing = storage.join("build-\u{1b}[2J\n");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&backing).unwrap();
+    std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::fs::write(backing.join("keep"), b"preserve").unwrap();
+    symlink(&backing, workspace.join("target")).unwrap();
+    configure_external_target_fixture(&e, &storage);
+
+    let no_consent = e
+        .cmd()
+        .args(["targets", "adopt"])
+        .arg(&workspace)
+        .output()
+        .unwrap();
+    assert!(!no_consent.status.success());
+    assert!(String::from_utf8_lossy(&no_consent.stderr).contains("--yes"));
+    let adopt = e
+        .cmd()
+        .args(["targets", "adopt", "--yes"])
+        .arg(&workspace)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        adopt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    let adopt: serde_json::Value = serde_json::from_slice(&adopt.stdout).unwrap();
+    assert_eq!(adopt["command"], "targets-adopt");
+    let first_id = adopt["adoption"]["id"].as_i64().unwrap();
+    assert_eq!(adopt["adoption"]["backing_path"], backing.to_str().unwrap());
+    let list = e
+        .cmd()
+        .args(["targets", "adoptions", "--json"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list["adoptions"][0]["id"], first_id);
+    assert_eq!(
+        list["adoptions"][0]["backing_path"],
+        backing.to_str().unwrap()
+    );
+    let human = e.cmd().args(["targets", "adoptions"]).output().unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(!human.contains('\u{1b}'));
+    assert!(human.contains("\\u{1b}[2J\\n"), "{human:?}");
+
+    let release = e
+        .cmd()
+        .args(["targets", "release"])
+        .arg(workspace.join("target"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        release.status.success(),
+        "{}",
+        String::from_utf8_lossy(&release.stderr)
+    );
+    let adopt = e
+        .cmd()
+        .args(["targets", "adopt", "--yes"])
+        .arg(&backing)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        adopt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopt.stderr)
+    );
+    let second_id = serde_json::from_slice::<serde_json::Value>(&adopt.stdout).unwrap()["adoption"]
+        ["id"]
+        .as_i64()
+        .unwrap();
+    assert!(second_id > first_id);
+    let moved = storage.join("moved");
+    std::fs::rename(&backing, &moved).unwrap();
+    std::fs::create_dir(&backing).unwrap();
+    e.cmd()
+        .args(["targets", "release", &second_id.to_string()])
+        .assert()
+        .success();
+    let list = e
+        .cmd()
+        .args(["targets", "adoptions", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&list.stdout).unwrap()["adoptions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(std::fs::read(moved.join("keep")).unwrap(), b"preserve");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn targets_adoption_commands_refuse_ambiguous_paths_and_escape_errors() {
+    use std::os::unix::fs::symlink;
+    let e = env();
+    let storage = e.home.join("storage");
+    let backing = storage.join("build");
+    let unknown = e.home.join("unknown-\u{1b}[2J");
+    std::fs::create_dir_all(&backing).unwrap();
+    std::fs::create_dir(&unknown).unwrap();
+    symlink(&backing, unknown.join("target")).unwrap();
+    configure_external_target_fixture(&e, &storage);
+    let failed = e
+        .cmd()
+        .args(["targets", "adopt", "--yes"])
+        .arg(&unknown)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert!(
+        stderr.contains("ambiguous") && stderr.contains("target"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\u{1b}[2J") && !stderr.contains('\u{1b}'),
+        "{stderr:?}"
+    );
+
+    std::fs::write(unknown.join("Cargo.toml"), "[workspace]\n").unwrap();
+    let ambiguous_backing = storage.join("ambiguous");
+    std::fs::create_dir(&ambiguous_backing).unwrap();
+    std::fs::write(ambiguous_backing.join("Cargo.toml"), "[workspace]\n").unwrap();
+    symlink(&backing, ambiguous_backing.join("target")).unwrap();
+    e.cmd()
+        .args(["targets", "adopt", "--yes"])
+        .arg(&ambiguous_backing)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("ambiguous"));
+    let missing = e.home.join("missing-\u{1b}[2J");
+    let failed = e
+        .cmd()
+        .args(["targets", "adopt", "--yes"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert!(!failed.status.success());
+    assert!(
+        stderr.contains("\\u{1b}[2J") && !stderr.contains('\u{1b}'),
+        "{stderr:?}"
+    );
+    e.cmd()
+        .args(["targets", "adopt"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
 #[test]
 fn clean_dry_run_reports_no_targets_in_empty_dir() {
     let e = env();

@@ -8489,8 +8489,8 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     assert_eq!(many.matches("(worktree deleted)").count(), 1, "{many}");
     assert!(
         many.ends_with(
-            "\n1 target belongs to a deleted worktree; the daemon removes it a day after its \
-             last build. To remove it now: `kache clean --orphans --yes`"
+            "\n1 target belongs to a deleted worktree; the daemon may remove it a day after its \
+             last recorded compile. To remove it now: `kache clean --orphans --yes`"
         ),
         "{many}"
     );
@@ -8500,7 +8500,9 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
     ];
     let rendered = render_targets(&two, true).join("\n");
     assert!(
-        rendered.contains("removes them a day after their last build. To remove them now:"),
+        rendered.contains(
+            "may remove them a day after their last recorded compile. To remove them now:"
+        ),
         "{rendered}"
     );
     let manual = render_targets(&two, false).join("\n");
@@ -9035,7 +9037,7 @@ fn clean_names_its_window_and_the_command_that_repeats_it() {
     assert_eq!(selection_words(TrackedSelection::Orphaned), "worktree gone");
     assert_eq!(
         selection_words(default),
-        "worktree gone, or no build in 14d"
+        "worktree gone, or last recorded compile at least 14d ago"
     );
     // `--stale 7d` is offered only when it selects more.
     assert!(can_widen(default));
@@ -9080,7 +9082,7 @@ fn the_clean_preview_splits_what_goes_from_what_stays() {
     let lines = plan_lines(&plan, &skipped, &[], PlanEnd::DryRun);
     assert_eq!(
         lines[0],
-        "Remove   1 target · 1.0 KiB freeable · worktree gone, or no build in 14d"
+        "Remove   1 target · 1.0 KiB freeable · worktree gone, or last recorded compile at least 14d ago"
     );
     assert!(
         lines[2].ends_with("/wt/gone/target  (worktree deleted)"),

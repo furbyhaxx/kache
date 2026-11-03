@@ -6327,9 +6327,7 @@ fn recorded_orphans(rows: &[TargetRow]) -> usize {
         .count()
 }
 
-/// `2 targets belong to deleted worktrees; the daemon removes them a day
-/// after their last build`, or only the first half when `auto` (the
-/// `auto_clean_orphaned_targets` setting) is off.
+/// Describe recorded orphan targets and their automatic cleanup policy.
 fn orphan_note(orphans: usize, auto: bool) -> String {
     let (subject, them, their) = if orphans == 1 {
         (
@@ -6348,7 +6346,7 @@ fn orphan_note(orphans: usize, auto: bool) -> String {
         )
     };
     if auto {
-        format!("{subject}; the daemon removes {them} a day after {their} last build")
+        format!("{subject}; the daemon may remove {them} a day after {their} last recorded compile")
     } else {
         subject
     }
@@ -6512,7 +6510,10 @@ fn selection_words(selection: TrackedSelection) -> String {
     match selection {
         TrackedSelection::Orphaned => "worktree gone".to_string(),
         TrackedSelection::StaleOrOrphaned(hours) => {
-            format!("worktree gone, or no build in {}", window_label(hours))
+            format!(
+                "worktree gone, or last recorded compile at least {} ago",
+                window_label(hours)
+            )
         }
     }
 }

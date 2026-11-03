@@ -1,0 +1,13 @@
+[package]
+name = "kache-managed"
+# Unpublished internal control code is versioned independently of the compiler cache.
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/furbyhaxx/kache"
+description = "Admission and reference accounting for managed Kache target stores"
+publish = false
+
+[dependencies]
+thiserror = "2"

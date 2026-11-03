@@ -20,6 +20,7 @@ members = [
     "crates/kache-e2e",
     "crates/kache-proofs",
     "crates/kache-service",
+    "crates/kache-managed",
 ]
 # scenarios/e2e-*/source and test-projects/* are not listed: each declares its own empty
 # `[workspace]` so cargo treats them as standalone, which is what the

@@ -1,18 +1,23 @@
 # Agent notes
 
-`just check` is not the merge gate. CI mutation-tests changed Rust lines in the kache binary. A PR that only ran `cargo test` on the new tests will go red on Mutation testing. That is the usual failure.
+## Repository and branches
 
-## Before `gh pr create`
+- Develop in `furbyhaxx/kache`; `origin` points to that repository.
+- The default and integration branch is `dev`.
+- Do not open upstream PRs unless the user explicitly requests one.
+- Do not run release/tag/publishing recipes: their upstream `main` assumptions do not define this fork's release policy.
+
+## Verification before publishing changes
 
 ```sh
 just check
 ```
 
-That is fmt, clippy `-D warnings`, and the workspace tests. Do not open the PR until it exits 0.
+That is fmt, clippy `-D warnings`, and the workspace tests. Run it before pushing code changes; focused tests alone are not the gate.
 
-Mutants run in CI, not on your machine. Open the PR as a draft; the `Mutation testing (diff k/n)` shards test every changed Rust line in parallel on Linux runners and finish in well under an hour. A red shard prints the missed mutants in its log and uploads them as `missed.txt` in its `mutation-diff-report-<k>` artifact; add the test that kills each one, push, and mark the PR ready when every shard is green. A laptop running the same diff at one to three jobs takes hours and the load makes the fixture-based tests flake.
+If an upstream contribution is explicitly authorized, mutation testing is an additional gate. Open that PR as a draft; the `Mutation testing (diff k/n)` shards test every changed Rust line in parallel on Linux runners and finish in well under an hour. A red shard prints the missed mutants in its log and uploads them as `missed.txt` in its `mutation-diff-report-<k>` artifact; add the test that kills each one, push, and mark the PR ready when every shard is green. A laptop running the same diff at one to three jobs takes hours and the load makes the fixture-based tests flake.
 
-`just pr` still exists for a Linux box with cores to spare: it is `just check` plus `just mutants-diff` against `origin/main`, the same scope CI runs. If you use it:
+Do not run mutation testing locally by default. If requested, `just pr origin/dev` runs `just check` plus changed-line mutation testing against this fork's remote integration branch. The recipe's implicit `origin/main` default belongs to upstream; pass the base explicitly. Install the pinned tool before using it:
 
 ```sh
 cargo install --locked cargo-mutants --version 27.1.0
@@ -38,7 +43,7 @@ Prefer tests and deleting dead branches over skip annotations.
 
 ## PRs
 
-Every PR targets `main`. Do not stack PRs on each other's branches. After one merges, rebase the others onto `main`.
+Fork PRs, when requested, target `dev`. Do not stack PRs on each other's branches. After one merges, rebase the others onto `dev`. An explicitly authorized upstream contribution targets upstream's `main`.
 
 Work in a git worktree. Do not mix unrelated dirty-tree WIP into the PR.
 

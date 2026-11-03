@@ -219,8 +219,8 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
 
-        /// Targets no build used for this long, and targets whose worktree
-        /// is gone (default: target_idle_hours, 12h unless configured)
+        /// Targets whose last recorded compile is at least this old, and targets
+        /// whose worktree is gone (default: target_idle_hours, 12h unless configured)
         #[arg(long, value_name = "DURATION")]
         stale: Option<String>,
 

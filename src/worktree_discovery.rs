@@ -593,11 +593,31 @@ impl ApprovedDirectory {
         }
     }
 
+    fn command_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            // Git cannot use /proc/self/fd because this descriptor closes on exec.
+            PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                self.file.as_raw_fd()
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.clone()
+        }
+    }
+
     fn verify(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
             if !kache_fs::handle_identity(&self.file)
                 .is_ok_and(|identity| identity == self.identity)
+                || !std::fs::read_link(self.access_path())
+                    .is_ok_and(|path| !shielded(&path, &self.homes))
             {
                 return false;
             }
@@ -621,6 +641,15 @@ fn approve_directory(
     homes: &[PathBuf],
     is_local: &dyn Fn(&Path) -> bool,
 ) -> Option<ApprovedDirectory> {
+    approve_directory_after_resolution(path, homes, is_local, &|| {})
+}
+
+fn approve_directory_after_resolution(
+    path: &Path,
+    homes: &[PathBuf],
+    is_local: &dyn Fn(&Path) -> bool,
+    after_resolution: &dyn Fn(),
+) -> Option<ApprovedDirectory> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -639,38 +668,41 @@ fn approve_directory(
                 return None;
             }
         };
-        let path = path.canonicalize().ok()?;
-        if shielded(&path, homes) {
-            return None;
-        }
-        let expected = kache_fs::directory_identity(&path).ok()?;
-        if !is_local(&path) {
-            return None;
-        }
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)
             .ok()?;
+        let identity = kache_fs::handle_identity(&file).ok()?;
         let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
-        if kache_fs::handle_identity(&file).ok()? != expected
+        let resolved = std::fs::read_link(&descriptor_path).ok()?;
+        if shielded(&resolved, homes) {
+            return None;
+        }
+        after_resolution();
+        if !is_local(&resolved)
+            || kache_fs::file_identity(path).ok()? != identity
             || shielded(&std::fs::read_link(&descriptor_path).ok()?, homes)
             || crate::cache_fs::probe(&descriptor_path).is_local != Some(true)
             || !verified_mounts(&file, homes, &mut mounts)
         {
             return None;
         }
+        let path = std::fs::read_link(&descriptor_path).ok()?;
+        if shielded(&path, homes) {
+            return None;
+        }
         Some(ApprovedDirectory {
             path,
             file,
-            identity: expected,
+            identity,
             homes: homes.to_vec(),
             mounts: std::sync::Mutex::new(mounts),
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (homes, is_local);
+        let _ = (homes, is_local, after_resolution);
         Some(ApprovedDirectory {
             path: path.to_path_buf(),
         })
@@ -683,7 +715,7 @@ fn repositories_in(
     dir: PathBuf,
     deadline: Instant,
     homes: &[PathBuf],
-) -> impl Iterator<Item = PathBuf> {
+) -> impl Iterator<Item = ApprovedDirectory> {
     let is_local = |path: &Path| crate::cache_fs::probe(path).is_local == Some(true);
     let approved = approve_directory(&dir, homes, &is_local);
     let entries = approved
@@ -706,7 +738,7 @@ fn repositories_in(
             {
                 return None;
             }
-            Some(child.path.clone())
+            Some(child)
         })
 }
 
@@ -721,7 +753,7 @@ fn bare_repository(
         return None;
     }
     let approved = approve_directory(path, homes, is_local)?;
-    bare_repository_approved(&approved, deadline, homes, is_local)
+    bare_repository_approved(&approved, deadline, homes, is_local).map(|common| common.path)
 }
 
 fn bare_repository_approved(
@@ -729,7 +761,7 @@ fn bare_repository_approved(
     deadline: Instant,
     homes: &[PathBuf],
     is_local: &dyn Fn(&Path) -> bool,
-) -> Option<PathBuf> {
+) -> Option<ApprovedDirectory> {
     let path = &approved.path;
     if Instant::now() >= deadline
         || shielded(path, homes)
@@ -742,35 +774,35 @@ fn bare_repository_approved(
     let common_file = path.join("commondir");
     let anchored_common_file = approved.access_path().join("commondir");
     let (common, has_common_file) = match std::fs::symlink_metadata(&anchored_common_file) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (path.to_path_buf(), false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (approved.access_path(), false)
+        }
         Ok(metadata) if metadata.file_type().is_file() => {
-            if shielded(&common_file, homes) || !is_local(&common_file) {
+            if shielded(&common_file, homes) || !is_local(&common_file) || !approved.verify() {
                 return None;
             }
             let text = read_git_metadata(&anchored_common_file).ok()??;
             if text.trim().is_empty() {
                 return None;
             }
-            (
-                approved
-                    .access_path()
-                    .join(text.trim())
-                    .canonicalize()
-                    .ok()?,
-                true,
-            )
+            (approved.access_path().join(text.trim()), true)
         }
         _ => return None,
     };
-    if shielded(&common, homes) || !is_local(&common) {
-        return None;
-    }
+    #[cfg(not(target_os = "linux"))]
+    let common = {
+        let common = common.canonicalize().ok()?;
+        if shielded(&common, homes) || !is_local(&common) {
+            return None;
+        }
+        common
+    };
     let approved_common = approve_directory(&common, homes, is_local)?;
     if !approved.verify() || !approved_common.verify() {
         return None;
     }
     let output = git_output(
-        path,
+        &approved.command_path(),
         &["--git-dir=.", "rev-parse", "--is-bare-repository"],
         GIT_TIMEOUT,
         deadline,
@@ -781,7 +813,7 @@ fn bare_repository_approved(
         // An explicit Git directory reports split bare repositories as worktrees.
         "false" if has_common_file => {
             let output = git_output(
-                path,
+                &approved.command_path(),
                 &["rev-parse", "--is-bare-repository"],
                 GIT_TIMEOUT,
                 deadline,
@@ -791,7 +823,7 @@ fn bare_repository_approved(
         }
         _ => false,
     };
-    bare.then_some(common)
+    bare.then_some(approved_common)
 }
 
 fn configured_repositories(
@@ -800,7 +832,7 @@ fn configured_repositories(
     homes: &[PathBuf],
     turn: u64,
     is_local: &dyn Fn(&Path) -> bool,
-) -> Vec<PathBuf> {
+) -> Vec<ApprovedDirectory> {
     if roots.is_empty() {
         return Vec::new();
     }
@@ -817,35 +849,36 @@ fn configured_repositories(
         if shielded(root, homes) {
             continue;
         }
-        let Ok(root) = root.canonicalize() else {
-            continue;
+        #[cfg(not(target_os = "linux"))]
+        let root = {
+            let Ok(root) = root.canonicalize() else {
+                continue;
+            };
+            if shielded(&root, homes) || !root.is_dir() || !is_local(&root) {
+                continue;
+            }
+            root
         };
-        if shielded(&root, homes) || !root.is_dir() || !is_local(&root) {
-            continue;
-        }
-        let Some(approved_root) = approve_directory(&root, homes, is_local) else {
+        let Some(approved_root) = approve_directory(root.as_path(), homes, is_local) else {
             continue;
         };
         if !approved_root.verify() {
             continue;
         }
-        let mut add_repository = |approved: &ApprovedDirectory| {
-            let path = &approved.path;
-            if shielded(path, homes) || !is_local(path) || !approved.verify() {
-                return;
+        let is_repository = |approved: &ApprovedDirectory| {
+            if shielded(&approved.path, homes) || !is_local(&approved.path) || !approved.verify() {
+                return false;
             }
-            let repository = match std::fs::symlink_metadata(approved.access_path().join(".git")) {
+            match std::fs::symlink_metadata(approved.access_path().join(".git")) {
                 Ok(meta) => meta.is_dir() || meta.is_file(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     bare_repository_approved(approved, deadline, homes, is_local).is_some()
                 }
                 Err(_) => false,
-            };
-            if repository {
-                repositories.push(path.clone());
             }
         };
-        add_repository(&approved_root);
+        let root_is_repository = is_repository(&approved_root);
+        let position = repositories.len();
         for entry in std::fs::read_dir(approved_root.access_path())
             .into_iter()
             .flatten()
@@ -858,17 +891,16 @@ fn configured_repositories(
             if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            let Ok(child) = approved_root
-                .access_path()
-                .join(entry.file_name())
-                .canonicalize()
-            else {
-                continue;
-            };
+            let child = approved_root.access_path().join(entry.file_name());
             let Some(child) = approve_directory(&child, homes, is_local) else {
                 continue;
             };
-            add_repository(&child);
+            if is_repository(&child) {
+                repositories.push(child);
+            }
+        }
+        if root_is_repository {
+            repositories.insert(position, approved_root);
         }
     }
     repositories
@@ -899,10 +931,87 @@ fn read_git_metadata(path: &Path) -> std::io::Result<Option<String>> {
     Ok(Some(text))
 }
 
-/// The Git directory every worktree of the repository holding `path`
-/// shares, read from the filesystem without running Git: the nearest
-/// `.git` directory, or the one a worktree's `.git` file points to through
-/// its `commondir`. Two paths in one repository give the same answer.
+fn repository_of_approved(
+    start: &ApprovedDirectory,
+    homes: &[PathBuf],
+    local_only: Option<&dyn Fn(&Path) -> bool>,
+) -> Option<ApprovedDirectory> {
+    #[cfg(target_os = "linux")]
+    {
+        // The locality callback can race a move, so recheck before reading metadata.
+        let safe = |directory: &ApprovedDirectory| {
+            directory.verify()
+                && local_only.is_none_or(|is_local| is_local(&directory.path))
+                && directory.verify()
+        };
+        let mut ancestor: Option<ApprovedDirectory> = None;
+        loop {
+            let directory = ancestor.as_ref().unwrap_or(start);
+            if !directory.verify() {
+                return None;
+            }
+            let dot_git = directory.access_path().join(".git");
+            match std::fs::symlink_metadata(&dot_git) {
+                Ok(metadata) => {
+                    if metadata.is_dir() || (metadata.is_symlink() && dot_git.is_dir()) {
+                        let common = approve_directory(&dot_git, homes, &|_| true)?;
+                        return safe(&common).then_some(common);
+                    }
+                    let text = read_git_metadata(&dot_git).ok()??;
+                    let git_dir = Path::new(text.strip_prefix("gitdir:")?.trim());
+                    let git_dir =
+                        approve_directory(&directory.access_path().join(git_dir), homes, &|_| {
+                            true
+                        })?;
+                    if !safe(&git_dir) {
+                        return None;
+                    }
+                    return match read_git_metadata(&git_dir.access_path().join("commondir")).ok()? {
+                        Some(common) => {
+                            let common = approve_directory(
+                                &git_dir.access_path().join(common.trim()),
+                                homes,
+                                &|_| true,
+                            )?;
+                            safe(&common).then_some(common)
+                        }
+                        None => Some(git_dir),
+                    };
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(_) => return None,
+            }
+            let parent = approve_directory(&directory.access_path().join(".."), homes, &|_| true)?;
+            if parent.identity == directory.identity {
+                return None;
+            }
+            ancestor = Some(parent);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let path = repository_of(&start.path, homes, local_only)?;
+        approve_directory(&path, homes, &|_| true)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn repository_of(
+    path: &Path,
+    homes: &[PathBuf],
+    local_only: Option<&dyn Fn(&Path) -> bool>,
+) -> Option<PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    let start = approve_directory(start, homes, &|_| true)?;
+    repository_of_approved(&start, homes, local_only).map(|common| common.path)
+}
+
+/// Find the common Git directory using ordinary paths on non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
 fn repository_of(
     path: &Path,
     homes: &[PathBuf],
@@ -1153,12 +1262,48 @@ struct ApprovedRepository {
     seeds: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RepositoryKey {
+    #[cfg(target_os = "linux")]
+    identity: kache_fs::InodeId,
+    #[cfg(not(target_os = "linux"))]
+    path: PathBuf,
+}
+
+impl ApprovedDirectory {
+    fn repository_key(&self) -> RepositoryKey {
+        RepositoryKey {
+            #[cfg(target_os = "linux")]
+            identity: self.identity,
+            #[cfg(not(target_os = "linux"))]
+            path: self.path.clone(),
+        }
+    }
+}
+
+enum RepositoryStart {
+    Path(PathBuf),
+    Approved(ApprovedDirectory),
+}
+
+impl From<PathBuf> for RepositoryStart {
+    fn from(path: PathBuf) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl From<ApprovedDirectory> for RepositoryStart {
+    fn from(directory: ApprovedDirectory) -> Self {
+        Self::Approved(directory)
+    }
+}
+
 /// Group `starts` by the repository each is in, keeping the first start of
 /// each and every seed, leaving out repositories in `seen` and starts that
 /// are shielded. Stops taking new repositories at `limit` or `deadline`.
-fn by_repository(
-    starts: impl IntoIterator<Item = (PathBuf, Option<PathBuf>)>,
-    seen: &mut HashSet<PathBuf>,
+fn by_repository<S: Into<RepositoryStart>>(
+    starts: impl IntoIterator<Item = (S, Option<PathBuf>)>,
+    seen: &mut HashSet<RepositoryKey>,
     limit: usize,
     deadline: Instant,
     homes: &[PathBuf],
@@ -1168,49 +1313,50 @@ fn by_repository(
         return Vec::new();
     }
     let mut order = Vec::new();
-    let mut grouped: HashMap<PathBuf, ApprovedRepository> = HashMap::new();
+    let mut grouped: HashMap<RepositoryKey, ApprovedRepository> = HashMap::new();
     let is_local = |path: &Path| crate::cache_fs::probe(path).is_local == Some(true);
     for (start, seed) in starts {
         if Instant::now() >= deadline {
             break;
         }
-        if shielded(&start, homes) {
-            continue;
-        }
-        let Some(start) = approve_directory(&start, homes, &is_local) else {
-            continue;
+        let start = match start.into() {
+            RepositoryStart::Path(path) => {
+                if shielded(&path, homes) {
+                    continue;
+                }
+                let Some(start) = approve_directory(&path, homes, &is_local) else {
+                    continue;
+                };
+                start
+            }
+            RepositoryStart::Approved(start) => start,
         };
-        if !start.verify() {
+        if shielded(&start.path, homes) || !start.verify() {
             continue;
         }
-        let repository = match local_only {
+        let common = match local_only {
             Some(is_local)
-                if std::fs::symlink_metadata(start.path.join(".git"))
+                if std::fs::symlink_metadata(start.access_path().join(".git"))
                     .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
             {
                 bare_repository_approved(&start, deadline, homes, is_local)
             }
-            _ => repository_of(&start.path, homes, local_only),
+            _ => repository_of_approved(&start, homes, local_only),
         };
-        let Some(repository) = repository else {
+        let Some(common) = common else {
             continue;
         };
-        if seen.contains(&repository) {
+        let key = common.repository_key();
+        if seen.contains(&key) {
             continue;
         }
-        if !grouped.contains_key(&repository) {
+        if !grouped.contains_key(&key) {
             if order.len() >= limit {
                 break;
             }
-            let Some(common) = approve_directory(&repository, homes, &is_local) else {
-                continue;
-            };
-            if !common.verify() {
-                continue;
-            }
-            order.push(repository.clone());
+            order.push(key.clone());
             grouped.insert(
-                repository.clone(),
+                key.clone(),
                 ApprovedRepository {
                     start,
                     common,
@@ -1218,15 +1364,15 @@ fn by_repository(
                 },
             );
         }
-        if let Some(entry) = grouped.get_mut(&repository) {
+        if let Some(entry) = grouped.get_mut(&key) {
             entry.seeds.extend(seed);
         }
     }
     order
         .into_iter()
-        .filter_map(|repository| {
-            seen.insert(repository.clone());
-            grouped.remove(&repository)
+        .filter_map(|key| {
+            seen.insert(key.clone());
+            grouped.remove(&key)
         })
         .collect()
 }
@@ -1740,7 +1886,7 @@ mod tests {
                 &|_| true,
             );
             assert_eq!(found.len(), MAX_REPOSITORY_ROOTS);
-            visited.extend(found);
+            visited.extend(found.into_iter().map(|directory| directory.path));
         }
         assert_eq!(visited, roots.into_iter().collect());
 
@@ -2155,7 +2301,8 @@ mod tests {
             0,
             &|_| true,
         );
-        assert_eq!(candidates, std::slice::from_ref(&repo));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, repo);
         let starts = || [(repo.clone(), None)];
         std::fs::write(
             git_dir.join("commondir"),
@@ -2175,11 +2322,10 @@ mod tests {
         );
         std::fs::write(git_dir.join("commondir"), common.display().to_string()).unwrap();
         let mut seen = HashSet::new();
-        assert_eq!(
-            by_repository(starts(), &mut seen, 1, deadline, &homes, Some(&|_| true)).len(),
-            1
-        );
-        assert_eq!(seen, HashSet::from([common]));
+        let grouped = by_repository(starts(), &mut seen, 1, deadline, &homes, Some(&|_| true));
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].common.path, common);
+        assert_eq!(seen, HashSet::from([grouped[0].common.repository_key()]));
     }
 
     #[cfg(target_os = "linux")]
@@ -2196,7 +2342,9 @@ mod tests {
             std::fs::create_dir_all(path).unwrap();
         }
         let alias = dir.path().join("hidden-alias");
+        let safe_alias = dir.path().join("safe-alias");
         symlink(&hidden, &alias).unwrap();
+        symlink(&safe, &safe_alias).unwrap();
         let homes = [home.clone()];
         for path in [&home, &hidden, &documents, &alias] {
             assert!(
@@ -2205,6 +2353,7 @@ mod tests {
         }
         assert!(approve_directory(&safe, &homes, &|_| false).is_none());
         assert!(approve_directory(&safe, &homes, &|_| true).is_some());
+        assert!(approve_directory(&safe_alias, &homes, &|_| true).is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -2336,6 +2485,356 @@ mod tests {
             .unwrap(),
             "approved"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn approval_never_accepts_replacement_after_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repo");
+        let moved = dir.path().join("moved");
+        std::fs::create_dir(&path).unwrap();
+        let original = kache_fs::directory_identity(&path).unwrap();
+        let replace = || {
+            std::fs::rename(&path, &moved).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        };
+        if let Some(approved) = approve_directory_after_resolution(&path, &[], &|_| true, &replace)
+        {
+            assert_eq!(
+                approved.identity, original,
+                "accepted replacement directory"
+            );
+        }
+        assert!(moved.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_approval_stays_bound_when_parent_is_replaced_after_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let moved = dir.path().join("moved");
+        std::fs::create_dir_all(parent.join("repo")).unwrap();
+        let identity = kache_fs::directory_identity(&parent.join("repo")).unwrap();
+        let approved_parent = approve_directory(&parent, &[], &|_| true).unwrap();
+        let replace = || {
+            std::fs::rename(&parent, &moved).unwrap();
+            std::fs::create_dir_all(parent.join("repo")).unwrap();
+        };
+        let child = approve_directory_after_resolution(
+            &approved_parent.access_path().join("repo"),
+            &[],
+            &|_| true,
+            &replace,
+        )
+        .unwrap();
+        assert_eq!(child.identity, identity, "accepted a replacement child");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn watch_opens(paths: &[PathBuf]) -> std::fs::File {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: a successful inotify_init1 returns a new owned descriptor.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(raw >= 0);
+        // SAFETY: raw is a newly created descriptor and is owned only by this File.
+        let events = unsafe { std::fs::File::from_raw_fd(raw) };
+        for path in paths {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: the descriptor is live and path is a NUL-terminated pathname.
+            assert!(
+                unsafe {
+                    libc::inotify_add_watch(events.as_raw_fd(), path.as_ptr(), libc::IN_OPEN)
+                } >= 0
+            );
+        }
+        events
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_unopened_and_watch_is_live(mut events: std::fs::File, paths: &[PathBuf]) {
+        let mut buffer = [0; 4096];
+        assert_eq!(
+            events.read(&mut buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        for path in paths {
+            drop(std::fs::File::open(path).unwrap());
+            assert!(events.read(&mut buffer).unwrap() > 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enumerated_repository_stays_bound_when_parent_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        for configured in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("parent");
+            let moved = dir.path().join("moved");
+            let home = dir.path().join("home");
+            let protected = home.join(".config/private");
+            let repo = parent.join("repo");
+            let replacement = protected.join("repo");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(replacement.join(".git")).unwrap();
+            for name in ["HEAD", "config"] {
+                std::fs::write(repo.join(".git").join(name), "original").unwrap();
+                std::fs::write(replacement.join(".git").join(name), "protected").unwrap();
+            }
+            let identity = kache_fs::directory_identity(&repo).unwrap();
+            let common_identity = kache_fs::directory_identity(&repo.join(".git")).unwrap();
+            let watched = [
+                replacement.join(".git/HEAD"),
+                replacement.join(".git/config"),
+            ];
+            let events = watch_opens(&watched);
+            let deadline = Instant::now() + DISCOVERY_TIME;
+            let homes = [home];
+            let children: Vec<_> = if configured {
+                configured_repositories(std::slice::from_ref(&parent), deadline, &homes, 0, &|_| {
+                    true
+                })
+            } else {
+                repositories_in(parent.clone(), deadline, &homes).collect()
+            };
+            assert_eq!(children.len(), 1);
+            std::fs::rename(&parent, &moved).unwrap();
+            symlink(&protected, &parent).unwrap();
+            let grouped = by_repository(
+                children.into_iter().map(|child| (child, None)),
+                &mut HashSet::new(),
+                1,
+                deadline,
+                &homes,
+                None,
+            );
+            assert_eq!(grouped.len(), 1, "original child was lost during grouping");
+            assert_eq!(grouped[0].start.identity, identity);
+            assert_eq!(grouped[0].common.identity, common_identity);
+            assert_unopened_and_watch_is_live(events, &watched);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_bare_repository_stays_bound_after_parent_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let moved = dir.path().join("moved");
+        let home = dir.path().join("home");
+        let protected = home.join(".config/private");
+        let repo = parent.join("repo");
+        let replacement = protected.join("repo");
+        for path in [&repo, &replacement] {
+            std::fs::create_dir_all(path).unwrap();
+            git(path, &["init", "--bare", "-q"]);
+        }
+        let identity = kache_fs::directory_identity(&repo).unwrap();
+        let watched = [replacement.join("HEAD"), replacement.join("config")];
+        let events = watch_opens(&watched);
+        let deadline = Instant::now() + DISCOVERY_TIME;
+        let homes = [home];
+        let children =
+            configured_repositories(std::slice::from_ref(&parent), deadline, &homes, 0, &|_| {
+                true
+            });
+        assert_eq!(children.len(), 1);
+        std::fs::rename(&parent, &moved).unwrap();
+        symlink(&protected, &parent).unwrap();
+        let grouped = by_repository(
+            children.into_iter().map(|child| (child, None)),
+            &mut HashSet::new(),
+            1,
+            deadline,
+            &homes,
+            Some(&|_| true),
+        );
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].start.identity, identity);
+        assert_eq!(grouped[0].common.identity, identity);
+        assert_unopened_and_watch_is_live(events, &watched);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grouping_distinguishes_repositories_that_reuse_a_path() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let moved = dir.path().join("moved");
+        let repo = parent.join("repo");
+        let git = repo.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let first = approve_directory(&repo, &[], &|_| true).unwrap();
+        let swapped = Cell::new(false);
+        let local = |path: &Path| {
+            if path == git && !swapped.replace(true) {
+                std::fs::rename(&parent, &moved).unwrap();
+                std::fs::create_dir_all(&git).unwrap();
+            }
+            true
+        };
+        let starts = std::iter::once((first, None)).chain(std::iter::once_with(|| {
+            (approve_directory(&repo, &[], &|_| true).unwrap(), None)
+        }));
+        let mut seen = HashSet::new();
+        let grouped = by_repository(
+            starts,
+            &mut seen,
+            2,
+            Instant::now() + DISCOVERY_TIME,
+            &[],
+            Some(&local),
+        );
+        assert!(swapped.get());
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(grouped[0].common.path, grouped[1].common.path);
+        assert_ne!(grouped[0].common.identity, grouped[1].common.identity);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relative_git_metadata_stays_bound_after_parent_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let moved = dir.path().join("moved");
+        let home = dir.path().join("home");
+        let protected = home.join(".config/private");
+        let repo = parent.join("repo");
+        let replacement = protected.join("repo");
+        for base in [&parent, &protected] {
+            std::fs::create_dir_all(base.join("repo")).unwrap();
+            std::fs::create_dir_all(base.join("shared/worktrees/tree")).unwrap();
+            std::fs::write(base.join("repo/.git"), "gitdir: ../shared/worktrees/tree\n").unwrap();
+            std::fs::write(base.join("shared/worktrees/tree/commondir"), "../..\n").unwrap();
+            for name in ["HEAD", "config"] {
+                std::fs::write(base.join("shared").join(name), "metadata").unwrap();
+            }
+        }
+        let identity = kache_fs::directory_identity(&repo).unwrap();
+        let common_identity = kache_fs::directory_identity(&parent.join("shared")).unwrap();
+        let watched = [
+            replacement.join(".git"),
+            protected.join("shared/worktrees/tree/commondir"),
+            protected.join("shared/HEAD"),
+            protected.join("shared/config"),
+        ];
+        let events = watch_opens(&watched);
+        let deadline = Instant::now() + DISCOVERY_TIME;
+        let homes = [home];
+        let children: Vec<_> = repositories_in(parent.clone(), deadline, &homes).collect();
+        assert_eq!(children.len(), 1);
+        std::fs::rename(&parent, &moved).unwrap();
+        symlink(&protected, &parent).unwrap();
+        let grouped = by_repository(
+            children.into_iter().map(|child| (child, None)),
+            &mut HashSet::new(),
+            1,
+            deadline,
+            &homes,
+            None,
+        );
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].start.identity, identity);
+        assert_eq!(grouped[0].common.identity, common_identity);
+        assert_unopened_and_watch_is_live(events, &watched);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absolute_metadata_rejects_a_protected_replacement_before_reading_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let moved = dir.path().join("moved");
+        let home = dir.path().join("home");
+        let protected = home.join(".config/private");
+        let repo = parent.join("repo");
+        let common = parent.join("shared");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::create_dir_all(protected.join("shared")).unwrap();
+        std::fs::write(repo.join(".git"), format!("gitdir: {}\n", common.display())).unwrap();
+        let watched = [
+            protected.join("shared/commondir"),
+            protected.join("shared/HEAD"),
+            protected.join("shared/config"),
+        ];
+        for path in &watched {
+            std::fs::write(path, "protected").unwrap();
+        }
+        let events = watch_opens(&watched);
+        let deadline = Instant::now() + DISCOVERY_TIME;
+        let homes = [home];
+        let children: Vec<_> = repositories_in(parent.clone(), deadline, &homes).collect();
+        assert_eq!(children.len(), 1);
+        std::fs::rename(&parent, &moved).unwrap();
+        symlink(&protected, &parent).unwrap();
+        assert!(
+            by_repository(
+                children.into_iter().map(|child| (child, None)),
+                &mut HashSet::new(),
+                1,
+                deadline,
+                &homes,
+                None,
+            )
+            .is_empty()
+        );
+        assert_unopened_and_watch_is_live(events, &watched);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn metadata_is_not_opened_after_its_directory_moves_into_a_protected_folder() {
+        use std::cell::Cell;
+
+        let (dir, repo, git_dir, common) = git_metadata_fixture();
+        let home = dir.path().join("home");
+        let hidden = home.join(".config");
+        let moved = hidden.join("git-dir");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(git_dir.join("commondir"), common.display().to_string()).unwrap();
+        let watched = [git_dir.join("commondir")];
+        let events = watch_opens(&watched);
+        let renamed = Cell::new(false);
+        let local = |path: &Path| {
+            if path == git_dir {
+                std::fs::rename(&git_dir, &moved).unwrap();
+                renamed.set(true);
+            }
+            true
+        };
+        assert!(repository_of(&repo, &[home], Some(&local)).is_none());
+        assert!(renamed.get());
+        assert_unopened_and_watch_is_live(events, &[moved.join("commondir")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn approved_directory_rejects_a_move_into_a_protected_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let home = dir.path().join("home");
+        let hidden = home.join(".config");
+        std::fs::create_dir_all(parent.join("repo")).unwrap();
+        std::fs::create_dir_all(&hidden).unwrap();
+        let approved = approve_directory(&parent.join("repo"), &[home], &|_| true).unwrap();
+        std::fs::rename(&parent, hidden.join("moved")).unwrap();
+        assert!(!approved.verify());
     }
 
     #[cfg(target_os = "linux")]
@@ -3405,6 +3904,7 @@ mod tests {
         let candidates: HashSet<_> =
             configured_repositories(std::slice::from_ref(&parent), deadline, &[], 0, &|_| true)
                 .into_iter()
+                .map(|directory| directory.path)
                 .collect();
         assert_eq!(candidates, HashSet::from([bare.clone(), split.clone()]));
         for starts in [
@@ -3420,11 +3920,10 @@ mod tests {
             ],
         ] {
             let mut seen = HashSet::new();
-            assert_eq!(
-                by_repository(starts, &mut seen, 3, deadline, &[], Some(&|_| true)).len(),
-                1
-            );
-            assert_eq!(seen, HashSet::from([bare.clone()]));
+            let grouped = by_repository(starts, &mut seen, 3, deadline, &[], Some(&|_| true));
+            assert_eq!(grouped.len(), 1);
+            assert_eq!(grouped[0].common.path, bare);
+            assert_eq!(seen, HashSet::from([grouped[0].common.repository_key()]));
         }
 
         let idle = crate::maintenance::RequestClock::idle();

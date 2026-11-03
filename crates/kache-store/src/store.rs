@@ -1944,7 +1944,49 @@ const EXTERNAL_TARGET_CONSENT_REVISION: i64 = 1;
 const EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 // A close on any fd for the DB can release another SQLite connection's POSIX locks.
-static EXTERNAL_TARGET_INVENTORY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static EXTERNAL_TARGET_INVENTORY_GATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<kache_fs::InodeId>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+struct InventoryGate {
+    identity: kache_fs::InodeId,
+}
+
+impl InventoryGate {
+    fn acquire(
+        identity: kache_fs::InodeId,
+        deadline: std::time::Instant,
+        path: &Path,
+    ) -> Result<Self> {
+        loop {
+            match EXTERNAL_TARGET_INVENTORY_GATE.try_lock() {
+                Ok(mut active) => {
+                    if active.insert(identity) {
+                        return Ok(Self { identity });
+                    }
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("inventory coordination state is poisoned");
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("inventory database is busy: {}", path.display());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+}
+
+impl Drop for InventoryGate {
+    fn drop(&mut self) {
+        EXTERNAL_TARGET_INVENTORY_GATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.identity);
+    }
+}
 
 struct InventoryConnection {
     // Drop the SQLite connection and DB fd before releasing either lock.
@@ -1954,7 +1996,7 @@ struct InventoryConnection {
     directory: fs::File,
     cache_dir: PathBuf,
     directory_path: PathBuf,
-    _gate: std::sync::MutexGuard<'static, ()>,
+    _gate: InventoryGate,
 }
 
 impl InventoryConnection {
@@ -2107,20 +2149,6 @@ fn open_external_target_inventory_mode(
         }
     }
     let deadline = std::time::Instant::now() + EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT;
-    let gate = loop {
-        match EXTERNAL_TARGET_INVENTORY_GATE.try_lock() {
-            Ok(gate) => break gate,
-            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    anyhow::bail!("inventory database is busy: {}", requested_path.display());
-                }
-                std::thread::sleep(remaining.min(Duration::from_millis(10)));
-            }
-        }
-    };
-
     let directory_path = fs::canonicalize(cache_dir)?;
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -2135,6 +2163,12 @@ fn open_external_target_inventory_mode(
         options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS);
     }
     let directory = options.open(&directory_path)?;
+    validate_inventory_directory(cache_dir, &directory_path, &directory)?;
+    let gate = InventoryGate::acquire(
+        kache_fs::handle_identity(&directory)?,
+        deadline,
+        &requested_path,
+    )?;
     validate_inventory_directory(cache_dir, &directory_path, &directory)?;
 
     let lock_path = directory_path.join(EXTERNAL_TARGET_INVENTORY_LOCK);

@@ -4616,7 +4616,6 @@ mod external_target_inventory {
     use crate::filesystem::{TargetSymlinkSnapshot, snapshot_workspace_target};
     use std::os::unix::fs::{MetadataExt, symlink};
 
-    // Independent fixtures share the production process-wide inventory gate.
     static INVENTORY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn serialize_inventory_tests() -> std::sync::MutexGuard<'static, ()> {
@@ -5173,6 +5172,7 @@ mod external_target_inventory {
         let lock = fs::File::open(f.inventory_lock_path()).unwrap();
         lock.lock().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let identity = kache_fs::directory_identity(&f.store.config.cache_dir).unwrap();
         let result = std::thread::scope(|scope| {
             let task = scope.spawn(move || {
                 started_tx.send(()).unwrap();
@@ -5182,8 +5182,8 @@ mod external_target_inventory {
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
             let gate_held = loop {
                 match EXTERNAL_TARGET_INVENTORY_GATE.try_lock() {
-                    Err(std::sync::TryLockError::WouldBlock) => break true,
-                    Ok(gate) => drop(gate),
+                    Ok(active) if active.contains(&identity) => break true,
+                    Ok(_) | Err(std::sync::TryLockError::WouldBlock) => {}
                     Err(std::sync::TryLockError::Poisoned(_)) => panic!("inventory gate poisoned"),
                 }
                 if std::time::Instant::now() >= deadline {
@@ -5729,8 +5729,8 @@ mod external_target_inventory {
             fs::canonicalize(&alias).unwrap()
         );
         assert_eq!(
-            fs::metadata(&f.store.config.cache_dir).unwrap().ino(),
-            fs::metadata(&alias).unwrap().ino()
+            kache_fs::directory_identity(&f.store.config.cache_dir).unwrap(),
+            kache_fs::directory_identity(&alias).unwrap()
         );
         let first = f.inventory_db();
         let transaction = rusqlite::Transaction::new_unchecked(
@@ -5739,7 +5739,7 @@ mod external_target_inventory {
         )
         .unwrap();
         let second = open_external_target_inventory(&alias, false);
-        let serialized = second.is_err();
+        let serialized = second.as_ref().err().map(ToString::to_string);
         drop(second);
         let lock_probe = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -5753,13 +5753,16 @@ mod external_target_inventory {
             .unwrap();
         drop(transaction);
         drop(first);
+        let reopened = open_external_target_inventory(&alias, false);
+        assert!(reopened.as_ref().is_ok_and(Option::is_some));
+        drop(reopened);
         let unmounted = std::process::Command::new("umount")
             .arg(&alias)
             .status()
             .unwrap();
         assert!(unmounted.success());
         assert!(
-            serialized,
+            serialized.is_some_and(|error| error.contains("inventory database is busy")),
             "a bind alias bypassed the process inventory gate"
         );
         assert!(
@@ -5825,21 +5828,176 @@ mod external_target_inventory {
     }
 
     #[test]
-    fn external_target_inventory_serializes_distinct_cache_paths() {
+    fn external_target_inventory_distinct_caches_progress_during_transaction() {
         let _serial = serialize_inventory_tests();
         let first = Fixture::new();
         let second = Fixture::new();
+        let empty = Fixture::new();
         let snapshot = second.snapshot(&second.workspace);
         assert!(second.observe(&second.workspace, &snapshot));
         let guard = first.inventory_db();
-        let start = std::time::Instant::now();
-        assert!(second.store.external_target_observations().is_err());
-        assert!(start.elapsed() < Duration::from_secs(5));
-        drop(guard);
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &guard.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        std::thread::sleep(EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT + Duration::from_millis(50));
+        assert_eq!(
+            second
+                .store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(0)
+        );
         assert_eq!(
             second.store.external_target_observations().unwrap().len(),
             1
         );
+        assert!(
+            empty
+                .store
+                .external_target_observations()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!empty.inventory_path().exists());
+        assert!(!empty.inventory_lock_path().exists());
+        assert_eq!(
+            empty
+                .store
+                .reserve_external_inventory_turn(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap(),
+            Some(0)
+        );
+        let lock_probe = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::external_target_inventory::external_target_inventory_lock_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_INVENTORY_DB", first.inventory_path())
+            .output()
+            .unwrap();
+        assert!(
+            lock_probe.status.success(),
+            "SQLite transaction lost its lock: {}\n{}",
+            String::from_utf8_lossy(&lock_probe.stdout),
+            String::from_utf8_lossy(&lock_probe.stderr)
+        );
+        drop(transaction);
+        drop(guard);
+    }
+
+    #[test]
+    fn external_target_inventory_symlink_alias_serializes_and_releases() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let alias = f.temp.path().join("cache-alias");
+        symlink(&f.store.config.cache_dir, &alias).unwrap();
+        let first = f.inventory_db();
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &first.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let error = open_external_target_inventory(&alias, false).err().unwrap();
+        assert!(error.to_string().contains("inventory database is busy"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(transaction);
+        drop(first);
+        assert!(
+            open_external_target_inventory(&alias, false)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn external_target_inventory_gate_releases_on_unwind() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let cache = f.store.config.cache_dir.clone();
+        let result = std::thread::spawn(move || {
+            let _connection = open_external_target_inventory(&cache, false)
+                .unwrap()
+                .unwrap();
+            panic!("exercise inventory connection unwinding");
+        })
+        .join();
+        assert!(result.is_err());
+        assert_eq!(f.store.external_target_observations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn external_target_inventory_poisoned_gate_fails_closed() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::external_target_inventory::external_target_inventory_poisoned_gate_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for poisoned inventory coordination"]
+    fn external_target_inventory_poisoned_gate_child() {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        let first_snapshot = first.snapshot(&first.workspace);
+        let second_snapshot = second.snapshot(&second.workspace);
+        assert!(first.observe(&first.workspace, &first_snapshot));
+        assert!(second.observe(&second.workspace, &second_snapshot));
+        let guard = first.inventory_db();
+        let identity = kache_fs::handle_identity(&guard.directory).unwrap();
+        assert!(
+            std::thread::spawn(|| {
+                let _active = EXTERNAL_TARGET_INVENTORY_GATE.lock().unwrap();
+                panic!("exercise poisoned inventory coordination");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(
+            EXTERNAL_TARGET_INVENTORY_GATE
+                .lock()
+                .unwrap_err()
+                .into_inner()
+                .contains(&identity)
+        );
+        for cache in [
+            &first.store.config.cache_dir,
+            &second.store.config.cache_dir,
+        ] {
+            let error = open_external_target_inventory(cache, false).err().unwrap();
+            assert!(error.to_string().contains("coordination state is poisoned"));
+        }
+        drop(guard);
+        assert!(
+            !EXTERNAL_TARGET_INVENTORY_GATE
+                .lock()
+                .unwrap_err()
+                .into_inner()
+                .contains(&identity)
+        );
+        let error = open_external_target_inventory(&first.store.config.cache_dir, false)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("coordination state is poisoned"));
     }
 
     #[test]

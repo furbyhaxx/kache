@@ -10,6 +10,9 @@ use std::process::{Command, Output};
 mod common;
 use common::{hermetic_command, stop_daemon};
 
+// A concurrent fork can temporarily retain the copied executable's writable FD.
+static LAUNCHER_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fixture(tempfile::TempDir);
 
 impl Fixture {
@@ -77,12 +80,13 @@ impl Drop for Fixture {
 
 #[test]
 fn a_relative_kache_symlink_installs_an_executable_pin() {
+    let _serial = LAUNCHER_FIXTURES.lock().unwrap();
     let fixture = Fixture::new();
     let cell = fixture.path().join("Cellar/kache/1/bin");
     let bin = fixture.path().join("bin");
     fs::create_dir_all(&cell).unwrap();
     fs::create_dir(&bin).unwrap();
-    fs::hard_link(env!("CARGO_BIN_EXE_kache"), cell.join("kache")).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_kache"), cell.join("kache")).unwrap();
     let symlink = bin.join("kache");
     std::os::unix::fs::symlink("../Cellar/kache/1/bin/kache", &symlink).unwrap();
     let output = fixture.compile(&symlink);
@@ -98,6 +102,7 @@ fn a_relative_kache_symlink_installs_an_executable_pin() {
 
 #[test]
 fn an_install_failure_records_why_the_script_will_run_uncached() {
+    let _serial = LAUNCHER_FIXTURES.lock().unwrap();
     let fixture = Fixture::new();
     fs::write(
         fixture.profile().join(".kache-build-script-shims"),

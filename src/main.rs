@@ -219,7 +219,7 @@ enum Commands {
         yes: bool,
 
         /// Targets no build used for this long, and targets whose worktree
-        /// is gone (default 14d)
+        /// is gone (default: target_idle_hours, 12h unless configured)
         #[arg(long, value_name = "DURATION")]
         stale: Option<String>,
 
@@ -1241,7 +1241,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                 let what = cache_clean_choice(stale_schema, stale_hours);
                 return cli::clean_cache(&config, what, dry_run, yes, json);
             }
-            let scope = clean_scope(path, orphans, stale_hours);
+            let scope = clean_scope(path, orphans, stale_hours, &config)?;
             cli::clean(&config, dry_run, yes, json, scope)
         }
         Some(Commands::Targets { command: None }) => cli::targets(&config, json),
@@ -1890,14 +1890,24 @@ fn cache_clean_choice(stale_schema: bool, stale_hours: Option<u64>) -> cli::Cach
 }
 
 /// Which target directories `kache clean` looks at.
-fn clean_scope(path: Option<PathBuf>, orphans: bool, stale_hours: Option<u64>) -> cli::CleanScope {
-    match path {
+fn clean_scope(
+    path: Option<PathBuf>,
+    orphans: bool,
+    stale_hours: Option<u64>,
+    config: &config::Config,
+) -> Result<cli::CleanScope> {
+    if path.is_none() && !orphans && stale_hours.is_none() && !config.target_cleanup_config_valid {
+        anyhow::bail!(
+            "cannot use the default target idle window with an invalid config; fix the config or pass --stale"
+        );
+    }
+    Ok(match path {
         Some(dir) => cli::CleanScope::Scan(dir),
         None if orphans => cli::CleanScope::Tracked(cli::TrackedSelection::Orphaned),
         None => cli::CleanScope::Tracked(cli::TrackedSelection::StaleOrOrphaned(
-            stale_hours.unwrap_or(cli::DEFAULT_TRACKED_STALE_HOURS),
+            stale_hours.unwrap_or(config.target_idle_hours),
         )),
-    }
+    })
 }
 
 /// `kache init --shims` and the hidden `kache install-shims`: compiler-name
@@ -2522,22 +2532,36 @@ mod tests {
             CacheClean::OlderThan(24)
         );
         assert_eq!(cache_clean_choice(true, None), CacheClean::StaleSchema);
+        let mut config = crate::test_support::test_config(PathBuf::from("unused"));
+        config.target_idle_hours = 30;
         assert_eq!(
-            clean_scope(None, false, None),
-            CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(
-                cli::DEFAULT_TRACKED_STALE_HOURS
-            ))
+            clean_scope(None, false, None, &config).unwrap(),
+            CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(30))
         );
         assert_eq!(
-            clean_scope(None, false, Some(48)),
+            clean_scope(None, false, Some(48), &config).unwrap(),
             CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(48))
         );
         assert_eq!(
-            clean_scope(None, true, None),
+            clean_scope(None, true, None, &config).unwrap(),
             CleanScope::Tracked(TrackedSelection::Orphaned)
         );
         assert_eq!(
-            clean_scope(Some(PathBuf::from("d")), true, None),
+            clean_scope(Some(PathBuf::from("d")), true, None, &config).unwrap(),
+            CleanScope::Scan(PathBuf::from("d"))
+        );
+        config.target_cleanup_config_valid = false;
+        assert!(clean_scope(None, false, None, &config).is_err());
+        assert_eq!(
+            clean_scope(None, false, Some(48), &config).unwrap(),
+            CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(48))
+        );
+        assert_eq!(
+            clean_scope(None, true, None, &config).unwrap(),
+            CleanScope::Tracked(TrackedSelection::Orphaned)
+        );
+        assert_eq!(
+            clean_scope(Some(PathBuf::from("d")), false, None, &config).unwrap(),
             CleanScope::Scan(PathBuf::from("d"))
         );
     }

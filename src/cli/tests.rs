@@ -947,7 +947,6 @@ fn gc_machine_output_boundaries_are_explicit() {
     let stats = skipped_gc_stats();
     assert!(stats.skipped);
     assert_eq!(stats.entries_evicted, 0);
-    assert_eq!(DEFAULT_TRACKED_STALE_HOURS, 14 * 24);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("target");
@@ -4026,6 +4025,11 @@ fn save_manifest_config(
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_clean_idle_targets_hours: None,
+        target_idle_hours: 12,
+        target_cleanup_config_valid: true,
+        external_target_reap: false,
+        external_target_reap_max_per_pass: 4,
+        external_target_reap_interval_minutes: 60,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -8865,8 +8869,11 @@ fn clean_names_its_window_and_the_command_that_repeats_it() {
     assert_eq!(window_label(24), "1d");
     assert_eq!(window_label(36), "36h");
     assert_eq!(window_label(0), "0h");
-    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
-    assert_eq!(clean_argv(default).join(" "), "kache clean --yes");
+    let default = TrackedSelection::StaleOrOrphaned(336);
+    assert_eq!(
+        clean_argv(default).join(" "),
+        "kache clean --stale 14d --yes"
+    );
     assert_eq!(
         clean_argv(TrackedSelection::StaleOrOrphaned(48)).join(" "),
         "kache clean --stale 2d --yes"
@@ -8911,7 +8918,7 @@ fn the_clean_preview_splits_what_goes_from_what_stays() {
         reason: "belongs to the current workspace".into(),
         missing: false,
     }];
-    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    let default = TrackedSelection::StaleOrOrphaned(336);
     let plan = TrackedPlan::from_parts(
         default,
         rows.clone(),
@@ -8942,7 +8949,7 @@ fn the_clean_preview_splits_what_goes_from_what_stays() {
         lines[lines.len() - 2..],
         [
             "Dry run, nothing removed.",
-            "`kache clean --yes` removes the 1 target above."
+            "`kache clean --stale 14d --yes` removes the 1 target above."
         ]
     );
 
@@ -9038,7 +9045,7 @@ fn a_tracked_clean_reads_every_target_only_when_it_shows_them() {
         "a clean with work opens the selector"
     );
     assert!(!prints_plan(true, true, 0), "JSON never prints text");
-    let stale = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    let stale = TrackedSelection::StaleOrOrphaned(336);
     assert_eq!(plan_selection(Some(stale), false, 0), Some(stale));
     assert_eq!(plan_selection(Some(stale), true, 3), Some(stale));
     assert_eq!(
@@ -9071,7 +9078,7 @@ fn a_clean_that_removes_nothing_shows_targets_found_through_git_and_counts_gone_
         missing: true,
     };
     let skipped = [gone("/wt/old-a/target"), gone("/wt/old-b/target")];
-    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    let default = TrackedSelection::StaleOrOrphaned(336);
     // Found through Git with nothing to free: neither counted nor suggested.
     let mut empty = row("/wt/empty", TargetState::Live, 0);
     empty.discovered = true;
@@ -9162,7 +9169,7 @@ fn a_tracked_clean_forgets_a_target_found_through_git_once_its_worktree_is_delet
     store
         .remember_discovered_target_root(&target, &workspace)
         .unwrap();
-    let default = TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS);
+    let default = TrackedSelection::StaleOrOrphaned(336);
 
     let (targets, skipped, _) = tracked_target_entries(&config, default, false).unwrap();
     assert!(targets.is_empty() && skipped.is_empty(), "{skipped:?}");

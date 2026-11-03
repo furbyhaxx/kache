@@ -4972,8 +4972,6 @@ impl CleanFailed {
     }
 }
 
-pub(crate) const DEFAULT_TRACKED_STALE_HOURS: u64 = 336;
-
 /// Which target directories `kache clean` looks at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CleanScope {
@@ -6524,7 +6522,6 @@ fn clean_argv(selection: TrackedSelection) -> Vec<String> {
     let mut argv = vec!["kache".to_string(), "clean".to_string()];
     match selection {
         TrackedSelection::Orphaned => argv.push("--orphans".to_string()),
-        TrackedSelection::StaleOrOrphaned(DEFAULT_TRACKED_STALE_HOURS) => {}
         TrackedSelection::StaleOrOrphaned(hours) => {
             argv.extend(["--stale".to_string(), window_label(hours)]);
         }

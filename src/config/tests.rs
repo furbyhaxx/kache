@@ -514,6 +514,196 @@ fn target_cleanup_defaults_and_env_precedence() {
 }
 
 #[test]
+fn target_idle_settings_drive_the_manual_clean_scope() {
+    use crate::cli::{CleanScope, TrackedSelection};
+
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&path);
+    let _host = NamedEnvGuard::set("KACHE_HOST_CONFIG", "");
+    let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(dir.path().as_os_str()));
+    let _runtime = set_env_for_test("KACHE_RUNTIME_DIR", Some(dir.path().as_os_str()));
+    let _trust = set_env_for_test("KACHE_TRUST_DOMAIN", None);
+    std::fs::write(&path, "[cache]\nignore_env = true\n").unwrap();
+    let config = Config::load().unwrap();
+    assert_eq!(
+        crate::clean_scope(None, false, None, &config).unwrap(),
+        CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(12))
+    );
+    assert!(!config.external_target_reap);
+    assert_eq!(config.external_target_reap_max_per_pass, 4);
+    assert_eq!(config.external_target_reap_interval_minutes, 60);
+    assert_eq!(
+        crate::target_cleanup::reason(&config, false, 100_000_000),
+        None
+    );
+
+    std::fs::write(&path, "[cache]\nignore_env = true\ntarget_idle_hours = 30\nexternal_target_reap = true\nexternal_target_reap_max_per_pass = 7\nexternal_target_reap_interval_minutes = 5\n").unwrap();
+    let config = Config::load().unwrap();
+    assert_eq!(
+        crate::clean_scope(None, false, None, &config).unwrap(),
+        CleanScope::Tracked(TrackedSelection::StaleOrOrphaned(30))
+    );
+    assert!(config.external_target_reap);
+    assert_eq!(config.external_target_reap_max_per_pass, 7);
+    assert_eq!(config.external_target_reap_interval_minutes, 5);
+    assert_eq!(
+        crate::target_cleanup::reason(&config, false, 100_000_000),
+        None
+    );
+}
+
+#[test]
+fn invalid_target_idle_settings_disable_automatic_target_cleanup() {
+    #[derive(Clone)]
+    struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&path);
+    let _host = NamedEnvGuard::set("KACHE_HOST_CONFIG", "");
+    let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(dir.path().as_os_str()));
+    let _runtime = set_env_for_test("KACHE_RUNTIME_DIR", Some(dir.path().as_os_str()));
+    let _trust = set_env_for_test("KACHE_TRUST_DOMAIN", None);
+    let cache_path = toml::Value::String(dir.path().to_string_lossy().into_owned());
+    for invalid in [
+        "target_idle_hours = 0",
+        "target_idle_hours = -1",
+        "external_target_reap_max_per_pass = 0",
+        "external_target_reap_max_per_pass = 4294967296",
+        "external_target_reap_interval_minutes = 4",
+        "external_target_reap = 1",
+        "this is not TOML",
+    ] {
+        let external = if invalid.starts_with("external_target_reap =") {
+            ""
+        } else {
+            "external_target_reap = true\n"
+        };
+        std::fs::write(&path, format!("[cache]\nignore_env = true\nlocal_store = {cache_path}\nauto_clean_orphaned_targets = true\nauto_clean_idle_targets_hours = 12\nauto_clean_unused_units_days = 30\nauto_recover_targets = true\n{external}{invalid}\n")).unwrap();
+        assert!(
+            target_reap_settings(&Config::load_file_config()).is_err(),
+            "{invalid}"
+        );
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(std::sync::Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let config = tracing::subscriber::with_default(subscriber, Config::load).unwrap();
+        let log = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("ERROR").count(), 1, "{invalid}: {log}");
+        assert!(
+            log.contains("automatic target cleanup disabled"),
+            "{invalid}: {log}"
+        );
+        assert_eq!(config.cache_dir, dir.path(), "{invalid}");
+        assert!(
+            crate::clean_scope(None, false, None, &config).is_err(),
+            "{invalid}"
+        );
+        assert_eq!(
+            crate::clean_scope(None, false, Some(30), &config).unwrap(),
+            crate::cli::CleanScope::Tracked(crate::cli::TrackedSelection::StaleOrOrphaned(30))
+        );
+        assert!(!config.auto_clean_orphaned_targets, "{invalid}");
+        assert_eq!(config.auto_clean_idle_targets_days, 0, "{invalid}");
+        assert_eq!(config.auto_clean_idle_targets_hours, Some(0), "{invalid}");
+        assert!(!config.external_target_reap, "{invalid}");
+        assert!(!config.auto_recover_targets, "{invalid}");
+        assert_eq!(config.auto_clean_unused_units_days, 0, "{invalid}");
+        assert_eq!(
+            crate::target_cleanup::reason(&config, false, i64::MAX),
+            None,
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn target_reap_environment_overrides_and_invalid_host_fail_closed() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let host = dir.path().join("host.toml");
+    let _config = set_kache_config_for_test(&path);
+    let _host = set_env_for_test("KACHE_HOST_CONFIG", Some(host.as_os_str()));
+    let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(dir.path().as_os_str()));
+    let _runtime = set_env_for_test("KACHE_RUNTIME_DIR", Some(dir.path().as_os_str()));
+    let _trust = set_env_for_test("KACHE_TRUST_DOMAIN", None);
+    let _idle = NamedEnvGuard::set("KACHE_TARGET_IDLE_HOURS", "50");
+    let _reap = NamedEnvGuard::set("KACHE_EXTERNAL_TARGET_REAP", "true");
+    let _max = NamedEnvGuard::set("KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS", "9");
+    let _interval = NamedEnvGuard::set("KACHE_EXTERNAL_TARGET_REAP_INTERVAL_MINUTES", "6");
+    std::fs::write(&path, "[cache]\ntarget_idle_hours = 30\nexternal_target_reap = false\nexternal_target_reap_max_per_pass = 2\nexternal_target_reap_interval_minutes = 8\n").unwrap();
+    let config = Config::load().unwrap();
+    assert_eq!(config.target_idle_hours, 50);
+    assert!(config.external_target_reap);
+    assert_eq!(config.external_target_reap_max_per_pass, 9);
+    assert_eq!(config.external_target_reap_interval_minutes, 6);
+    {
+        let _idle = NamedEnvGuard::set("KACHE_TARGET_IDLE_HOURS", "1");
+        let _reap = NamedEnvGuard::set("KACHE_EXTERNAL_TARGET_REAP", "false");
+        let _max = NamedEnvGuard::set("KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS", "1");
+        let _interval = NamedEnvGuard::set("KACHE_EXTERNAL_TARGET_REAP_INTERVAL_MINUTES", "5");
+        let config = Config::load().unwrap();
+        assert_eq!(config.target_idle_hours, 1);
+        assert!(!config.external_target_reap);
+        assert_eq!(config.external_target_reap_max_per_pass, 1);
+        assert_eq!(config.external_target_reap_interval_minutes, 5);
+    }
+    for (name, value) in [
+        ("KACHE_TARGET_IDLE_HOURS", "0"),
+        ("KACHE_TARGET_IDLE_HOURS", "invalid"),
+        ("KACHE_EXTERNAL_TARGET_REAP", "invalid"),
+        ("KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS", "0"),
+        ("KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS", "4294967296"),
+        ("KACHE_EXTERNAL_TARGET_REAP_INTERVAL_MINUTES", "4"),
+    ] {
+        let _invalid = NamedEnvGuard::set(name, value);
+        assert!(
+            target_reap_settings(&Config::load_file_config()).is_err(),
+            "{name}={value}"
+        );
+        let config = Config::load().unwrap();
+        assert!(!config.target_cleanup_config_valid, "{name}={value}");
+        assert!(!config.auto_clean_orphaned_targets, "{name}={value}");
+        assert!(!config.external_target_reap, "{name}={value}");
+    }
+
+    std::fs::write(&path, "[cache]\nignore_env = true\ntarget_idle_hours = 30\nexternal_target_reap = false\nexternal_target_reap_max_per_pass = 2\nexternal_target_reap_interval_minutes = 8\n").unwrap();
+    let config = Config::load().unwrap();
+    assert_eq!(config.target_idle_hours, 30);
+    assert!(!config.external_target_reap);
+    assert_eq!(config.external_target_reap_max_per_pass, 2);
+    assert_eq!(config.external_target_reap_interval_minutes, 8);
+
+    std::fs::write(
+        &host,
+        "[cache]\nexternal_target_reap_interval_minutes = 4\n",
+    )
+    .unwrap();
+    let config = Config::load().unwrap();
+    assert_eq!(config.target_idle_hours, 30);
+    assert!(!config.auto_clean_orphaned_targets);
+    assert_eq!(config.auto_clean_unused_units_days, 0);
+    assert!(!config.external_target_reap);
+}
+
+#[test]
 fn target_cleanup_hours_config_precedence() {
     use crate::target_cleanup::{Reason, reason};
 
@@ -1394,7 +1584,7 @@ fn config_provenance_distinguishes_absent_and_unreadable_paths() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.toml");
 
-    let (loaded, absent) = Config::load_file_config_with_provenance(missing.clone());
+    let (loaded, absent, _) = Config::load_file_config_with_provenance(missing.clone());
     assert!(loaded.is_ok(), "a missing config file means defaults");
     let expected_absent =
         ConfigFileProvenance::from_snapshot(missing.clone(), ConfigFileState::Absent, &[], None);
@@ -1406,7 +1596,7 @@ fn config_provenance_distinguishes_absent_and_unreadable_paths() {
     // platform with a non-NotFound error, so it is an unreadable snapshot
     // rather than an absent one.
     let unreadable_path = dir.path().to_path_buf();
-    let (loaded, unreadable) = Config::load_file_config_with_provenance(unreadable_path.clone());
+    let (loaded, unreadable, _) = Config::load_file_config_with_provenance(unreadable_path.clone());
     assert!(loaded.is_err(), "an unreadable config must stay an error");
     let expected_unreadable = ConfigFileProvenance::from_snapshot(
         unreadable_path.clone(),
@@ -1465,7 +1655,7 @@ fn a_missing_host_file_changes_nothing() {
     std::fs::write(&chosen, content).unwrap();
     let _host = set_host_config_for_test(&dir.path().join("absent.toml"));
 
-    let (loaded, provenance) = Config::load_file_config_with_provenance(chosen.clone());
+    let (loaded, provenance, _) = Config::load_file_config_with_provenance(chosen.clone());
     assert_eq!(
         loaded.unwrap().cache.unwrap().local_max_size.as_deref(),
         Some("10GiB")
@@ -2670,6 +2860,10 @@ fn test_file_config_roundtrip() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_clean_idle_targets_hours: None,
+            target_idle_hours: None,
+            external_target_reap: None,
+            external_target_reap_max_per_pass: None,
+            external_target_reap_interval_minutes: None,
             auto_recover_min_free_bytes: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
@@ -3231,6 +3425,11 @@ fn test_config_store_dir() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_idle_targets_hours: None,
+        target_idle_hours: 12,
+        target_cleanup_config_valid: true,
+        external_target_reap: false,
+        external_target_reap_max_per_pass: 4,
+        external_target_reap_interval_minutes: 60,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3314,6 +3513,11 @@ fn test_config_index_db_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_idle_targets_hours: None,
+        target_idle_hours: 12,
+        target_cleanup_config_valid: true,
+        external_target_reap: false,
+        external_target_reap_max_per_pass: 4,
+        external_target_reap_interval_minutes: 60,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3393,6 +3597,11 @@ fn test_config_event_log_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_idle_targets_hours: None,
+        target_idle_hours: 12,
+        target_cleanup_config_valid: true,
+        external_target_reap: false,
+        external_target_reap_max_per_pass: 4,
+        external_target_reap_interval_minutes: 60,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3491,6 +3700,11 @@ fn test_config_socket_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_clean_idle_targets_hours: None,
+        target_idle_hours: 12,
+        target_cleanup_config_valid: true,
+        external_target_reap: false,
+        external_target_reap_max_per_pass: 4,
+        external_target_reap_interval_minutes: 60,
         auto_recover_min_free_bytes: 0,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
@@ -3687,14 +3901,17 @@ fn concurrent_runtime_dirs_isolate_job_state_while_sharing_store() {
     let _runtime_env = set_env_for_test("KACHE_RUNTIME_DIR", None);
     let _socket_env = set_env_for_test("KACHE_SOCKET_PATH", None);
     let make = |runtime: &Path| {
-        Config::load_resolved(Ok(FileConfig {
-            cache: Some(CacheFileConfig {
-                local_store: Some(shared.to_string_lossy().into_owned()),
-                runtime_dir: Some(runtime.to_string_lossy().into_owned()),
+        Config::load_resolved(
+            Ok(FileConfig {
+                cache: Some(CacheFileConfig {
+                    local_store: Some(shared.to_string_lossy().into_owned()),
+                    runtime_dir: Some(runtime.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
-            ..Default::default()
-        }))
+            false,
+        )
         .unwrap()
     };
     let a = make(&runtime_a);
@@ -4225,6 +4442,10 @@ fn test_save_and_load_file_config() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_clean_idle_targets_hours: None,
+            target_idle_hours: None,
+            external_target_reap: None,
+            external_target_reap_max_per_pass: None,
+            external_target_reap_interval_minutes: None,
             auto_recover_min_free_bytes: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
@@ -4344,6 +4565,8 @@ fn update_file_config_keeps_comments_and_unknown_keys() {
     let source = r#"# my kache settings
 [cache]
 local_max_size = "40GiB" # keep it small
+target_idle_hours = 12 # manual target cleanup
+external_target_reap_max_per_pass = 4 # bound each pass
 retired_setting = true
 exclude = ["vendor/**"]
 
@@ -4357,6 +4580,8 @@ bucket = "b"
     let mut after = before.clone();
     let cache = after.cache.as_mut().unwrap();
     cache.local_max_size = Some("55GiB".into());
+    cache.target_idle_hours = Some(30);
+    cache.external_target_reap_max_per_pass = Some(8);
     cache.exclude = None;
     cache.fallback = Some("custom".into());
     cache.remote.as_mut().unwrap().user_agent = Some("new/2.0".into());
@@ -4366,6 +4591,8 @@ bucket = "b"
     let expected = r#"# my kache settings
 [cache]
 local_max_size = "55GiB" # keep it small
+target_idle_hours = 30 # manual target cleanup
+external_target_reap_max_per_pass = 8 # bound each pass
 retired_setting = true
 fallback = "custom"
 
@@ -5418,7 +5645,7 @@ fn s3_user_agent_loaded_from_file_and_env() {
             user_agent = "file-agent/1.0"
         "#;
     let resolved_cfg =
-        Config::load_resolved(toml::from_str(toml_ignore_env).map_err(Into::into)).unwrap();
+        Config::load_resolved(toml::from_str(toml_ignore_env).map_err(Into::into), false).unwrap();
     match resolved_cfg.remote.unwrap().backend {
         RemoteBackendConfig::S3(s3) => {
             assert_eq!(

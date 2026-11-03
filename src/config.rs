@@ -532,6 +532,18 @@ pub struct Config {
     /// `0` disables the idle rule. Set via `KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS`
     /// or `[cache] auto_clean_idle_targets_hours`.
     pub auto_clean_idle_targets_hours: Option<u64>,
+    /// Manual target cleanup age in hours; defaults to 12, minimum 1.
+    pub target_idle_hours: u64,
+    pub(crate) target_cleanup_config_valid: bool,
+    /// Whether adopted external targets may be reaped when supported.
+    #[allow(dead_code)]
+    pub external_target_reap: bool,
+    /// Maximum adopted external targets to reap per pass; minimum 1.
+    #[allow(dead_code)]
+    pub external_target_reap_max_per_pass: u32,
+    /// Minutes between adopted external target reaping passes; minimum 5.
+    #[allow(dead_code)]
+    pub external_target_reap_interval_minutes: u64,
     /// Minimum free bytes on the store's volume. Below it, builds have
     /// auto-GC evict eligible store entries. With
     /// [`Config::auto_recover_targets`] on, quiet target cleanup also removes
@@ -928,6 +940,14 @@ pub(crate) struct CacheFileConfig {
     pub(crate) auto_clean_idle_targets_days: Option<u64>,
     /// See [`Config::auto_clean_idle_targets_hours`].
     pub(crate) auto_clean_idle_targets_hours: Option<u64>,
+    /// See [`Config::target_idle_hours`].
+    pub(crate) target_idle_hours: Option<u64>,
+    /// See [`Config::external_target_reap`].
+    pub(crate) external_target_reap: Option<bool>,
+    /// See [`Config::external_target_reap_max_per_pass`].
+    pub(crate) external_target_reap_max_per_pass: Option<u32>,
+    /// See [`Config::external_target_reap_interval_minutes`].
+    pub(crate) external_target_reap_interval_minutes: Option<u64>,
     /// See [`Config::auto_recover_min_free_bytes`].
     pub(crate) auto_recover_min_free_bytes: Option<u64>,
     /// See [`Config::auto_recover_targets`].
@@ -1371,6 +1391,10 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_SHARE_TARGET_FILES",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_DAYS",
     "KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS",
+    "KACHE_TARGET_IDLE_HOURS",
+    "KACHE_EXTERNAL_TARGET_REAP",
+    "KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS",
+    "KACHE_EXTERNAL_TARGET_REAP_INTERVAL_MINUTES",
     "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
@@ -1487,6 +1511,16 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "KACHE_AUTO_CLEAN_IDLE_TARGETS_HOURS",
         "cache.auto_clean_idle_targets_hours",
     ),
+    ("KACHE_TARGET_IDLE_HOURS", "cache.target_idle_hours"),
+    ("KACHE_EXTERNAL_TARGET_REAP", "cache.external_target_reap"),
+    (
+        "KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS",
+        "cache.external_target_reap_max_per_pass",
+    ),
+    (
+        "KACHE_EXTERNAL_TARGET_REAP_INTERVAL_MINUTES",
+        "cache.external_target_reap_interval_minutes",
+    ),
     (
         "KACHE_AUTO_RECOVER_MIN_FREE_BYTES",
         "cache.auto_recover_min_free_bytes",
@@ -1562,6 +1596,102 @@ fn warn_ignored_env_overrides() {
     }
 }
 
+#[derive(Debug)]
+struct TargetReapSettings {
+    target_idle_hours: u64,
+    external_target_reap: bool,
+    external_target_reap_max_per_pass: u32,
+    external_target_reap_interval_minutes: u64,
+}
+
+impl Default for TargetReapSettings {
+    fn default() -> Self {
+        Self {
+            target_idle_hours: 12,
+            external_target_reap: false,
+            external_target_reap_max_per_pass: 4,
+            external_target_reap_interval_minutes: 60,
+        }
+    }
+}
+
+fn validate_target_reap_file(cache: Option<&CacheFileConfig>) -> Result<()> {
+    if let Some(cache) = cache {
+        anyhow::ensure!(
+            cache.target_idle_hours.is_none_or(|value| value >= 1),
+            "cache.target_idle_hours must be at least 1"
+        );
+        anyhow::ensure!(
+            cache
+                .external_target_reap_max_per_pass
+                .is_none_or(|value| value >= 1),
+            "cache.external_target_reap_max_per_pass must be at least 1"
+        );
+        anyhow::ensure!(
+            cache
+                .external_target_reap_interval_minutes
+                .is_none_or(|value| value >= 5),
+            "cache.external_target_reap_interval_minutes must be at least 5"
+        );
+    }
+    Ok(())
+}
+
+fn target_reap_settings(file_config: &Result<FileConfig>) -> Result<TargetReapSettings> {
+    let file = file_config
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    let cache = file.cache.as_ref();
+    validate_target_reap_file(cache)?;
+    let ignore_env = Config::ignore_env_enabled(file_config);
+    let defaults = TargetReapSettings::default();
+    let number = |name: &str, file: Option<u64>, default, minimum| -> Result<u64> {
+        let value = match env_or_ignored(name, ignore_env) {
+            Ok(value) => value
+                .parse::<u64>()
+                .with_context(|| format!("{name} must be an unsigned integer"))?,
+            Err(_) => file.unwrap_or(default),
+        };
+        anyhow::ensure!(value >= minimum, "{name} must be at least {minimum}");
+        Ok(value)
+    };
+    let target_idle_hours = number(
+        "KACHE_TARGET_IDLE_HOURS",
+        cache.and_then(|c| c.target_idle_hours),
+        defaults.target_idle_hours,
+        1,
+    )?;
+    let external_target_reap = match env_or_ignored("KACHE_EXTERNAL_TARGET_REAP", ignore_env) {
+        Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
+        Ok(value) if value == "0" || value.eq_ignore_ascii_case("false") => false,
+        Ok(_) => anyhow::bail!("KACHE_EXTERNAL_TARGET_REAP must be 1, 0, true, or false"),
+        Err(_) => cache
+            .and_then(|c| c.external_target_reap)
+            .unwrap_or(defaults.external_target_reap),
+    };
+    let external_target_reap_max_per_pass = u32::try_from(number(
+        "KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS",
+        cache
+            .and_then(|c| c.external_target_reap_max_per_pass)
+            .map(u64::from),
+        u64::from(defaults.external_target_reap_max_per_pass),
+        1,
+    )?)
+    .context("KACHE_EXTERNAL_TARGET_REAP_MAX_PER_PASS exceeds u32")?;
+    let external_target_reap_interval_minutes = number(
+        "KACHE_EXTERNAL_TARGET_REAP_INTERVAL_MINUTES",
+        cache.and_then(|c| c.external_target_reap_interval_minutes),
+        defaults.external_target_reap_interval_minutes,
+        5,
+    )?;
+    Ok(TargetReapSettings {
+        target_idle_hours,
+        external_target_reap,
+        external_target_reap_max_per_pass,
+        external_target_reap_interval_minutes,
+    })
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         Self::load_with_provenance().map(|(config, _)| config)
@@ -1572,12 +1702,28 @@ impl Config {
     /// neither component re-resolves or re-reads a different config.
     pub(crate) fn load_with_provenance() -> Result<(Self, ConfigFileProvenance)> {
         let path = normalize_config_path(resolve_config_path());
-        let (file_config, provenance) = Self::load_file_config_with_provenance(path);
-        let config = Self::load_resolved(file_config)?;
+        let (file_config, provenance, host_invalid) = Self::load_file_config_with_provenance(path);
+        let config = Self::load_resolved(file_config, host_invalid)?;
         Ok((config, provenance))
     }
 
-    fn load_resolved(file_config: Result<FileConfig>) -> Result<Self> {
+    fn load_resolved(file_config: Result<FileConfig>, host_invalid: bool) -> Result<Self> {
+        let reap_settings = target_reap_settings(&file_config);
+        let cleanup_valid = !host_invalid && reap_settings.is_ok();
+        let reap_settings = match reap_settings {
+            Ok(settings) => {
+                if host_invalid {
+                    tracing::error!(
+                        "automatic target cleanup disabled because host configuration is invalid"
+                    );
+                }
+                settings
+            }
+            Err(error) => {
+                tracing::error!(%error, "automatic target cleanup disabled because configuration is invalid");
+                TargetReapSettings::default()
+            }
+        };
         let ignore_env = Self::ignore_env_enabled(&file_config);
         if ignore_env {
             warn_ignored_env_overrides();
@@ -2200,14 +2346,32 @@ impl Config {
             project_rules,
             auto_gc,
             index_auto_compact,
-            auto_clean_orphaned_targets,
+            auto_clean_orphaned_targets: cleanup_valid && auto_clean_orphaned_targets,
             auto_share_target_files,
-            auto_clean_idle_targets_days,
-            auto_clean_idle_targets_hours,
+            auto_clean_idle_targets_days: if cleanup_valid {
+                auto_clean_idle_targets_days
+            } else {
+                0
+            },
+            auto_clean_idle_targets_hours: if cleanup_valid {
+                auto_clean_idle_targets_hours
+            } else {
+                Some(0)
+            },
+            target_idle_hours: reap_settings.target_idle_hours,
+            target_cleanup_config_valid: cleanup_valid,
+            external_target_reap: cleanup_valid && reap_settings.external_target_reap,
+            external_target_reap_max_per_pass: reap_settings.external_target_reap_max_per_pass,
+            external_target_reap_interval_minutes: reap_settings
+                .external_target_reap_interval_minutes,
             auto_recover_min_free_bytes,
-            auto_recover_targets,
+            auto_recover_targets: cleanup_valid && auto_recover_targets,
             scheduler_memory_pressure,
-            auto_clean_unused_units_days,
+            auto_clean_unused_units_days: if cleanup_valid {
+                auto_clean_unused_units_days
+            } else {
+                0
+            },
             seed_new_targets,
             build_script_hermetic,
             gc_evict_shared,
@@ -2318,9 +2482,10 @@ impl Config {
     /// fills in the keys it leaves unset.
     fn load_file_config_with_provenance(
         config_path: PathBuf,
-    ) -> (Result<FileConfig>, ConfigFileProvenance) {
+    ) -> (Result<FileConfig>, ConfigFileProvenance, bool) {
         let host = read_host_config_snapshot();
         let host_layer = host_config_layer(host.as_ref());
+        let host_invalid = host.is_some() && host_layer.is_none();
         match std::fs::read(&config_path) {
             Ok(bytes) => {
                 let provenance = ConfigFileProvenance::from_snapshot(
@@ -2332,7 +2497,7 @@ impl Config {
                 let parsed = std::str::from_utf8(&bytes)
                     .context("reading kache config file as UTF-8")
                     .and_then(|content| parse_layered_file_config(content, host_layer));
-                (parsed, provenance)
+                (parsed, provenance, host_invalid)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let provenance = ConfigFileProvenance::from_snapshot(
@@ -2349,7 +2514,7 @@ impl Config {
                         toml::Value::Table(table).try_into().ok()
                     })
                     .unwrap_or_default();
-                (Ok(host_only), provenance)
+                (Ok(host_only), provenance, host_invalid)
             }
             Err(error) => {
                 let provenance = ConfigFileProvenance::from_snapshot(
@@ -2358,7 +2523,11 @@ impl Config {
                     &[],
                     host.as_ref(),
                 );
-                (Err(error).context("reading kache config file"), provenance)
+                (
+                    Err(error).context("reading kache config file"),
+                    provenance,
+                    host_invalid,
+                )
             }
         }
     }
@@ -3695,9 +3864,10 @@ fn parse_host_config(host: &HostConfigSnapshot) -> Result<toml::Table> {
             );
         }
     }
-    toml::Value::Table(table.clone())
+    let config = toml::Value::Table(table.clone())
         .try_into::<FileConfig>()
         .context("host config does not match the kache config schema")?;
+    validate_target_reap_file(config.cache.as_ref()).context("invalid host cleanup settings")?;
     Ok(table)
 }
 

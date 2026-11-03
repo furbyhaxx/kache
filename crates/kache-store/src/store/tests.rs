@@ -5708,6 +5708,207 @@ mod external_target_inventory {
         }
     }
 
+    fn assert_file_bind_inventory_leaf_is_refused(name: &str) {
+        let first = Fixture::new();
+        let second = Fixture::new();
+        let first_snapshot = first.snapshot(&first.workspace);
+        let second_snapshot = second.snapshot(&second.workspace);
+        assert!(first.observe(&first.workspace, &first_snapshot));
+        assert!(second.observe(&second.workspace, &second_snapshot));
+        let leaf = second.store.config.cache_dir.join(name);
+        if !leaf.exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&leaf)
+                .unwrap();
+        }
+        assert!(
+            std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(first.inventory_path())
+                .arg(&leaf)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let first_db = first.inventory_db();
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &first_db.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let result = second.store.external_target_observations();
+        let lock_probe = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::external_target_inventory::external_target_inventory_lock_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KACHE_TEST_INVENTORY_DB", first.inventory_path())
+            .output()
+            .unwrap();
+        drop(transaction);
+        drop(first_db);
+        assert!(
+            std::process::Command::new("umount")
+                .arg(&leaf)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            lock_probe.status.success(),
+            "{name} released the original SQLite lock: {}\n{}",
+            String::from_utf8_lossy(&lock_probe.stdout),
+            String::from_utf8_lossy(&lock_probe.stderr)
+        );
+        assert!(
+            result.err().is_some_and(|error| error
+                .to_string()
+                .contains("inventory file is on a different mount")),
+            "{name} was not refused as a separate mount"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a private user and mount namespace"]
+    fn external_target_inventory_bind_db_file_refused() {
+        let _serial = serialize_inventory_tests();
+        assert_file_bind_inventory_leaf_is_refused("external-target-inventory.db");
+    }
+
+    #[test]
+    #[ignore = "requires a private user and mount namespace"]
+    fn external_target_inventory_bind_journal_file_refused() {
+        let _serial = serialize_inventory_tests();
+        assert_file_bind_inventory_leaf_is_refused("external-target-inventory.db-journal");
+    }
+
+    #[test]
+    #[ignore = "requires a private user and mount namespace"]
+    fn external_target_inventory_bind_other_files_refused() {
+        let _serial = serialize_inventory_tests();
+        for name in [
+            "external-target-inventory.lock",
+            "external-target-inventory.db-wal",
+            "external-target-inventory.db-shm",
+        ] {
+            assert_file_bind_inventory_leaf_is_refused(name);
+        }
+    }
+
+    #[test]
+    fn external_target_inventory_refuses_unsafe_auxiliary_files() {
+        let _serial = serialize_inventory_tests();
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        for suffix in ["-journal", "-wal", "-shm"] {
+            for kind in ["symlink", "hardlink", "directory", "socket", "public"] {
+                let first = Fixture::new();
+                let second = Fixture::new();
+                let first_snapshot = first.snapshot(&first.workspace);
+                let second_snapshot = second.snapshot(&second.workspace);
+                assert!(first.observe(&first.workspace, &first_snapshot));
+                assert!(second.observe(&second.workspace, &second_snapshot));
+                let leaf = second
+                    .store
+                    .config
+                    .cache_dir
+                    .join(format!("{EXTERNAL_TARGET_INVENTORY_DB}{suffix}"));
+                let source = first.temp.path().join("auxiliary-source");
+                let listener = match kind {
+                    "symlink" => {
+                        symlink(first.inventory_path(), &leaf).unwrap();
+                        None
+                    }
+                    "hardlink" => {
+                        fs::write(&source, b"source").unwrap();
+                        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+                        fs::hard_link(&source, &leaf).unwrap();
+                        None
+                    }
+                    "directory" => {
+                        fs::create_dir(&leaf).unwrap();
+                        None
+                    }
+                    "socket" => Some(UnixListener::bind(&leaf).unwrap()),
+                    "public" => {
+                        fs::write(&leaf, b"public").unwrap();
+                        fs::set_permissions(&leaf, fs::Permissions::from_mode(0o644)).unwrap();
+                        None
+                    }
+                    _ => unreachable!(),
+                };
+                let first_db = first.inventory_db();
+                let transaction = rusqlite::Transaction::new_unchecked(
+                    &first_db.db,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                let result = second.store.external_target_observations();
+                let probe = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "store::tests::external_target_inventory::external_target_inventory_lock_child",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("KACHE_TEST_INVENTORY_DB", first.inventory_path())
+                    .output()
+                    .unwrap();
+                assert!(
+                    probe.status.success(),
+                    "{suffix} {kind} released the original SQLite lock"
+                );
+                let expected = match kind {
+                    "symlink" | "directory" | "socket" => {
+                        "inventory path has an unexpected file type"
+                    }
+                    "hardlink" => "inventory file has multiple links",
+                    "public" => "inventory path is not private",
+                    _ => unreachable!(),
+                };
+                assert!(
+                    result
+                        .err()
+                        .is_some_and(|error| error.to_string().contains(expected)),
+                    "{suffix} {kind} was not refused as unsafe"
+                );
+                drop(transaction);
+                drop(first_db);
+                drop(listener);
+            }
+        }
+    }
+
+    #[test]
+    fn external_target_inventory_rechecks_auxiliaries_before_sqlite_open() {
+        let _serial = serialize_inventory_tests();
+        let f = Fixture::new();
+        let snapshot = f.snapshot(&f.workspace);
+        assert!(f.observe(&f.workspace, &snapshot));
+        let journal = f
+            .store
+            .config
+            .cache_dir
+            .join("external-target-inventory.db-journal");
+        let result = open_external_target_inventory_with(&f.store.config.cache_dir, false, || {
+            symlink(f.inventory_path(), &journal).unwrap();
+        });
+        assert!(result.err().is_some_and(|error| {
+            error
+                .to_string()
+                .contains("inventory path has an unexpected file type")
+        }));
+        fs::remove_file(&journal).unwrap();
+        assert_eq!(f.store.external_target_observations().unwrap().len(), 1);
+    }
+
     #[test]
     #[ignore = "requires a private user and mount namespace"]
     fn external_target_inventory_bind_aliases_serialize() {

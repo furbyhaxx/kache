@@ -1939,6 +1939,13 @@ const INDEX_SCHEMA_GENERATION: i64 = 9;
 
 const EXTERNAL_TARGET_INVENTORY_DB: &str = "external-target-inventory.db";
 const EXTERNAL_TARGET_INVENTORY_LOCK: &str = "external-target-inventory.lock";
+const EXTERNAL_TARGET_INVENTORY_FILES: [&str; 5] = [
+    EXTERNAL_TARGET_INVENTORY_LOCK,
+    EXTERNAL_TARGET_INVENTORY_DB,
+    "external-target-inventory.db-journal",
+    "external-target-inventory.db-wal",
+    "external-target-inventory.db-shm",
+];
 const EXTERNAL_TARGET_INVENTORY_SCHEMA: i64 = 3;
 const EXTERNAL_TARGET_CONSENT_REVISION: i64 = 1;
 const EXTERNAL_TARGET_INVENTORY_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -2029,15 +2036,13 @@ fn inventory_private_metadata(metadata: &fs::Metadata, path: &Path, directory: b
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions.
-        let euid = unsafe { libc::geteuid() };
-        if metadata.uid() != euid || metadata.mode() & 0o7077 != 0 {
-            anyhow::bail!("inventory path is not private: {}", path.display());
-        }
-        if !directory && metadata.nlink() != 1 {
-            anyhow::bail!("inventory file has multiple links: {}", path.display());
-        }
-        Ok(())
+        inventory_private_unix_metadata(
+            path,
+            directory,
+            metadata.uid(),
+            metadata.mode(),
+            metadata.nlink(),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -2046,6 +2051,99 @@ fn inventory_private_metadata(metadata: &fs::Metadata, path: &Path, directory: b
             path.display()
         )
     }
+}
+
+#[cfg(unix)]
+fn inventory_private_unix_metadata(
+    path: &Path,
+    directory: bool,
+    owner: u32,
+    mode: u32,
+    links: impl Into<u64>,
+) -> Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if owner != euid || mode & 0o7077 != 0 {
+        anyhow::bail!("inventory path is not private: {}", path.display());
+    }
+    if !directory && links.into() != 1 {
+        anyhow::bail!("inventory file has multiple links: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_inventory_leaf_metadata(
+    directory: &fs::File,
+    name: &std::ffi::CStr,
+    path: &Path,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory and name are valid, and metadata is writable.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(error).with_context(|| format!("inspecting inventory file {}", path.display()));
+    }
+    // SAFETY: successful fstatat initialized metadata.
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+        anyhow::bail!(
+            "inventory path has an unexpected file type: {}",
+            path.display()
+        );
+    }
+    inventory_private_unix_metadata(
+        path,
+        false,
+        metadata.st_uid,
+        metadata.st_mode,
+        metadata.st_nlink,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_inventory_leaf_metadata(
+    _directory: &fs::File,
+    _name: &std::ffi::CStr,
+    path: &Path,
+) -> Result<()> {
+    anyhow::bail!("cannot verify inventory file metadata: {}", path.display())
+}
+
+fn validate_inventory_family(directory: &fs::File, directory_path: &Path) -> Result<()> {
+    let parent_mount = kache_fs::unique_mount_id(directory)
+        .with_context(|| format!("identifying inventory mount {}", directory_path.display()))?;
+    for name in EXTERNAL_TARGET_INVENTORY_FILES {
+        let path = directory_path.join(name);
+        let name = std::ffi::CString::new(name)?;
+        let mount = match kache_fs::unique_mount_id_at(directory, &name) {
+            Ok(mount) => mount,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("identifying inventory file mount {}", path.display())
+                });
+            }
+        };
+        if mount != parent_mount {
+            anyhow::bail!("inventory file is on a different mount: {}", path.display());
+        }
+        validate_inventory_leaf_metadata(directory, &name, &path)?;
+    }
+    Ok(())
 }
 
 fn validate_inventory_directory(cache_dir: &Path, path: &Path, handle: &fs::File) -> Result<()> {
@@ -2081,7 +2179,11 @@ fn validate_inventory_paths(
     validate_inventory_file(&directory_path.join(EXTERNAL_TARGET_INVENTORY_DB), database)
 }
 
-fn open_inventory_file(path: &Path, create: bool) -> Result<fs::File> {
+fn open_inventory_file(
+    path: &Path,
+    create: bool,
+    validate_family: impl Fn() -> Result<()>,
+) -> Result<fs::File> {
     let mut existing = fs::OpenOptions::new();
     existing.read(true);
     #[cfg(unix)]
@@ -2089,6 +2191,7 @@ fn open_inventory_file(path: &Path, create: bool) -> Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         existing.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    validate_family()?;
     let file = match existing.open(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
             let mut new = fs::OpenOptions::new();
@@ -2099,8 +2202,10 @@ fn open_inventory_file(path: &Path, create: bool) -> Result<fs::File> {
                 new.mode(0o600)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
+            validate_family()?;
             match new.open(path) {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    validate_family()?;
                     existing.open(path)
                 }
                 result => result,
@@ -2170,10 +2275,11 @@ fn open_external_target_inventory_mode(
         &requested_path,
     )?;
     validate_inventory_directory(cache_dir, &directory_path, &directory)?;
+    let validate_family = || validate_inventory_family(&directory, &directory_path);
 
     let lock_path = directory_path.join(EXTERNAL_TARGET_INVENTORY_LOCK);
     let lock = StoreLock {
-        file: open_inventory_file(&lock_path, write)?,
+        file: open_inventory_file(&lock_path, write, validate_family)?,
     };
     while !StoreLock::try_lock_file(&lock.file)? {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -2192,7 +2298,7 @@ fn open_external_target_inventory_mode(
             Ok(_) => {}
         }
     }
-    let mut file = open_inventory_file(&path, create_db)?;
+    let mut file = open_inventory_file(&path, create_db, validate_family)?;
     let metadata = file.metadata()?;
     if metadata.len() >= 20 {
         let mut header = [0; 20];
@@ -2209,6 +2315,7 @@ fn open_external_target_inventory_mode(
 
     before_sqlite_open();
     validate_inventory_paths(cache_dir, &directory_path, &directory, &lock.file, &file)?;
+    validate_family()?;
     let flags = if write {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
     } else {
@@ -5664,9 +5771,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// These are historical snapshots, not proof that the paths remain valid.
     /// An existing inventory without a coordination lock cannot be listed until
     /// a writer creates the lock; read-only listing never creates it. Inventory
-    /// access requires an owner-private cache directory and Unix permissions.
-    /// Coordination covers cooperating Kache processes; arbitrary same-UID
-    /// replacement cannot be made atomic without an fd-aware SQLite VFS.
+    /// access requires an owner-private cache directory, Unix permissions, and
+    /// unique mount IDs. Coordination covers cooperating Kache processes in a
+    /// static namespace; arbitrary same-UID path or mount changes cannot be
+    /// excluded atomically without an fd-aware SQLite VFS.
     pub fn external_target_observations(&self) -> Result<Vec<ExternalTargetObservation>> {
         let Some(db) = open_external_target_inventory(&self.config.cache_dir, false)? else {
             return Ok(Vec::new());
